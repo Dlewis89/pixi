@@ -1,6 +1,8 @@
 const std = @import("std");
 
-pub const plugin = @import("plugin_sdk.zig");
+/// App-side re-export of the plugin build API (lives in `sdk/`). Plugins should depend on
+/// the `sdk/` package directly — see CLAUDE.md — not this root package.
+pub const plugin = @import("sdk/plugin_sdk.zig");
 
 pub fn build(b: *std.Build) !void {
     const windows_msvc_libc_opt = b.option([]const u8, "windows-msvc-libc", "zig libc manifest for *-windows-msvc when cross-compiling; forwarded by packageall for Windows children") orelse null;
@@ -16,16 +18,6 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const plugin_sdk = b.option(
-        bool,
-        "plugin_sdk",
-        "Export core/sdk modules for third-party plugin builds; skips the fizzy app",
-    ) orelse false;
-    if (plugin_sdk) {
-        try plugin.exportModules(b, target, optimize);
-        return;
-    }
-
     try @import("build/app.zig").build(b, target, optimize, .{
         .windows_msvc_libc_opt = windows_msvc_libc_opt,
         .fetch_msvc_opt = fetch_msvc_opt,
@@ -33,4 +25,4 @@ pub fn build(b: *std.Build) !void {
         .macos_sign_install_identity = macos_sign_install_identity,
         .macos_notary_profile = macos_notary_profile,
     });
-} 
+}

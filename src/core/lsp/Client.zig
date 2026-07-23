@@ -24,6 +24,7 @@ const Protocol = @import("Protocol.zig");
 const UriUtil = @import("UriUtil.zig");
 const shell_env = @import("../shell_env.zig");
 const darwin_spawn = @import("../darwin_spawn.zig");
+const fuzzy = @import("../fuzzy.zig");
 
 const Client = @This();
 
@@ -1758,11 +1759,36 @@ fn runCompletionJob(self: *Client, io: std.Io, pc: PendingCompletion) !void {
         return;
     }
 
-    // Resolve every candidate (up to `completion_max_items`), skipping — not aborting on —
-    // any that fail to reduce to this SDK's ghost-text-compatible shape (see
-    // `resolveCompletionItem`). zls returns items already ranked, so a straight preselect-
-    // first-else-server-order pass is all the sorting this needs. Each candidate also keeps
-    // its own original JSON, serialized back to text — see `CachedCompletionItem`'s doc
+    // Two passes, because the candidates have to be *ranked before* they're truncated.
+    //
+    // Pass 1 scores every candidate — no allocation, since `resolveCompletionItem`'s strings all
+    // borrow from the already-parsed JSON. This used to be a single pass that stopped at
+    // `completion_max_items` in server order, which was fine when matching was prefix-only (zls
+    // had already ranked those sensibly). With fuzzy matching a scattered match can sit far down
+    // the server's list, so cutting at 50 first would throw away the very candidate the user was
+    // typing towards.
+    const Scored = struct {
+        index: usize,
+        score: f64,
+
+        fn lessThan(_: void, a: @This(), b: @This()) bool {
+            if (a.score != b.score) return a.score < b.score;
+            // Equal scores keep zls's own ordering, which already accounts for scope and type.
+            return a.index < b.index;
+        }
+    };
+    var scored: std.ArrayListUnmanaged(Scored) = .empty;
+    defer scored.deinit(gpa);
+    for (raw_items, 0..) |item_obj, i| {
+        const r = resolveCompletionItem(item_obj, pc.bytes, pc.byte_offset) orelse continue;
+        scored.append(gpa, .{ .index = i, .score = r.score }) catch continue;
+    }
+    std.sort.block(Scored, scored.items, {}, Scored.lessThan);
+    const keep = @min(scored.items.len, completion_max_items);
+
+    // Pass 2 allocates only the winners, skipping — not aborting on — any that fail to reduce to
+    // this SDK's ghost-text-compatible shape (see `resolveCompletionItem`). Each candidate also
+    // keeps its own original JSON, serialized back to text — see `CachedCompletionItem`'s doc
     // comment for why — needed later if `resolveCompletionDocumentation` asks zls to fill in
     // the `documentation` this initial response left empty (zls's usual lazy-load convention).
     var resolved: std.ArrayListUnmanaged(CachedCompletionItem) = .empty;
@@ -1775,8 +1801,8 @@ fn runCompletionJob(self: *Client, io: std.Io, pc: PendingCompletion) !void {
         gpa.free(c.raw_json);
     };
 
-    for (raw_items) |item_obj| {
-        if (resolved.items.len >= completion_max_items) break;
+    for (scored.items[0..keep]) |s| {
+        const item_obj = raw_items[s.index];
         const r = resolveCompletionItem(item_obj, pc.bytes, pc.byte_offset) orelse continue;
         const owned_label = gpa.dupe(u8, r.label) catch continue;
         const owned_text = gpa.dupe(u8, r.insert_text) catch {
@@ -2112,6 +2138,9 @@ const ResolvedCompletion = struct {
     /// LSP `CompletionItem.documentation` (`string | MarkupContent`), unwrapped the same way
     /// `extractContentsText` already unwraps a hover result's `contents` — empty when absent.
     documentation: []const u8,
+    /// Fuzzy-match score of `insert_text` against the word the user has typed so far. Lower is
+    /// better (see `core.fuzzy`); 0 when nothing has been typed yet, so server order stands.
+    score: f64,
 };
 
 /// Maps an LSP `CompletionItemKind` integer (1-25 per spec) onto this SDK's small
@@ -2197,10 +2226,23 @@ fn resolveCompletionItem(item: std.json.Value, bytes: []const u8, byte_offset: u
         already_typed = already_typed[1..];
     }
 
-    if (!std.mem.startsWith(u8, insert_text, already_typed)) return null;
-    insert_text = insert_text[already_typed.len..];
-
     if (insert_text.len == 0) return null;
+
+    // Fuzzy, not prefix: `intcast` should suggest `@intCast`, and `arlst` should suggest
+    // `ArrayList`. A prefix test can't do either, and being case-sensitive on top of that meant
+    // even an exact-but-differently-cased word was dropped.
+    //
+    // The consequence is that what the user typed is no longer a removable prefix of the
+    // candidate — the matched characters are scattered through it. So instead of inserting a
+    // trimmed remainder at the cursor, the candidate carries its **full** text plus a replace
+    // range covering the typed word; `TextEntryWidget.acceptCompletion` replaces
+    // `[replace_start, replace_end)` wholesale, which handles both cases identically.
+    var query = fuzzy.Query.init(already_typed);
+    const score = fuzzy.score(insert_text, &query, .{ .plain = true }) orelse return null;
+
+    // Derived rather than reusing `word_start`: the `@`-sigil adjustment above may have shortened
+    // `already_typed` by one byte, and that `@` must stay in the buffer.
+    const replace_start = byte_offset - already_typed.len;
     const kind = if (jsonInt(item, "kind")) |n| lspCompletionKind(n) else .other;
     // Prefer LSP 3.17's `labelDetails` — `description` is what VSCode itself shows right-
     // aligned (typically the type, e.g. "u32"), `detail` there is more like an inline
@@ -2218,11 +2260,12 @@ fn resolveCompletionItem(item: std.json.Value, bytes: []const u8, byte_offset: u
     return .{
         .label = label,
         .insert_text = insert_text,
-        .replace_start = byte_offset,
+        .replace_start = replace_start,
         .replace_end = byte_offset,
         .kind = kind,
         .detail = detail,
         .documentation = documentation,
+        .score = score,
     };
 }
 

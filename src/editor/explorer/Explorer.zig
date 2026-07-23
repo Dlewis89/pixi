@@ -63,8 +63,8 @@ pub fn open(explorer: *Explorer) void {
         return;
     }
 
-    if (fizzy.editor.settings.explorer_ratio > 0.0) {
-        explorer.paned.animateSplit(fizzy.editor.settings.explorer_ratio, dvui.easing.outBack);
+    if (fizzy.editor.explorer_ratio > 0.0) {
+        explorer.paned.animateSplit(fizzy.editor.explorer_ratio, dvui.easing.outBack);
     } else {
         explorer.paned.animateSplit(0.2, dvui.easing.outBack);
     }

@@ -2,7 +2,8 @@ const std = @import("std");
 const dvui = @import("dvui");
 // Vendored Velopack glue — see build/velopack.zig header (never `@import("velopack_zig")`).
 const velopack = @import("velopack.zig");
-const plugin = @import("../plugin_sdk.zig");
+const plugin = @import("../sdk/plugin_sdk.zig");
+const core_mod = @import("../sdk/core_module.zig");
 const common = @import("common.zig");
 const plugins = @import("plugins.zig");
 const sdk = @import("sdk.zig");
@@ -131,29 +132,26 @@ pub fn addFizzyExecutableForTarget(
     exe.root_module.addImport("backend", dvui_dep.module("sdl3"));
 
     // Shared `core` module (gfx/math/fs/generated atlas/platform/paths/dvui hub +
-    // generic widgets). Imports only `dvui` and `icons`.
+    // generic widgets). Import set is shared with the plugin SDK path — see sdk/core_module.zig.
     const core_module = b.createModule(.{
         .target = resolved_target,
         .optimize = optimize,
         .root_source_file = b.path("src/core/core.zig"),
     });
-    core_module.addImport("dvui", dvui_dep.module("dvui_sdl3"));
+    const icons_module = core_mod.addImports(b, core_module, dvui_dep.module("dvui_sdl3"), resolved_target, optimize);
     exe.root_module.addImport("core", core_module);
-
-    var icons_module: ?*std.Build.Module = null;
-    if (b.lazyDependency("icons", .{ .target = resolved_target, .optimize = optimize })) |dep| {
-        exe.root_module.addImport("icons", dep.module("icons"));
-        core_module.addImport("icons", dep.module("icons"));
-        icons_module = dep.module("icons");
-    }
+    if (icons_module) |icons| exe.root_module.addImport("icons", icons);
 
     const core_proxy_module = b.createModule(.{
         .target = resolved_target,
         .optimize = optimize,
         .root_source_file = b.path("src/core/core.zig"),
     });
-    core_proxy_module.addImport("dvui", dvui_proxy_mod);
-    if (icons_module) |icons| core_proxy_module.addImport("icons", icons);
+    _ = core_mod.addImports(b, core_proxy_module, dvui_proxy_mod, resolved_target, optimize);
+
+    if (b.lazyDependency("nightwatch", .{ .target = resolved_target, .optimize = optimize })) |dep| {
+        exe.root_module.addImport("nightwatch", dep.module("nightwatch"));
+    }
 
     const sdk_module = sdk.wireSdkModule(b, resolved_target, optimize, dvui_dep.module("dvui_sdl3"), proxy_bridge_host_mod, core_module, exe.root_module);
     const sdk_proxy_module = sdk.wireSdkModule(b, resolved_target, optimize, dvui_proxy_mod, proxy_bridge_plugin_mod, core_proxy_module, null);

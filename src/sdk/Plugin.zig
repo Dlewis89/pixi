@@ -75,6 +75,11 @@ pub const VTable = struct {
     createDocument: ?*const fn (state: *anyopaque, path: []const u8, grid: EditorAPI.NewDocGrid, out_doc: *anyopaque) anyerror!void = null,
     saveDocument: ?*const fn (state: *anyopaque, doc: DocHandle) anyerror!void = null,
     closeDocument: ?*const fn (state: *anyopaque, doc: DocHandle) void = null,
+    /// Reload `doc` from its on-disk path, replacing in-memory contents and clearing dirty
+    /// state / undo history as appropriate. Called by the shell's document watcher when a
+    /// clean open file changes externally. Absent = the shell skips auto-reload for this
+    /// owner (dirty conflict detection on save still works via content hashing).
+    reloadDocument: ?*const fn (state: *anyopaque, doc: DocHandle) anyerror!void = null,
     isDirty: ?*const fn (state: *anyopaque, doc: DocHandle) bool = null,
     undo: ?*const fn (state: *anyopaque, doc: DocHandle) anyerror!void = null,
     redo: ?*const fn (state: *anyopaque, doc: DocHandle) anyerror!void = null,
@@ -187,12 +192,17 @@ pub const VTable = struct {
     requestSaveConfirmation: ?*const fn (state: *anyopaque, doc: DocHandle, mode: SaveConfirmMode, from_save_all_quit: bool) void = null,
 
     // ---- settings ----
-    /// [requested] The shell's settings pane (Phase 3) edited this plugin's persisted settings
-    /// blob (see `Host.storePluginSettings`) while the plugin is loaded — `blob` is the whole,
-    /// freshly-serialized zon text (same shape `Host.loadPluginSettings` returns), not a diff. A
-    /// plugin that keeps its own in-memory copy of settings (e.g. to avoid re-parsing zon every
-    /// draw) should re-parse and apply it here instead of only reading the blob once at
-    /// `register`. Absent = the plugin only ever reads its settings at `register`/`initPlugin`.
+    /// [requested] This plugin's persisted settings blob changed while the plugin is loaded —
+    /// `blob` is the whole, freshly-serialized zon text (same shape `Host.loadPluginSettings`
+    /// returns), not a diff. Fires from **two** sources, and a plugin implementing this should
+    /// not assume which one: (1) the shell's settings pane edited it in-app (see
+    /// `Host.storePluginSettings`), or (2) an external edit to `settings.zon` (hand edit, another
+    /// tool) was picked up live by the settings watcher and reconciled (see R11 in
+    /// docs/PLUGIN_MANIFEST_PLAN.md) — in that case this fires with no settings-pane interaction
+    /// having happened at all. A plugin that keeps its own in-memory copy of settings (e.g. to
+    /// avoid re-parsing zon every draw) should re-parse and apply it here instead of only reading
+    /// the blob once at `register`. Absent = the plugin only ever reads its settings at
+    /// `register`/`initPlugin`.
     settingsChanged: ?*const fn (state: *anyopaque, blob: []const u8) void = null,
 
     // NOTE: editing actions (copy / paste / transform / accept-edit / cancel-edit /
@@ -357,6 +367,18 @@ pub fn isDirty(self: Plugin, doc: DocHandle) bool {
 
 pub fn saveDocument(self: Plugin, doc: DocHandle) !void {
     if (self.vtable.saveDocument) |f| try f(self.state, doc);
+}
+
+/// Reload from disk. Returns whether the plugin handled it (`false` = no hook).
+pub fn reloadDocument(self: Plugin, doc: DocHandle) bool {
+    if (self.vtable.reloadDocument) |f| {
+        f(self.state, doc) catch |err| {
+            std.log.err("reloadDocument failed: {s}", .{@errorName(err)});
+            return false;
+        };
+        return true;
+    }
+    return false;
 }
 
 /// Tear down an open document. Returns whether the plugin handled it, so the shell

@@ -7,6 +7,7 @@ const Dialogs = @This();
 // re-exported here. The shell triggers them through plugin vtable hooks / `Host.requestNewDocument`
 // so it never names a plugin's dialog implementation. This hub owns only shell-level dialogs.
 pub const UnsavedClose = @import("UnsavedClose.zig");
+pub const FileChangedOnDisk = @import("FileChangedOnDisk.zig");
 pub const AppQuitUnsaved = @import("AppQuitUnsaved.zig");
 pub const AboutFizzy = @import("AboutFizzy.zig");
 pub const WebFolderUnavailable = if (builtin.target.cpu.arch == .wasm32)

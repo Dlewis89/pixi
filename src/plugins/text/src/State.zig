@@ -46,7 +46,7 @@ pub fn loadSettings(self: *State, host: *sdk.Host) void {
 /// Register schema with the Host — shell draws shared controls from `Schema.settings`.
 pub fn registerSettings(self: *State, host: *sdk.Host, plugin: *sdk.Plugin) !void {
     try Schema.register(host, plugin, .{
-        .title = "Text Editor",
+        .title = "Text",
         .value = &self.settings,
     });
 }

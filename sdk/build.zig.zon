@@ -1,0 +1,34 @@
+.{
+    .name = .fizzy,
+    .version = "0.1.0",
+    .fingerprint = 0x3311781b63706048,
+    .minimum_zig_version = "0.16.0",
+    // Plugin SDK package — no app-only deps (Velopack, nightwatch, …). Plugins depend on
+    // this directory; the repo-root zon owns the editor build. See CLAUDE.md.
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "plugin_sdk.zig",
+        "core_module.zig",
+        "plugin_sdk_meta.zig",
+        "plugin_sdk_check.zig",
+        "sdk_version.zig",
+        "manifest_identity.zig",
+        "paths.zig",
+    },
+    .dependencies = .{
+        .icons = .{
+            .url = "https://github.com/foxnne/zig-lib-icons/archive/db034786a1286ab28dc35aba534c098aa4f1a3aa.tar.gz",
+            .hash = "icons-0.0.0-iJxA-VvGMwAgiKSXRe_Y0O7RpasdtEJhBfVx8IGGEBl_",
+            .lazy = true,
+        },
+        .dvui = .{
+            .url = "https://github.com/foxnne/dvui-dev/archive/f486a95ef0a10ae64e74d57e6f090027896149b9.tar.gz",
+            .hash = "dvui-0.5.0-dev-AQFJmWiB-gCtzdvo-D5qGOj-k7nNvIsFEq-nYctwzDvZ",
+        },
+        .zf = .{
+            .url = "git+https://github.com/natecraddock/zf#c35c421f84895193246db06c40683c1a30e616ef",
+            .hash = "zf-0.11.0-OIRy8X-RAAAwaRXHMYpj2uvBnuGTZWEE_3V7acqHQNtW",
+        },
+    },
+}

@@ -2,6 +2,7 @@ const std = @import("std");
 const fizzy = @import("../fizzy.zig");
 const dvui = @import("dvui");
 const RecentsMigration = @import("RecentsMigration.zig");
+const Constants = @import("Constants.zig");
 
 const Recents = @This();
 
@@ -103,7 +104,7 @@ pub fn appendFolder(recents: *Recents, path: []const u8) !void {
         return;
     }
 
-    if (recents.folders.items.len >= fizzy.editor.settings.max_recents) {
+    if (recents.folders.items.len >= Constants.max_recents) {
         const oldest = recents.folders.orderedRemove(0);
         fizzy.app.allocator.free(oldest);
     }

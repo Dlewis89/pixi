@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const dvui = @import("dvui");
 const wdvui = @import("core").dvui;
+const fuzzy = @import("core").fuzzy;
 const runtime = @import("runtime.zig");
 const icons = @import("icons");
 const Workspace = @import("Workspace.zig");
@@ -159,7 +160,20 @@ pub fn drawFiles(path: []const u8, tree: *wdvui.TreeWidget) !void {
     filter_text_edit.deinit();
     filter_hbox.deinit();
 
-    const folder = std.fs.path.basename(path);
+    // Closing the filter ends the session the path index was built for: the next one re-walks, so
+    // files created or removed while the box was closed can't linger in the results.
+    if (filter_text.len == 0) invalidateFilterIndex();
+
+    // Resolve before taking the basename. Launching as `fizzy .` (or any relative path) makes
+    // `basename` return the literal "." and the project row's title becomes a single unreadable
+    // period instead of the folder's name.
+    const folder = blk: {
+        const base = std.fs.path.basename(path);
+        if (base.len > 0 and !std.mem.eql(u8, base, ".") and !std.mem.eql(u8, base, "..")) break :blk base;
+        const resolved = std.fs.path.resolve(dvui.currentWindow().arena(), &.{path}) catch break :blk base;
+        const resolved_base = std.fs.path.basename(resolved);
+        break :blk if (resolved_base.len > 0) resolved_base else base;
+    };
 
     const branch = tree.branch(@src(), .{
         .expanded = true,
@@ -190,14 +204,23 @@ pub fn drawFiles(path: []const u8, tree: *wdvui.TreeWidget) !void {
     }
 
     const color = dvui.themeGet().color(.control, .fill_hover);
+    // Folder rows tint their caret from the per-row fill (`control.fill`, optionally overridden
+    // by `fileRowFillColor`); the project row has no per-row tint, so it takes the base.
+    const caret_color = dvui.themeGet().color(.control, .fill);
 
-    _ = dvui.icon(
-        @src(),
-        "FolderIcon",
-        if (branch.expanded) icons.tvg.entypo.@"down-open" else icons.tvg.entypo.@"right-open",
-        .{ .fill_color = color },
-        .{ .gravity_y = 0.5, .padding = dvui.Rect.all(0) },
-    );
+    {
+        var caret_slot = wdvui.treeRowGlyph(@src(), .{});
+        defer caret_slot.deinit();
+        _ = dvui.icon(
+            @src(),
+            "FolderIcon",
+            if (branch.expanded) icons.tvg.entypo.@"down-open" else icons.tvg.entypo.@"right-open",
+            // Same tint the folder rows below use, so the project row's caret doesn't read as a
+            // different kind of control from every other caret in the tree.
+            .{ .fill_color = caret_color, .stroke_color = caret_color },
+            wdvui.treeRowIconOptions(.{}),
+        );
+    }
 
     var fmt_string = std.fmt.allocPrint(dvui.currentWindow().lifo(), comptime "{s}", .{folder}) catch unreachable;
     defer dvui.currentWindow().lifo().free(fmt_string);
@@ -308,7 +331,145 @@ fn pointerReleaseInRectWithoutSelectionModifier(r: dvui.Rect.Physical) bool {
     return false;
 }
 
-const SimpleEntry = struct { name: []const u8, kind: std.Io.File.Kind };
+// ---- filtered-mode path index --------------------------------------------------------------
+//
+// While the filter box is empty the tree is drawn straight from the filesystem, one directory per
+// expanded folder — cheap, and always current. A filter changes that completely: every file in
+// the project is a candidate, so the old code re-walked the *entire* project on every frame just
+// to test basenames. Instead the project is walked **once per filter session** into this index,
+// and each keystroke only re-ranks strings already in memory.
+
+/// Absolute paths of every non-ignored file in the project, owned by `runtime.allocator()`.
+var filter_index: std.ArrayListUnmanaged([]u8) = .empty;
+/// Project root the index was built for; empty when there is no index. Owned.
+var filter_index_root: []u8 = &.{};
+/// Set when the filter box goes empty, so the next filter session rebuilds from disk rather than
+/// ranking a snapshot that may be minutes old. Also set by the mutation helpers below.
+var filter_index_stale: bool = true;
+
+/// Refuse to index a pathological tree rather than stall a frame. A project past this many files
+/// still filters — just over the first `filter_index_max_files` discovered.
+const filter_index_max_files: usize = 200_000;
+const filter_index_max_depth: usize = 32;
+
+/// Drop the cached path index. Called when the filter closes and whenever this module creates,
+/// deletes, renames, or moves something — those are the only mutations that happen while the
+/// explorer is open, and re-walking on the next keystroke is cheap enough to not need finer
+/// invalidation.
+pub fn invalidateFilterIndex() void {
+    filter_index_stale = true;
+}
+
+fn freeFilterIndex() void {
+    const gpa = runtime.allocator();
+    for (filter_index.items) |p| gpa.free(p);
+    filter_index.clearRetainingCapacity();
+}
+
+pub fn deinitFilterIndex() void {
+    const gpa = runtime.allocator();
+    freeFilterIndex();
+    filter_index.deinit(gpa);
+    if (filter_index_root.len > 0) gpa.free(filter_index_root);
+    filter_index_root = &.{};
+    filter_index_stale = true;
+}
+
+/// Rebuild the index for `root` if it's missing, stale, or was built for a different project.
+fn ensureFilterIndex(root: []const u8) void {
+    if (!filter_index_stale and std.mem.eql(u8, filter_index_root, root)) return;
+
+    const gpa = runtime.allocator();
+    freeFilterIndex();
+    if (!std.mem.eql(u8, filter_index_root, root)) {
+        if (filter_index_root.len > 0) gpa.free(filter_index_root);
+        filter_index_root = gpa.dupe(u8, root) catch &.{};
+    }
+    indexDir(root, 0);
+    filter_index_stale = false;
+}
+
+/// Depth-first walk honouring the same ignore rules the tree itself uses, so a filter never
+/// surfaces something the unfiltered tree deliberately hides (`.git`, `node_modules`, …). Written
+/// by hand rather than with `Dir.walk` precisely because it has to *prune* ignored directories —
+/// a walker that descends into `node_modules` first and filters after is the slow thing we're
+/// removing.
+fn indexDir(directory: []const u8, depth: usize) void {
+    if (depth > filter_index_max_depth) return;
+    if (filter_index.items.len >= filter_index_max_files) return;
+
+    const io = dvui.io;
+    const gpa = runtime.allocator();
+    var dir = std.Io.Dir.cwd().openDir(io, directory, .{ .access_sub_paths = true, .iterate = true }) catch return;
+    defer dir.close(io);
+
+    var iter = dir.iterate();
+    while (iter.next(io) catch null) |entry| {
+        if (filter_index.items.len >= filter_index_max_files) return;
+
+        const abs_path = std.fs.path.join(gpa, &.{ directory, entry.name }) catch continue;
+        var keep = false;
+        defer if (!keep) gpa.free(abs_path);
+
+        if (runtime.host().folder()) |proj_root| {
+            if (runtime.host().isPathIgnored(proj_root, abs_path, entry.name, entry.kind)) continue;
+        }
+
+        switch (entry.kind) {
+            .file => {
+                filter_index.append(gpa, abs_path) catch continue;
+                keep = true;
+            },
+            .directory => indexDir(abs_path, depth + 1),
+            else => {},
+        }
+    }
+}
+
+/// Rank the indexed paths against `filter_text` and return the rows to draw, best match first.
+///
+/// Matching runs against the **project-relative path**, not just the basename, with zf's filepath
+/// mode: `src/files.zig` beats `s/r/c/f/i/l/e/s.zig` for the query `srcfiles`, and a query with a
+/// `/` in it is treated as a path constraint. The old substring test on the basename alone could
+/// not express either.
+fn rankedFilterRows(root_directory: []const u8, filter_text: []const u8) []const SimpleEntry {
+    ensureFilterIndex(root_directory);
+
+    var query = fuzzy.Query.init(filter_text);
+    if (query.isEmpty()) return &.{};
+
+    const arena = dvui.currentWindow().arena();
+    const Hit = fuzzy.Ranked(usize);
+    var hits: std.ArrayListUnmanaged(Hit) = .empty;
+
+    for (filter_index.items, 0..) |abs_path, i| {
+        const rel = std.fs.path.relativePosix(arena, ".", root_directory, abs_path) catch continue;
+        const score = fuzzy.score(rel, &query, .{ .plain = false }) orelse continue;
+        // Shorter paths win ties — the same tie-break zf's own frontend uses.
+        hits.append(arena, .{ .item = i, .score = score, .tie = rel.len }) catch break;
+    }
+    fuzzy.sort(usize, hits.items);
+
+    var rows: std.ArrayListUnmanaged(SimpleEntry) = .empty;
+    for (hits.items) |hit| {
+        const abs_path = filter_index.items[hit.item];
+        rows.append(arena, .{
+            .name = std.fs.path.basename(abs_path),
+            .kind = .file,
+            .dir = std.fs.path.dirname(abs_path) orelse root_directory,
+        }) catch break;
+    }
+    return rows.items;
+}
+
+/// One row to draw. `dir` is normally null — the row's parent directory is whichever directory
+/// the walk is currently in. Filtered rows come from all over the project at once (a flat ranked
+/// list, not a walk), so those carry their own parent explicitly.
+const SimpleEntry = struct {
+    name: []const u8,
+    kind: std.Io.File.Kind,
+    dir: ?[]const u8 = null,
+};
 
 fn lessThan(_: void, lhs: SimpleEntry, rhs: SimpleEntry) bool {
     if (lhs.kind == .directory and rhs.kind == .file) return true;
@@ -433,47 +594,55 @@ pub fn recurseFiles(root_directory: []const u8, outer_tree: *wdvui.TreeWidget, u
     errdefer pending_file_shift_range = null;
 
     const recursor = struct {
-        fn search(directory: []const u8, tree: *wdvui.TreeWidget, inner_unique_id: dvui.Id, inner_id_extra: *usize, color_id: *usize, filter_text: []const u8, parent_branch: ?*wdvui.TreeWidget.Branch) !void {
+        /// Draw a set of rows: either the contents of `directory` (the normal tree walk, `rows`
+        /// null), or a caller-supplied flat list of already-ranked rows (`rows` non-null, used
+        /// while a filter is active — see `rankedFilterRows`).
+        ///
+        /// The filtered case used to run through the walk too, re-reading *every* directory in
+        /// the project from disk on *every frame* and testing each basename with a substring
+        /// match. That is what made typing in the filter box scale with project size.
+        fn search(directory: []const u8, tree: *wdvui.TreeWidget, inner_unique_id: dvui.Id, inner_id_extra: *usize, color_id: *usize, filter_text: []const u8, parent_branch: ?*wdvui.TreeWidget.Branch, rows: ?[]const SimpleEntry) !void {
             const io = dvui.io;
-            var dir = std.Io.Dir.cwd().openDir(io, directory, .{ .access_sub_paths = true, .iterate = true }) catch return;
-            defer dir.close(io);
 
             var files = std.array_list.Managed(SimpleEntry).init(dvui.currentWindow().arena());
 
-            var iter = dir.iterate();
-            while (try iter.next(io)) |entry| {
-                try files.append(.{
-                    .name = dvui.currentWindow().arena().dupe(u8, entry.name) catch "Arena failed to allocate",
-                    .kind = entry.kind,
-                });
-            }
+            if (rows) |ranked| {
+                // Already filtered, ranked, and carrying their own parent directories.
+                try files.appendSlice(ranked);
+            } else {
+                var dir = std.Io.Dir.cwd().openDir(io, directory, .{ .access_sub_paths = true, .iterate = true }) catch return;
+                defer dir.close(io);
 
-            std.mem.sort(
-                SimpleEntry,
-                files.items,
-                {},
-                lessThan,
-            );
-
-            for (files.items) |entry| {
-                const abs_path = try std.fs.path.join(
-                    dvui.currentWindow().arena(),
-                    &.{ directory, entry.name },
-                );
-
-                if (runtime.host().folder()) |proj_root| {
-                    if (runtime.host().isPathIgnored(proj_root, abs_path, entry.name, entry.kind)) {
-                        continue;
-                    }
+                var iter = dir.iterate();
+                while (try iter.next(io)) |entry| {
+                    try files.append(.{
+                        .name = dvui.currentWindow().arena().dupe(u8, entry.name) catch "Arena failed to allocate",
+                        .kind = entry.kind,
+                    });
                 }
 
-                if (entry.kind == .file) {
-                    if (std.ascii.indexOfIgnoreCase(entry.name, filter_text) == null) {
-                        continue;
+                std.mem.sort(
+                    SimpleEntry,
+                    files.items,
+                    {},
+                    lessThan,
+                );
+            }
+
+            for (files.items) |entry| {
+                const entry_dir = entry.dir orelse directory;
+                const abs_path = try std.fs.path.join(
+                    dvui.currentWindow().arena(),
+                    &.{ entry_dir, entry.name },
+                );
+
+                // Ranked rows were already screened when the index was built.
+                if (rows == null) {
+                    if (runtime.host().folder()) |proj_root| {
+                        if (runtime.host().isPathIgnored(proj_root, abs_path, entry.name, entry.kind)) {
+                            continue;
+                        }
                     }
-                } else if (filter_text.len > 0) {
-                    search(abs_path, tree, inner_unique_id, inner_id_extra, color_id, filter_text, null) catch continue;
-                    continue;
                 }
 
                 inner_id_extra.* = dvui.Id.update(tree.data().id, abs_path).asUsize();
@@ -484,7 +653,7 @@ pub fn recurseFiles(root_directory: []const u8, outer_tree: *wdvui.TreeWidget, u
                     color = tint;
                 }
 
-                const padding = dvui.Rect.all(2);
+                // (row icon padding now comes from the shared `treeRowGlyph` slot)
 
                 const selected: bool = isFileSelected(inner_id_extra.*);
                 const editing: bool = if (edit_id) |id| inner_id_extra.* == id else false;
@@ -583,7 +752,7 @@ pub fn recurseFiles(root_directory: []const u8, outer_tree: *wdvui.TreeWidget, u
                 }
 
                 if (branch.insertBefore()) {
-                    const target_dir = if (entry.kind == .directory) abs_path else directory;
+                    const target_dir = if (entry.kind == .directory) abs_path else entry_dir;
                     try applyFileMove(inner_unique_id, tree, target_dir);
                 }
 
@@ -674,7 +843,7 @@ pub fn recurseFiles(root_directory: []const u8, outer_tree: *wdvui.TreeWidget, u
                         if ((dvui.menuItemLabel(@src(), "New File...", .{}, .{ .expand = .horizontal })) != null) {
                             defer fw2.close();
 
-                            const parent_dir: []const u8 = if (entry.kind == .directory) abs_path else directory;
+                            const parent_dir: []const u8 = if (entry.kind == .directory) abs_path else entry_dir;
                             runtime.host().requestNewDocument(parent_dir, branch_id.asUsize());
                         }
 
@@ -685,7 +854,7 @@ pub fn recurseFiles(root_directory: []const u8, outer_tree: *wdvui.TreeWidget, u
                                     std.Io.Dir.createDirAbsolute(dvui.io, new_folder_path, .default_dir) catch dvui.log.err("Failed to create folder: {s}", .{new_folder_path});
                                 },
                                 .file => {
-                                    const new_folder_path = try std.fs.path.join(dvui.currentWindow().arena(), &.{ directory, "New Folder" });
+                                    const new_folder_path = try std.fs.path.join(dvui.currentWindow().arena(), &.{ entry_dir, "New Folder" });
                                     std.Io.Dir.createDirAbsolute(dvui.io, new_folder_path, .default_dir) catch dvui.log.err("Failed to create folder: {s}", .{new_folder_path});
                                 },
                                 else => {},
@@ -724,26 +893,36 @@ pub fn recurseFiles(root_directory: []const u8, outer_tree: *wdvui.TreeWidget, u
                         //if (ext == .hidden) continue;
                         const icon_color = color;
 
+                        // Files have no expander, so they open with an empty caret-sized slot —
+                        // that's what lines their icons up with the folder icons above them.
+                        {
+                            var caret_slot = wdvui.treeRowGlyph(@src(), .{});
+                            caret_slot.deinit();
+                        }
+
                         // The plugin that owns this file type draws its own icon (see
                         // `Host.registerFileIcon`); the workbench only falls back to generic
-                        // filesystem icons when no plugin claims it.
-                        if (!runtime.host().drawFileIcon(std.fs.path.extension(entry.name), abs_path, icon_color)) {
-                            const icon = switch (ext) {
-                                .pdf => icons.tvg.entypo.@"doc-text",
-                                .tar, ._7z, .zip => icons.tvg.entypo.archive,
-                                else => icons.tvg.entypo.archive,
-                            };
-                            dvui.icon(
-                                @src(),
-                                "FileIcon",
-                                icon,
-                                .{ .stroke_color = icon_color, .fill_color = icon_color },
-                                .{
-                                    .gravity_y = 0.5,
-                                    .padding = padding,
-                                    .background = false,
-                                },
-                            );
+                        // filesystem icons when no plugin claims it. A plugin's icon is arbitrary
+                        // art at an arbitrary aspect ratio, so it is boxed to the shared row-glyph
+                        // size like every other glyph rather than being trusted to behave.
+                        {
+                            var icon_slot = wdvui.treeRowGlyph(@src(), .{ .margin = .{ .w = 2 } });
+                            defer icon_slot.deinit();
+
+                            if (!runtime.host().drawFileIcon(std.fs.path.extension(entry.name), abs_path, icon_color)) {
+                                const icon = switch (ext) {
+                                    .pdf => icons.tvg.entypo.@"doc-text",
+                                    .tar, ._7z, .zip => icons.tvg.entypo.archive,
+                                    else => icons.tvg.entypo.archive,
+                                };
+                                dvui.icon(
+                                    @src(),
+                                    "FileIcon",
+                                    icon,
+                                    .{ .stroke_color = icon_color, .fill_color = icon_color },
+                                    wdvui.treeRowIconOptions(.{}),
+                                );
+                            }
                         }
 
                         editableLabel(
@@ -786,33 +965,35 @@ pub fn recurseFiles(root_directory: []const u8, outer_tree: *wdvui.TreeWidget, u
                         const icon_color = color;
 
                         if (dvui.parentGet().data().rectScale().r.h > 10) {
-                            _ = dvui.icon(
-                                @src(),
-                                "DropIcon",
-                                if (branch.expanded) icons.tvg.entypo.@"down-open" else icons.tvg.entypo.@"right-open",
-                                .{
-                                    .fill_color = icon_color,
-                                    .stroke_color = icon_color,
-                                },
-                                .{
-                                    .gravity_y = 0.5,
-                                    .padding = padding,
-                                },
-                            );
+                            {
+                                var caret_slot = wdvui.treeRowGlyph(@src(), .{});
+                                defer caret_slot.deinit();
+                                _ = dvui.icon(
+                                    @src(),
+                                    "DropIcon",
+                                    if (branch.expanded) icons.tvg.entypo.@"down-open" else icons.tvg.entypo.@"right-open",
+                                    .{
+                                        .fill_color = icon_color,
+                                        .stroke_color = icon_color,
+                                    },
+                                    wdvui.treeRowIconOptions(.{}),
+                                );
+                            }
 
-                            _ = dvui.icon(
-                                @src(),
-                                "FolderIcon",
-                                if (branch.expanded) icons.tvg.entypo.folder else icons.tvg.entypo.folder,
-                                .{
-                                    .fill_color = icon_color,
-                                    .stroke_color = icon_color,
-                                },
-                                .{
-                                    .gravity_y = 0.5,
-                                    .padding = padding,
-                                },
-                            );
+                            {
+                                var icon_slot = wdvui.treeRowGlyph(@src(), .{ .margin = .{ .w = 2 } });
+                                defer icon_slot.deinit();
+                                _ = dvui.icon(
+                                    @src(),
+                                    "FolderIcon",
+                                    icons.tvg.entypo.folder,
+                                    .{
+                                        .fill_color = icon_color,
+                                        .stroke_color = icon_color,
+                                    },
+                                    wdvui.treeRowIconOptions(.{}),
+                                );
+                            }
                         }
 
                         editableLabel(
@@ -851,6 +1032,7 @@ pub fn recurseFiles(root_directory: []const u8, outer_tree: *wdvui.TreeWidget, u
                                 color_id,
                                 filter_text,
                                 branch,
+                                null,
                             );
                         } else {
                             if (runtime.host().explorerBranchIsOpen(branch_id)) {
@@ -869,7 +1051,12 @@ pub fn recurseFiles(root_directory: []const u8, outer_tree: *wdvui.TreeWidget, u
         }
     }.search;
 
-    try recursor(root_directory, outer_tree, unique_id, &id_extra, &color_i, outer_filter_text, null);
+    if (outer_filter_text.len > 0) {
+        const ranked = rankedFilterRows(root_directory, outer_filter_text);
+        try recursor(root_directory, outer_tree, unique_id, &id_extra, &color_i, outer_filter_text, null, ranked);
+    } else {
+        try recursor(root_directory, outer_tree, unique_id, &id_extra, &color_i, outer_filter_text, null, null);
+    }
     flushPendingFileShiftRange();
 
     return;
@@ -1178,6 +1365,7 @@ pub fn moveOnePath(source_path: []const u8, target_dir: []const u8, arena: std.m
 /// every open document beneath it; a file rename rewrites that document. Logs and
 /// continues on a filesystem failure (matches the explorer's inline behavior).
 pub fn renamePath(full_path: []const u8, new_path: []const u8, kind: std.Io.File.Kind) !void {
+    invalidateFilterIndex();
     switch (kind) {
         .directory => {
             std.Io.Dir.renameAbsolute(full_path, new_path, dvui.io) catch dvui.log.err("Failed to rename folder: {s} to {s}", .{ std.fs.path.basename(full_path), std.fs.path.basename(new_path) });
@@ -1212,6 +1400,7 @@ pub fn renamePath(full_path: []const u8, new_path: []const u8, kind: std.Io.File
 /// Delete `path` from disk (a directory must be empty — mirrors the explorer's
 /// inline Delete). Logs and continues on failure.
 pub fn deletePath(path: []const u8) void {
+    invalidateFilterIndex();
     if (pathIsDirAbsolute(path)) {
         std.Io.Dir.deleteDirAbsolute(dvui.io, path) catch dvui.log.err("Failed to delete folder: {s}", .{path});
     } else {
@@ -1221,12 +1410,14 @@ pub fn deletePath(path: []const u8) void {
 
 /// Create an empty file at absolute `path`.
 pub fn createFilePath(path: []const u8) !void {
+    invalidateFilterIndex();
     var handle = try std.Io.Dir.createFileAbsolute(dvui.io, path, .{});
     handle.close(dvui.io);
 }
 
 /// Create a directory at absolute `path` (parents must already exist).
 pub fn createDirPath(path: []const u8) !void {
+    invalidateFilterIndex();
     try std.Io.Dir.createDirAbsolute(dvui.io, path, .default_dir);
 }
 

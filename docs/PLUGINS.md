@@ -127,11 +127,12 @@ Zig package, pinned by a **`sdk-v<sdk_version>` tag** (e.g. `sdk-v0.1.35`), not 
 commit SHA. That tag is pushed automatically at the exact commit where the matching `sdk_version`
 was recorded in `src/sdk/version.zig` (see §5) — pin against it and the ref you're reading in
 `build.zig.zon` tells you, at a glance, which SDK contract you're building against. Use
-`zig fetch` to fill in the hash:
+`zig fetch` to fill in the hash — pin the **SDK release asset**, not the git archive of the tag:
 
 ```sh
 mkdir my-plugin && cd my-plugin
-zig fetch --save=fizzy https://github.com/fizzyedit/fizzy/archive/refs/tags/sdk-v0.1.35.tar.gz
+zig fetch --save=fizzy \
+  https://github.com/fizzyedit/fizzy/releases/download/sdk-v0.1.42/fizzy-sdk-v0.1.42.tar.gz
 ```
 
 which produces:
@@ -146,7 +147,7 @@ which produces:
     .fingerprint = 0x0000000000000000, // zig fills this in on first `zig build`
     .dependencies = .{
         .fizzy = .{
-            .url = "https://github.com/fizzyedit/fizzy/archive/refs/tags/sdk-v0.1.35.tar.gz",
+            .url = "https://github.com/fizzyedit/fizzy/releases/download/sdk-v0.1.42/fizzy-sdk-v0.1.42.tar.gz",
             .hash = "<hash zig fetch printed>",
         },
     },
@@ -154,16 +155,23 @@ which produces:
 ```
 
 Pick the `sdk-v*` tag that matches the SDK version you intend to support (see §5) — every
-`sdk_version` bump gets one automatically, so there's no need to go spelunking through commit
-history for the right SHA. Built-in plugins in this repo use `.path = "../../.."` instead of a
-URL, since they live next to the fizzy checkout — a real third-party plugin always pins a
-**URL + hash** against an `sdk-v*` tag, because CI and other users won't have a sibling checkout.
+`sdk_version` bump gets a tag **and** a `fizzy-sdk-v*` release asset automatically
+(`.github/workflows/sdk-tag.yml` + `scripts/pack-sdk.sh`). Built-in plugins in this repo use
+`.path = "../../../sdk"` instead of a URL, since they live next to the fizzy checkout — a real
+third-party plugin always pins a **URL + hash** against that release asset, because CI and other
+users won't have a sibling checkout.
+
+Depend on fizzy's **`sdk/` package** (not the repo root). The root zon owns the editor and lists
+app-only deps (Velopack, …) that must never enter a plugin's `zig-pkg`. Zig cannot depend on a
+subdirectory of a URL archive, so the release asset *is* the `sdk/` package with `src/core` +
+`src/sdk` vendored in. Do **not** pin
+`https://github.com/fizzyedit/fizzy/archive/refs/tags/sdk-v….tar.gz` — that is the full monorepo.
+
+Locally: `.path = "../fizzy/sdk"` (or equivalent) while developing against an unreleased SDK.
 
 `sdk-v*` tags are a separate namespace from fizzy's own `v*` app-release tags (§5) — they don't
 trigger the app's build/package pipeline and never will (the release workflow's trigger is a glob
-on the ref's start, and `sdk-v...` doesn't start with `v`). They exist purely as a pin point for
-this dependency; there's no separate "SDK package" to install and nothing to `zig build` from a
-`sdk-v*` checkout directly.
+on the ref's start, and `sdk-v...` doesn't start with `v`).
 
 ### 2.4 `build.zig`
 
@@ -180,12 +188,12 @@ pub fn build(b: *std.Build) void {
 }
 ```
 
-`fizzy.plugin.create`/`.install` (defined in fizzy's `plugin_sdk.zig`, exposed as `fizzy.plugin`
-in `build.zig`) are the entire "built-in function" surface a plugin needs — there's no separate
-SDK package to import, and no `name`/`version` to pass: `create` reads both (plus `id` and
-`min_sdk_version`) straight from `plugin.zig.zon` (§2.2), so there is exactly one source of truth.
-Under the hood, depending on `fizzy` with `.plugin_sdk = true` makes fizzy's root `build.zig` skip
-the whole app build and just export the `fizzy_sdk`/`core`/`dvui` modules your plugin links against.
+`fizzy.plugin.create`/`.install` (defined in fizzy's `sdk/plugin_sdk.zig`, exposed as
+`fizzy.plugin` from the `sdk/` package's `build.zig`) are the entire build-side surface a plugin
+needs — no `name`/`version` to pass: `create` reads both (plus `id` and `min_sdk_version`)
+straight from `plugin.zig.zon` (§2.2), so there is exactly one source of truth. Depending on the
+`sdk/` package exports the `fizzy_sdk`/`core`/`dvui` modules your plugin links against (the
+`.plugin_sdk = true` option is still accepted for compatibility and is a no-op).
 
 `create` returns `.{ lib, module }`: `lib` is the dylib artifact to pass to `.install`;
 `module` is *your* `plugin.zig` module — attach any extra imports/options there (not to
@@ -253,8 +261,9 @@ single export avoids the double attachment entirely.
 zig build install
 ```
 
-This builds the plugin for your current OS and drops `my_plugin.<ext>` straight into the fizzy
-plugins directory the editor scans on startup — no `--prefix`, no manual copy:
+This builds the plugin for your current OS and drops `my_plugin/my_plugin.<ext>` — its own
+directory, one per plugin — straight into the fizzy plugins directory the editor scans on
+startup: no `--prefix`, no manual copy:
 
 | OS | Plugins directory |
 |----|--------------------|
@@ -265,8 +274,9 @@ plugins directory the editor scans on startup — no `--prefix`, no manual copy:
 Relaunch Fizzy. Your plugin registers, but since it contributes no sidebar view or menu yet,
 there's nothing to see — that's expected. Section 3 adds a visible pane.
 
-`zig build install` also leaves `zig-out/my_plugin.<ext>` behind, which is what packaging / the
-release CI in §6 grabs.
+`zig build install` also leaves `zig-out/my_plugin/my_plugin.<ext>` behind, which is what
+packaging / the release CI in §6 grabs. Your plugin's own directory (`Host.pluginInstallDir(id)`)
+is also where it can store its own assets/data at runtime, if it needs to.
 
 > **Fastest way to start a real plugin:** copy [`src/plugins/text/`](../src/plugins/text/)
 > instead of typing all of the above by hand. It's an always-compiling document-owning editor
@@ -344,18 +354,44 @@ pub fn register(host: *sdk.Host) !void {
 type actually uses (`IntKind{min,max,choices}`, `FloatKind{min,max,step}`, `EnumKind{choices}`,
 void for bool/string/color), rather than one flat struct with every type's bounds fields present
 on every entry — and generates `Value` (= `T`), `load`/`store` (a zon round-trip through
-`Host.loadPluginSettings`/`storePluginSettings` — each plugin gets its own real, human-editable
-`<plugins_dir>/<id>.settings.zon` file, sitting right beside `<id>.{dylib,so,dll}` in the same
-`plugins/` directory a third-party plugin installs into; not a blob embedded in the shell's own
-settings.zon), `applyZon` (parse+apply a blob directly, e.g. from `Plugin.VTable.settingsChanged`
-for live edits), and `register` (wires a `SettingsSchema` + typed `Access` vtable into the Host).
-`storePluginSettings` buffers the write and debounces through the shell's autosave
-(`Host.flushPluginSettings`), which also skips the `writeFile` entirely when the pending blob
-hashes the same as what's already on disk (or was last written this session) — a `persist()`/
-`save()` call that didn't actually change anything doesn't touch disk. The file survives a
-disabled or uninstalled plugin (only the dylib is deleted on uninstall), so reinstalling — or
-fixing a plugin stuck in a load-failure loop and reloading it — picks the settings back up
-unchanged.
+`Host.loadPluginSettings`/`storePluginSettings`), `applyZon` (parse a blob directly into the live
+value — the primitive `Access.applyBlob` wraps with a `settingsChanged` notification, used by
+external-change reconciliation, see below), and `register` (wires a `SettingsSchema` + typed
+`Access` vtable into the Host).
+
+Every plugin's block lives as a real, hand-editable nested ZON struct literal keyed by plugin
+id inside the shell's own `{config}/settings.zon`:
+
+```
+.plugins = .{
+    .text = .{ .enabled = true, .settings = .{ .tab_size = 8 } },
+    .pixi = .{ .settings = .{ .grid_size = 16 } }, // disabled (`.enabled` omitted = false)
+}
+```
+
+Author fields live under `.settings` so they can never collide with the shell-reserved
+`.enabled`. Only fields that differ from `T`'s own declared defaults are written; an all-default
+value removes that plugin's `.settings` (and if also disabled, the whole `.plugins.<id>` entry).
+`src/editor/SettingsPluginsZon.zig` locates/composes fields by source byte-span via the same
+`std.zig.Ast`/`ZonGen` machinery `std.zon.parse` uses, so nothing else in the file is
+re-serialized. Reads (`Host.loadPluginSettings`) return the `.settings` sub-blob for the plugin
+currently calling `register()`. A plugin's settings survive uninstall (only the dylib/directory
+is deleted); reinstalling picks them back up. Whether the merge touches disk at all is decided
+once, over the whole composed file.
+
+**Enabled state is per-plugin.** `.plugins.<id>.enabled` defaults to `false` (absent = disabled).
+Store installs write `.enabled = true` immediately (auto-load as before); a dylib dropped
+straight into `plugins/` shows up as a disabled entry with no settings.zon write until the user
+enables it from the UI.
+
+**`settings.zon` is watched live.** A background watcher ([nightwatch](https://github.com/neurocyte/nightwatch),
+recursive over `<config>/`) picks up external changes — a hand edit, another tool, a newly
+dropped-in plugin directory — while fizzy is running and reconciles them into every loaded
+plugin's live value via `Access.applyBlob`, calling `settingsChanged` exactly as an in-app edit
+would. A plugin implementing `settingsChanged` should not assume it only fires from the user's
+own settings-pane interaction. This is on by default and not configurable; if the watcher can't
+start (platform quirk, resource limit) fizzy still launches normally, it just doesn't get live
+reconciliation that session.
 
 **Plugins do not draw settings.** They register a typed value + field metadata only. The shell's
 `PluginSettingsPane` renders shared controls (checkbox / slider / enum dropdown / …) so every
@@ -373,8 +409,10 @@ plugin gets an Enabled-toggle-only row instead of its fields.
 
 - **Lifecycle** — `deinit`, `initPlugin`.
 - **Document ownership** — `fileTypePriority(ext)` (claim file extensions), `loadDocument` /
-  `loadDocumentFromBytes` / `createDocument`, `saveDocument`, `closeDocument`, `isDirty`,
-  `undo`/`redo`/`canUndo`/`canRedo`, plus opaque document-buffer management for the async load path.
+  `loadDocumentFromBytes` / `createDocument`, `saveDocument`, `reloadDocument` (optional — shell
+  document watcher reloads clean open tabs when the file changes on disk), `closeDocument`,
+  `isDirty`, `undo`/`redo`/`canUndo`/`canRedo`, plus opaque document-buffer management for the
+  async load path.
 - **Document metadata at the workbench boundary** — `bindDocumentToPane`, `documentGrouping`,
   `documentPath`, `setDocumentPath`, dirty/save indicators. These keep `DocHandle` opaque so the
   file-management plugin never sees a plugin-specific type.
@@ -493,6 +531,13 @@ Files inside `src/**` must **not** `@import("fizzy")` or reach into the shell. A
 `@import("fizzy_sdk")`, `@import("core")`, `@import("dvui")` (wired onto your module by
 `fizzy.plugin.create`), and sibling files in your own `src/` tree. This is what lets the same
 sources compile as a standalone dylib whether they ship in-repo or from a third-party project.
+
+Useful things already inside `core`, so you never need to add a dependency for them:
+`core.lsp.Client` (§7), and `core.fuzzy` — the zf-backed matcher every filter box in the shell
+uses. Build a `fuzzy.Query` once from your filter text, then `fuzzy.score` / `fuzzy.scoreBest`
+each candidate and `fuzzy.sort` the survivors; `fuzzy.highlight` gives you the matched byte
+indices for tinting a label. Scores are **costs — lower is better**, and matching is
+case-insensitive until the query itself contains a capital.
 
 ### 3.7 Plugin shapes
 
@@ -674,7 +719,7 @@ Fizzy uses three independent versions:
 | Version | Owner | Purpose |
 |---------|-------|---------|
 | **App version** | Fizzy release (`build.zig.zon`) | User-facing editor release; does **not** gate plugin loading |
-| **SDK version** | `src/sdk/version.zig` (`sdk_version`) | ABI contract; bumps when the plugin boundary changes. Every bump gets an `sdk-v<version>` git tag (auto-pushed by CI — see §2.3) as the pin point for plugin `build.zig.zon`s |
+| **SDK version** | `src/sdk/version.zig` (`sdk_version`) | ABI contract; bumps when the plugin boundary changes. Every bump gets an `sdk-v<version>` git tag **and** a `fizzy-sdk-v*` release asset (auto-pushed by CI — see §2.3) as the pin point for plugin `build.zig.zon`s |
 | **Plugin version** | Author `plugin.zig.zon` `.version` | Plugin's own release semver — the single source of truth, forwarded into the build (`fizzy_plugin_options`) and embedded in the dylib's `fizzy_plugin_manifest_zon`/`fizzy_plugin_version` exports |
 
 At load time the host checks, in order:
@@ -849,7 +894,7 @@ Fizzy's in-app Plugins tab:
   1. fetch summary.json → the browse list
   2. fetch releases.json for MY abi_fingerprint
   3. pick the release's download for my os-arch, verify its sha256
-  4. write {config}/plugins/{id}.{ext}  →  dlopen on next launch
+  4. write {config}/plugins/{id}/{id}.{ext}  →  dlopen on next launch
 ```
 
 The catalog is split by fingerprint on purpose: each running Fizzy build only ever needs — and
@@ -877,7 +922,9 @@ drop straight into the plugins directory, exactly like §2.6.
 | `src/sdk/version.zig` | SDK version + ABI fingerprint CI lock |
 | `src/sdk/manifest.zig` | `Manifest` — the identity-only `plugin.zig.zon` shape (`id`/`name`/`version`/`min_sdk_version`) + `parse`/`free`, read back out of a loaded dylib at runtime. The typed shape actually baked into a dylib's C-ABI exports is `dylib.Identity` (build-injected, never runtime-parsed) |
 | `src/sdk/settings.zig` | Comptime settings API (`sdk.settings.Schema(T)`) — see §3.1.1 |
-| `plugin_sdk.zig` (repo root) | `fizzy.plugin.create` / `.install` / `.addCModule` — the build-side API a plugin's `build.zig` calls |
+| `src/editor/SettingsPluginsZon.zig` | ZON-AST byte-span surgery for `settings.zon`'s merged `.plugins.<id>` fields — shell-only, not part of the SDK |
+| `src/editor/SettingsWatcher.zig` | Thin nightwatch adapter for live external `settings.zon` / dropped-in plugin reconciliation (see above) — shell-only, not part of the SDK |
+| `sdk/plugin_sdk.zig` | `fizzy.plugin.create` / `.install` / `.addCModule` — the build-side API a plugin's `build.zig` calls |
 | `src/plugins/text/` | Canonical document-owning editor plugin — copy to start a new editor plugin |
 | `src/plugins/image/` | Read-only image viewer (PNG/JPG/JPEG) with zoom/pan |
 | `src/plugins/workbench/` | Reference file-management (shell-profile) plugin |
@@ -901,14 +948,15 @@ drop straight into the plugins directory, exactly like §2.6.
 ### Plugin dylib layout
 
 ```
-{config}/plugins/{id}.dylib   # macOS
-{config}/plugins/{id}.so      # Linux
-{config}/plugins/{id}.dll     # Windows
-{exe}/plugins/{id}.{ext}      # bundled built-ins
+{config}/plugins/{id}/{id}.dylib   # macOS
+{config}/plugins/{id}/{id}.so      # Linux
+{config}/plugins/{id}/{id}.dll     # Windows
+{exe}/plugins/{id}/{id}.{ext}      # bundled built-ins
 ```
 
-Flat only — there is no legacy `{id}/plugin.dylib` layout, and no on-disk `.zon` sidecar next to
-it. The plugin's `plugin.zig.zon` `.id` must match the filename basename.
+One directory per plugin (`Host.pluginInstallDir(id)` gives a plugin this path at runtime, for
+its own assets/data) — no on-disk `.zon` sidecar next to the dylib. The plugin's `plugin.zig.zon`
+`.id` must match both the directory name and the dylib's filename basename.
 
 ### How built-in plugins are wired (fizzy-internal — not needed for third-party authors)
 

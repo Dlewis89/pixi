@@ -13,7 +13,7 @@
     .fingerprint = 0x96be88e3e93bcfea,
     .dependencies = .{
         .fizzy = .{
-            .path = "../../..",
+            .path = "../../../sdk",
         },
         .cmark_gfm = .{
             .url = "git+https://github.com/kristoff-it/cmark-gfm#cd0aba87cc89f0c8aa9393e59505db271ea30239",

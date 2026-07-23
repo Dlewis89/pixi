@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const fizzy = @import("../fizzy.zig");
 const dvui = @import("dvui");
+const Constants = @import("Constants.zig");
 const App = fizzy.App;
 const Editor = fizzy.Editor;
 
@@ -117,7 +118,7 @@ fn drawOption(view: *const SidebarView, index: usize, size: f32) !Action {
     // sit inside the strip — anything below is registered harmlessly (no overlap with drag rect).
     if (builtin.os.tag == .windows) {
         const r = bw.data().rectScale().r;
-        const strip_h = (fizzy.editor.settings.titlebar_top_buffer + fizzy.editor.settings.titlebar_height) * dvui.windowNaturalScale();
+        const strip_h = (Constants.titlebar_top_buffer + Constants.titlebar_height) * dvui.windowNaturalScale();
         if (r.y < strip_h) fizzy.backend.pushTitleBarInteractiveRect(r);
     }
 

@@ -1,13 +1,15 @@
+//! Shown when the user tries to save a dirty document whose on-disk contents have
+//! changed since it was opened / last saved / last reloaded. Offers overwrite,
+//! discard (reload from disk), or cancel.
 const std = @import("std");
 const fizzy = @import("../../fizzy.zig");
 const dvui = @import("dvui");
-const Dialogs = @import("Dialogs.zig");
 
 pub fn request(file_id: u64) void {
     var mutex = fizzy.dvui.dialog(@src(), .{
         .displayFn = dialog,
         .callafterFn = callAfter,
-        .title = "Unsaved changes",
+        .title = "File changed on disk",
         .ok_label = "",
         .cancel_label = "",
         .resizeable = false,
@@ -16,7 +18,7 @@ pub fn request(file_id: u64) void {
         .max_size = .{ .w = 520, .h = 280 },
         .header_kind = .warning,
     });
-    dvui.dataSet(null, mutex.id, "_unsaved_file_id", file_id);
+    dvui.dataSet(null, mutex.id, "_file_changed_id", file_id);
     mutex.mutex.unlock(dvui.io);
 }
 
@@ -48,18 +50,21 @@ fn dialogButton(src: std.builtin.SourceLocation, label_text: []const u8, style: 
 }
 
 pub fn dialog(id: dvui.Id) anyerror!bool {
-    const file_id = dvui.dataGet(null, id, "_unsaved_file_id", u64) orelse return false;
+    const file_id = dvui.dataGet(null, id, "_file_changed_id", u64) orelse return false;
     const name = fileBasename(file_id);
 
     var outer = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both, .padding = .all(8) });
     defer outer.deinit();
 
-    dvui.label(
-        @src(),
-        "Save changes to \"{s}\" before closing?",
+    const message = std.fmt.allocPrint(
+        dvui.currentWindow().arena(),
+        "\"{s}\" has a newer version on disk. Overwrite with your edits, or discard them and reload?",
         .{name},
-        .{ .font = dvui.Font.theme(.body) },
-    );
+    ) catch name;
+
+    var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .background = false });
+    tl.addText(message, .{ .font = dvui.Font.theme(.body) });
+    tl.deinit();
 
     _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 8, .h = 16 } });
 
@@ -69,12 +74,12 @@ pub fn dialog(id: dvui.Id) anyerror!bool {
     var btn_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .none, .gravity_x = 0.5 });
     defer btn_row.deinit();
 
-    if (dialogButton(@src(), "Close", .control, 1, 0)) {
-        try onDiscard(file_id);
+    if (dialogButton(@src(), "Overwrite", .highlight, 1, 0)) {
+        try onOverwrite(file_id);
     }
     _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 10, .h = 1 } });
-    if (dialogButton(@src(), "Save and Close", .highlight, 2, 1)) {
-        try onSaveAndClose(file_id);
+    if (dialogButton(@src(), "Discard Changes", .control, 2, 1)) {
+        onDiscard(file_id);
     }
     _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 10, .h = 1 } });
     if (dialogButton(@src(), "Cancel", .control, 3, 2)) {
@@ -84,52 +89,32 @@ pub fn dialog(id: dvui.Id) anyerror!bool {
     return true;
 }
 
-fn onDiscard(file_id: u64) !void {
-    try fizzy.editor.rawCloseFileID(file_id);
+fn onOverwrite(file_id: u64) !void {
+    const doc = fizzy.editor.docById(file_id) orelse {
+        fizzy.dvui.closeFloatingDialogAnchored();
+        return;
+    };
+    fizzy.dvui.closeFloatingDialogAnchored();
+    // Clear conflict and write; `noteSaved` refreshes the baseline after success.
+    if (fizzy.editor.document_watcher) |*w| w.markPendingBaseline(file_id);
+    doc.owner.saveDocument(doc) catch |err| {
+        // Save failed — keep treating disk as conflicting so the next save re-prompts.
+        if (fizzy.editor.document_watcher) |*w| w.restoreDiskConflict(file_id);
+        return err;
+    };
+    if (fizzy.editor.document_watcher) |*w| w.noteSaved(file_id);
+}
+
+fn onDiscard(file_id: u64) void {
+    const doc = fizzy.editor.docById(file_id) orelse {
+        fizzy.dvui.closeFloatingDialogAnchored();
+        return;
+    };
+    if (fizzy.editor.document_watcher) |*w| w.discardToDisk(doc);
     fizzy.dvui.closeFloatingDialogAnchored();
 }
 
 fn onCancel() void {
-    fizzy.dvui.closeFloatingDialogAnchored();
-}
-
-fn beginSaveAndClose(doc: fizzy.sdk.DocHandle, file_id: u64) !void {
-    if (doc.owner.isDocumentSaving(doc)) return;
-    if (comptime @import("builtin").target.cpu.arch == .wasm32) {
-        const idx = fizzy.editor.open_files.getIndex(file_id) orelse return;
-        fizzy.editor.setActiveFile(idx);
-        fizzy.editor.pending_close_file_id = file_id;
-        fizzy.editor.requestWebSaveDialog(.save);
-        return;
-    }
-    if (fizzy.editor.document_watcher) |*w| w.markPendingBaseline(file_id);
-    try doc.owner.saveDocumentAsync(doc);
-    try fizzy.editor.pending_close_after_save.put(fizzy.app.allocator, file_id, {});
-}
-
-fn onSaveAndClose(file_id: u64) !void {
-    const doc = fizzy.editor.docById(file_id) orelse return;
-    if (!doc.owner.documentHasRecognizedSaveExtension(doc)) {
-        const idx = fizzy.editor.open_files.getIndex(file_id) orelse return;
-        fizzy.editor.setActiveFile(idx);
-        fizzy.editor.pending_close_file_id = file_id;
-        fizzy.dvui.closeFloatingDialogAnchored();
-        fizzy.editor.requestSaveAs();
-        return;
-    }
-    if (fizzy.editor.document_watcher) |*w| {
-        if (w.hasDiskConflict(file_id)) {
-            fizzy.dvui.closeFloatingDialogAnchored();
-            Dialogs.FileChangedOnDisk.request(file_id);
-            return;
-        }
-    }
-    if (doc.owner.saveNeedsConfirmation(doc)) {
-        fizzy.dvui.closeFloatingDialogAnchored();
-        doc.owner.requestSaveConfirmation(doc, .save_and_close, false);
-        return;
-    }
-    try beginSaveAndClose(doc, file_id);
     fizzy.dvui.closeFloatingDialogAnchored();
 }
 

@@ -54,6 +54,7 @@ const vtable: sdk.Plugin.VTable = .{
     // rendering + lifecycle
     .drawDocument = drawDocument,
     .closeDocument = closeDocument,
+    .reloadDocument = reloadDocument,
     .isDirty = isDirty,
     .saveDocument = saveDocument,
     // text saves are small and synchronous, so the async path just saves in place
@@ -169,9 +170,15 @@ fn isTextIconExt(ext: []const u8) bool {
 
 fn drawFileIcon(_: ?*anyopaque, ext: []const u8, _: []const u8, color: dvui.Color) bool {
     if (!isTextIconExt(ext)) return false;
+    // `expand = .ratio` fits the glyph to the fixed slot the file tree reserved for it — see
+    // `Host.FileIcon`. Sizing it here instead would make text rows a different height to every
+    // other row in the tree.
     dvui.icon(@src(), "CodeFileIcon", dvui.entypo.code, .{ .stroke_color = color, .fill_color = color }, .{
+        .expand = .ratio,
+        .gravity_x = 0.5,
         .gravity_y = 0.5,
-        .padding = dvui.Rect.all(3),
+        .padding = dvui.Rect.all(0),
+        .margin = dvui.Rect.all(0),
         .background = false,
     });
     return true;
@@ -274,6 +281,10 @@ fn drawDocument(_: *anyopaque, handle: DocHandle) anyerror!void {
 
 fn closeDocument(_: *anyopaque, handle: DocHandle) void {
     (docFrom(handle) orelse return).deinit();
+}
+fn reloadDocument(_: *anyopaque, handle: DocHandle) anyerror!void {
+    const doc = docFrom(handle) orelse return error.DocumentNotFound;
+    try doc.reloadFromDisk();
 }
 fn isDirty(_: *anyopaque, handle: DocHandle) bool {
     return (docFrom(handle) orelse return false).isDirty();

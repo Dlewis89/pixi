@@ -9,6 +9,7 @@ const Document = @import("Document.zig");
 const SyntaxHighlight = @import("SyntaxHighlight.zig");
 const TextEntryWidget = @import("widgets/TextEntryWidget.zig");
 const TooltipWidget = @import("widgets/TooltipWidget.zig");
+const fuzzy = core.fuzzy;
 
 const editor_pad_y: f32 = 8;
 const editor_pad_right: f32 = 8;
@@ -459,6 +460,40 @@ fn fetchSignatureHint(doc: *Document, ext: []const u8, te: *TextEntryWidget, gpa
 /// shorter than a hover tooltip since this is a scannable list of short candidates, not prose.
 const completion_list_max_size: dvui.Size = .{ .w = 280, .h = 200 };
 
+/// Render `label` into `tl`, tinting the characters `query` matched. With nothing typed (or a
+/// label that somehow didn't match) this is a single plain run — the common case, and the reason
+/// the fast paths come first.
+fn addMatchHighlighted(tl: *dvui.TextLayoutWidget, label: []const u8, query: *const fuzzy.Query) void {
+    const plain = dvui.themeGet().color(.control, .text);
+    if (query.isEmpty()) {
+        tl.addText(label, .{ .color_text = plain });
+        return;
+    }
+
+    var buf: [fuzzy.highlight_buf_len]usize = undefined;
+    const hits = fuzzy.highlight(label, query, &buf, .{ .plain = true });
+    if (hits.len == 0) {
+        tl.addText(label, .{ .color_text = plain });
+        return;
+    }
+
+    const matched = dvui.themeGet().color(.highlight, .fill);
+    var i: usize = 0;
+    var h: usize = 0;
+    while (i < label.len) {
+        if (h < hits.len and hits[h] == i) {
+            // One `addText` per contiguous matched run, not per character.
+            const start = i;
+            while (h < hits.len and hits[h] == i) : (h += 1) i += 1;
+            tl.addText(label[start..i], .{ .color_text = matched });
+        } else {
+            const start = i;
+            i = if (h < hits.len) hits[h] else label.len;
+            tl.addText(label[start..i], .{ .color_text = plain });
+        }
+    }
+}
+
 /// Picks a dropdown row's icon from dvui's generic `entypo` set — there's no VSCode-style
 /// code-symbol icon set available here, so this is a best-effort semantic approximation
 /// (e.g. `code` for anything callable, `box` for a plain value) rather than a faithful match.
@@ -586,14 +621,15 @@ fn drawCompletionList(doc: *Document, ext: []const u8, te: *TextEntryWidget, id_
         .background = false,
     });
 
-    // The portion of the current word already typed, so each row can render that prefix in
-    // the theme's highlight-fill color (matching what the user actually typed) with the rest
-    // of the label in plain control text
+    // The portion of the current word already typed, so each row can render the characters it
+    // matched in the theme's highlight-fill color with the rest of the label in plain control
+    // text. Candidates are fuzzy-matched (see `lsp.Client.resolveCompletionItem`), so those
+    // characters are scattered through the label rather than being a leading prefix.
     const word_start = wordStartBefore(doc.text.items, completion.anchor);
     const already_typed = doc.text.items[word_start..completion.anchor];
+    var typed_query = fuzzy.Query.init(already_typed);
 
     for (completion.items, 0..) |candidate, i| {
-        const matched_len = if (std.mem.startsWith(u8, candidate.label, already_typed)) already_typed.len else 0;
 
         // Inlined `dvui.button()` (rather than the convenience wrapper) so the row's own
         // rect is available afterward for `dvui.scrollTo` — the wrapper doesn't expose it.
@@ -637,12 +673,7 @@ fn drawCompletionList(doc: *Document, ext: []const u8, te: *TextEntryWidget, id_
 
         const mono_font = dvui.Font.theme(.mono);
         var lbl = dvui.textLayout(@src(), .{ .break_lines = false }, .{ .expand = .horizontal, .gravity_y = 0.5, .background = false, .font = mono_font });
-        if (matched_len > 0) {
-            lbl.addText(candidate.label[0..matched_len], .{ .color_text = dvui.themeGet().color(.highlight, .fill) });
-            lbl.addText(candidate.label[matched_len..], .{ .color_text = dvui.themeGet().color(.control, .text) });
-        } else {
-            lbl.addText(candidate.label, .{ .color_text = dvui.themeGet().color(.control, .text) });
-        }
+        addMatchHighlighted(lbl, candidate.label, &typed_query);
         lbl.deinit();
 
         if (candidate.detail.len > 0) {

@@ -8,6 +8,7 @@ const objc = @import("objc");
 const win32 = @import("win32");
 const singleton = @import("singleton.zig");
 const window_layout = @import("window_layout.zig");
+const Constants = @import("../editor/Constants.zig");
 
 // AppKit geometry types for NSView frame/bounds (same layout as Foundation).
 const NSPoint = extern struct { x: f64, y: f64 };
@@ -179,7 +180,7 @@ fn macosAppPreBeginSync(back: *@import("backend").SDLBackend) void {
     if (!macos_pump_ready) return;
     // Sync AppKit's live sizes into SDL during Space/zoom animations so dvui lays
     // out at transition-correct dimensions. Geometry persistence is owned by fizzy
-    // (window_frame.zon) and disabled in dvui, so there is nothing to toggle here.
+    // (window.zon) and disabled in dvui, so there is nothing to toggle here.
     if (!macosTransitionSyncActive()) return;
     macosSyncContentViews(back.window);
     macosSyncRendererSize(back.window, true);
@@ -209,53 +210,104 @@ export fn fizzy_macos_window_request_clear_frames(frames: c_int) void {
     _ = frames;
 }
 
-// Frame-based geometry persistence. fizzy's window is a frame == content window
-// (full-size content view), which dvui's content-based `WindowGeometry` can't
-// represent — so fizzy persists the actual NSWindow.frame (AppKit bottom-left
-// points) itself. dvui's own persistence is disabled (persist_window_geometry =
-// false in App.startOptions). Stored next to where dvui would write, in the
-// configured pref_path.
-const SavedFrame = struct { x: f64, y: f64, w: f64, h: f64 };
-const window_frame_file = "window_frame.zon";
+// Frame-based geometry persistence, plus (cross-platform) the explorer/panel split ratios —
+// both are "window shape" state, persisted separately from `settings.zon` so dragging a splitter
+// doesn't touch the user's actual settings file (see docs comment on `Constants.zig`). fizzy's
+// window is a frame == content window (full-size content view), which dvui's content-based
+// `WindowGeometry` can't represent — so fizzy persists the actual NSWindow.frame (AppKit
+// bottom-left points) itself, macOS-only. dvui's own persistence is disabled
+// (persist_window_geometry = false in App.startOptions). Stored next to where dvui would write,
+// in the configured pref_path.
+//
+// Two independent writers touch this same file — the macOS-only geometry save (at shutdown) and
+// the cross-platform ratio save (debounced, on every platform) — so both read-modify-write
+// (`loadWindowFile` then override only their own fields) rather than overwriting the whole file,
+// so neither ever clobbers what the other most recently wrote.
+const SavedFrame = struct {
+    x: f64 = 0,
+    y: f64 = 0,
+    w: f64 = 0,
+    h: f64 = 0,
+    explorer_ratio: f32 = 0.35,
+    panel_ratio: f32 = 0.25,
+};
+const window_file = "window.zon";
 
-fn frameFilePath(buf: []u8, dir: [:0]const u8) ?[:0]const u8 {
+fn windowFilePath(buf: []u8, dir: []const u8) ?[:0]const u8 {
     const sep = std.fs.path.sep_str;
     if (std.mem.endsWith(u8, dir, sep)) {
-        return std.fmt.bufPrintZ(buf, "{s}{s}", .{ dir, window_frame_file }) catch null;
+        return std.fmt.bufPrintZ(buf, "{s}{s}", .{ dir, window_file }) catch null;
     }
-    return std.fmt.bufPrintZ(buf, "{s}{s}{s}", .{ dir, sep, window_frame_file }) catch null;
+    return std.fmt.bufPrintZ(buf, "{s}{s}{s}", .{ dir, sep, window_file }) catch null;
 }
 
-fn loadSavedFrame(dir: [:0]const u8) ?SavedFrame {
+/// Reads every field of `window.zon`, falling back to `SavedFrame`'s own defaults for whatever
+/// is missing or unparseable (never null — simplifies every caller, which only cares about the
+/// subset of fields it owns).
+fn loadWindowFile(dir: []const u8) SavedFrame {
     var path_buf: [1024]u8 = undefined;
-    const path = frameFilePath(&path_buf, dir) orelse return null;
-    const data = std.Io.Dir.cwd().readFileAlloc(dvui.io, path, std.heap.page_allocator, .limited(1024)) catch return null;
+    const path = windowFilePath(&path_buf, dir) orelse return .{};
+    const data = std.Io.Dir.cwd().readFileAlloc(dvui.io, path, std.heap.page_allocator, .limited(1024)) catch return .{};
     defer std.heap.page_allocator.free(data);
     var nul_buf: [1025]u8 = undefined;
-    if (data.len >= nul_buf.len) return null;
+    if (data.len >= nul_buf.len) return .{};
     @memcpy(nul_buf[0..data.len], data);
     nul_buf[data.len] = 0;
-    const f = std.zon.parse.fromSlice(
+    return std.zon.parse.fromSlice(
         SavedFrame,
         std.heap.page_allocator,
         nul_buf[0..data.len :0],
         null,
         .{ .ignore_unknown_fields = true },
-    ) catch return null;
-    if (f.w < 1 or f.h < 1) return null;
-    return f;
+    ) catch .{};
 }
 
-fn writeSavedFrame(dir: [:0]const u8, f: SavedFrame) void {
+fn writeWindowFile(dir: []const u8, f: SavedFrame) void {
     var path_buf: [1024]u8 = undefined;
-    const path = frameFilePath(&path_buf, dir) orelse return;
+    const path = windowFilePath(&path_buf, dir) orelse return;
     var aw = std.Io.Writer.Allocating.init(std.heap.page_allocator);
     defer aw.deinit();
     std.zon.stringify.serialize(f, .{}, &aw.writer) catch return;
     std.Io.Dir.createDirAbsolute(dvui.io, dir, .default_dir) catch {};
     std.Io.Dir.cwd().writeFile(dvui.io, .{ .sub_path = path, .data = aw.written() }) catch {
-        std.log.err("failed to write window_frame.zon", .{});
+        std.log.err("failed to write window.zon", .{});
     };
+}
+
+/// The saved NSWindow frame, or null if there's none yet / it's degenerate (w/h < 1) — same
+/// contract `loadSavedFrame` had before the rename. macOS-only caller (`restoreWindowState`).
+fn loadSavedFrame(dir: []const u8) ?SavedFrame {
+    const f = loadWindowFile(dir);
+    if (f.w < 1 or f.h < 1) return null;
+    return f;
+}
+
+/// Read-modify-write: preserves whatever ratios are already on disk, overrides only the frame
+/// geometry. macOS-only caller (`saveWindowGeometry`).
+fn writeSavedFrame(dir: []const u8, x: f64, y: f64, w: f64, h: f64) void {
+    var f = loadWindowFile(dir);
+    f.x = x;
+    f.y = y;
+    f.w = w;
+    f.h = h;
+    writeWindowFile(dir, f);
+}
+
+/// Read-modify-write: preserves whatever frame geometry is already on disk, overrides only the
+/// explorer/panel split ratios. Cross-platform (called from `Editor`'s debounced autosave on
+/// every OS, not just macOS).
+pub fn saveWindowRatios(dir: []const u8, explorer_ratio: f32, panel_ratio: f32) void {
+    var f = loadWindowFile(dir);
+    f.explorer_ratio = explorer_ratio;
+    f.panel_ratio = panel_ratio;
+    writeWindowFile(dir, f);
+}
+
+/// Explorer/panel split ratios from `window.zon`, or `SavedFrame`'s own defaults if the file
+/// doesn't exist yet (fresh install). Cross-platform; call once at startup.
+pub fn loadWindowRatios(dir: []const u8) struct { explorer_ratio: f32, panel_ratio: f32 } {
+    const f = loadWindowFile(dir);
+    return .{ .explorer_ratio = f.explorer_ratio, .panel_ratio = f.panel_ratio };
 }
 
 /// True if the saved frame's title strip lands on a connected display (guards
@@ -334,7 +386,7 @@ pub fn restoreWindowState(win: *dvui.Window) void {
         }
 
         // dvui no longer manages geometry (persist_window_geometry = false); fizzy
-        // owns it via window_frame.zon.
+        // owns it via window.zon.
         macos_monitor_window = window;
         // `begin_hook` is now a per-backend field (dvui moved it off the module).
         back.begin_hook = macosAppPreBeginSync;
@@ -352,7 +404,7 @@ pub fn saveWindowGeometry(win: *dvui.Window) void {
     var out4: [4]f64 = .{0} ** 4;
     fizzy_macos_window_current_windowed_frame(cocoa, &out4);
     if (out4[2] < 1 or out4[3] < 1) return;
-    writeSavedFrame(dir, .{ .x = out4[0], .y = out4[1], .w = out4[2], .h = out4[3] });
+    writeSavedFrame(dir, out4[0], out4[1], out4[2], out4[3]);
 }
 
 /// Reveal the window after chrome + geometry are settled (it is created hidden).
@@ -987,7 +1039,7 @@ fn windowFillsUsableBounds(window: *sdl3.SDL_Window) bool {
 /// traffic lights don't overlap left-anchored panes mid-transition.
 /// Zoom/maximize without a Space keeps the full strip.
 pub fn titlebarStripHeight(win: *dvui.Window) f32 {
-    if (builtin.os.tag != .macos) return fizzy.editor.settings.titlebar_height;
+    if (builtin.os.tag != .macos) return Constants.titlebar_height;
     const raw_ptr = sdl3.SDL_GetPointerProperty(
         sdl3.SDL_GetWindowProperties(win.backend.impl.window),
         sdl3.SDL_PROP_WINDOW_COCOA_WINDOW_POINTER,
@@ -1004,8 +1056,8 @@ pub fn titlebarStripHeight(win: *dvui.Window) f32 {
         .restoring_chrome = restoring_chrome,
         .live_inset = if (inset > 0) @floatCast(inset) else 0,
         .saved_inset = if (saved > 0) @floatCast(saved) else 0,
-        .titlebar_height = fizzy.editor.settings.titlebar_height,
-        .titlebar_top_buffer = fizzy.editor.settings.titlebar_top_buffer,
+        .titlebar_height = Constants.titlebar_height,
+        .titlebar_top_buffer = Constants.titlebar_top_buffer,
     });
 }
 

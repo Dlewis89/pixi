@@ -1,4 +1,5 @@
 const std = @import("std");
+const core_mod = @import("../sdk/core_module.zig");
 const plugins = @import("plugins.zig");
 const sdk = @import("sdk.zig");
 
@@ -79,11 +80,9 @@ pub fn addSteps(
         .link_libc = false,
         .single_threaded = true,
     });
-    core_module_web.addImport("dvui", dvui_web_dep.module("dvui_web"));
-    if (b.lazyDependency("icons", .{ .target = web_target, .optimize = optimize })) |dep| {
-        core_module_web.addImport("icons", dep.module("icons"));
-    }
+    const icons_web = core_mod.addImports(b, core_module_web, dvui_web_dep.module("dvui_web"), web_target, optimize);
     web_exe.root_module.addImport("core", core_module_web);
+    if (icons_web) |icons| web_exe.root_module.addImport("icons", icons);
     const sdk_module_web = sdk.wireSdkModule(b, web_target, optimize, dvui_web_dep.module("dvui_web"), dvui_web_proxy_bridge, core_module_web, web_exe.root_module);
 
     // Three editor files have `const sdl3 = @import("backend").c;` at file
@@ -96,7 +95,7 @@ pub fn addSteps(
         .dvui = dvui_web_dep.module("dvui_web"),
         .core = core_module_web,
         .sdk = sdk_module_web,
-        .icons = if (b.lazyDependency("icons", .{ .target = web_target, .optimize = optimize })) |dep| dep.module("icons") else null,
+        .icons = icons_web,
         .backend = null,
     }, workbench_opts, web_exe.root_module);
     _ = text_plugin.addStaticModule(b, web_target, optimize, .{

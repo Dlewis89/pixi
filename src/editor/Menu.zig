@@ -1,6 +1,7 @@
 const std = @import("std");
 const fizzy = @import("../fizzy.zig");
 const dvui = @import("dvui");
+const Constants = @import("Constants.zig");
 const Editor = fizzy.Editor;
 const settings = fizzy.settings;
 const builtin = @import("builtin");
@@ -395,7 +396,7 @@ pub fn menuItem(src: std.builtin.SourceLocation, label_str: []const u8, init_opt
     // items rendered inside floatingMenu are below the strip and don't need registering.
     if (builtin.os.tag == .windows) {
         const r = mi.data().rectScale().r;
-        const strip_h = (fizzy.editor.settings.titlebar_top_buffer + fizzy.editor.settings.titlebar_height) * dvui.windowNaturalScale();
+        const strip_h = (Constants.titlebar_top_buffer + Constants.titlebar_height) * dvui.windowNaturalScale();
         if (r.y < strip_h) fizzy.backend.pushTitleBarInteractiveRect(r);
     }
 

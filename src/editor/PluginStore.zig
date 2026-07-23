@@ -13,6 +13,7 @@ const icons = @import("icons");
 const fizzy = @import("../fizzy.zig");
 const store = @import("../backend/plugin_store/store.zig");
 const PluginLoader = @import("PluginLoader.zig");
+const fuzzy = @import("core").fuzzy;
 
 const compat = store.compat;
 const version = sdk.version;
@@ -200,7 +201,7 @@ fn probeDisabledInfo() void {
         if (have_name and have_version) continue; // already known (registry / prior probe)
         const file_name = PluginLoader.pluginFilename(id, a) catch continue;
         defer a.free(file_name);
-        const path = std.fs.path.join(a, &.{ plugins_dir, file_name }) catch continue;
+        const path = std.fs.path.join(a, &.{ plugins_dir, id, file_name }) catch continue;
         defer a.free(path);
         if (!have_name) {
             if (PluginLoader.probeName(a, path)) |name| {
@@ -440,7 +441,10 @@ fn buildJob(id: []const u8, dl: store.registry.Download, is_update: bool) !*Job 
 
     const plugins_dir = try std.fs.path.join(a, &.{ fizzy.editor.config_folder, "plugins" });
     defer a.free(plugins_dir);
+    const plugin_dir = try std.fs.path.join(a, &.{ plugins_dir, id });
+    defer a.free(plugin_dir);
     std.Io.Dir.createDirAbsolute(dvui.io, plugins_dir, .default_dir) catch {}; // best-effort; exists is fine
+    std.Io.Dir.createDirAbsolute(dvui.io, plugin_dir, .default_dir) catch {}; // best-effort; exists is fine
     const file_name = try PluginLoader.pluginFilename(id, a);
     defer a.free(file_name);
 
@@ -452,7 +456,7 @@ fn buildJob(id: []const u8, dl: store.registry.Download, is_update: bool) !*Job 
     errdefer a.free(url_dup);
     const sha_dup = try a.dupe(u8, dl.sha256);
     errdefer a.free(sha_dup);
-    const dest = try std.fs.path.join(a, &.{ plugins_dir, file_name });
+    const dest = try std.fs.path.join(a, &.{ plugin_dir, file_name });
     errdefer a.free(dest);
 
     job.* = .{
@@ -533,6 +537,9 @@ const StoreEntry = struct {
     /// server-side — see `store.ShardRelease`). Still needs an arch check; see `selectedRelease`.
     release: ?store.ShardRelease = null,
     plugin: ?*sdk.Plugin = null,
+    /// Fuzzy-match score against the current filter, assigned by `rankEntries`. Lower is better;
+    /// 0 for every row when there is no filter.
+    score: f64 = 0,
 };
 
 /// Stable, position-independent widget/branch id for a plugin id (avoids the old loop-index
@@ -557,26 +564,69 @@ fn entryLess(_: void, lhs: StoreEntry, rhs: StoreEntry) bool {
     };
 }
 
-fn fieldMatches(haystack: []const u8, needle: []const u8) bool {
-    return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
+/// How well `entry` matches the query, or null if it doesn't. Lower is better (see `core.fuzzy`).
+///
+/// Identity fields (id, title) and prose fields (description, author, tags) are scored separately
+/// and the prose side is penalised, so a plugin *named* "theme" always outranks one that merely
+/// mentions themes in its description — otherwise a long description full of common words can
+/// score better than the name the user was actually typing.
+fn scoreEntry(entry: StoreEntry, query: *const fuzzy.Query) ?f64 {
+    if (query.isEmpty()) return 0;
+
+    var identity: [3][]const u8 = undefined;
+    var n: usize = 0;
+    identity[n] = entry.id;
+    n += 1;
+    identity[n] = entry.title;
+    n += 1;
+    if (entry.plugin) |p| {
+        identity[n] = p.display_name;
+        n += 1;
+    }
+    var best = fuzzy.scoreBest(identity[0..n], query, .{ .plain = true });
+
+    if (entry.registry) |r| {
+        var prose = fuzzy.scoreBest(&.{ r.description, r.author }, query, .{ .plain = true });
+        for (r.tags) |tag| {
+            if (fuzzy.score(tag, query, .{ .plain = true })) |s| {
+                if (prose == null or s < prose.?) prose = s;
+            }
+        }
+        if (prose) |s| {
+            const penalised = s + prose_match_penalty;
+            if (best == null or penalised < best.?) best = penalised;
+        }
+    }
+    return best;
 }
 
-/// Case-insensitive substring match across id, title, and (for registry rows) description,
-/// author, and tags — mirroring the Files tab filter behaviour.
-fn matchesFilter(entry: StoreEntry, filter: []const u8) bool {
-    if (filter.len == 0) return true;
-    if (fieldMatches(entry.id, filter)) return true;
-    if (fieldMatches(entry.title, filter)) return true;
-    if (entry.registry) |r| {
-        if (fieldMatches(r.description, filter)) return true;
-        if (fieldMatches(r.author, filter)) return true;
-        for (r.tags) |tag| if (fieldMatches(tag, filter)) return true;
+/// Added to description/author/tag hits so they rank below any name/id hit.
+const prose_match_penalty: f64 = 2.0;
+
+/// Best-first, falling back to the A→Z order for equal scores.
+fn entryScoreLess(_: void, lhs: StoreEntry, rhs: StoreEntry) bool {
+    if (lhs.score != rhs.score) return lhs.score < rhs.score;
+    return entryLess({}, lhs, rhs);
+}
+
+/// Drop non-matching entries and order what's left. With no query this is the plain A→Z list the
+/// store has always shown; with one, the best match is the first card.
+fn rankEntries(entries: *std.ArrayListUnmanaged(StoreEntry), query: *const fuzzy.Query) void {
+    if (query.isEmpty()) {
+        std.sort.pdq(StoreEntry, entries.items, {}, entryLess);
+        return;
     }
-    if (entry.plugin) |p| {
-        if (fieldMatches(p.id, filter)) return true;
-        if (fieldMatches(p.display_name, filter)) return true;
+
+    var keep: usize = 0;
+    for (entries.items) |entry| {
+        const s = scoreEntry(entry, query) orelse continue;
+        entries.items[keep] = entry;
+        entries.items[keep].score = s;
+        keep += 1;
     }
-    return false;
+    entries.shrinkRetainingCapacity(keep);
+    // Stable, so entries equal on both score and title keep insertion order.
+    std.sort.block(StoreEntry, entries.items, {}, entryScoreLess);
 }
 
 fn draw(_: ?*anyopaque) anyerror!void {
@@ -613,6 +663,7 @@ fn draw(_: ?*anyopaque) anyerror!void {
     const filter_text = filter_edit.getText();
     filter_edit.deinit();
     filter_hbox.deinit();
+    var query = fuzzy.Query.init(filter_text);
 
     const cat = if (catalog) |*c| c else return;
     const maybe_snapshot = cat.acquire();
@@ -636,7 +687,7 @@ fn draw(_: ?*anyopaque) anyerror!void {
             }) catch {};
         }
     }
-    std.sort.pdq(StoreEntry, store_entries.items, {}, entryLess);
+    rankEntries(&store_entries, &query);
 
     // Installed entries (lower pane): everything genuinely present locally — loaded,
     // disabled-on-disk, sideloaded, or a failed/rejected build — enriched with a matching
@@ -682,7 +733,7 @@ fn draw(_: ?*anyopaque) anyerror!void {
             .release = if (maybe_snapshot) |snap| snap.shard.releaseFor(f.id) else null,
         }) catch {};
     }
-    std.sort.pdq(StoreEntry, installed_entries.items, {}, entryLess);
+    rankEntries(&installed_entries, &query);
 
     // Surface registry-fetch state above the split (installed plugins still render below it).
     // `.fetching` fires both on the initial load and on a manual refresh, so the spinner shows
@@ -773,9 +824,9 @@ fn drawStoreSection(entries: []const StoreEntry, filter_text: []const u8, is_fir
         .vertical_bar = .auto_overlay,
     }, .{ .expand = .both, .background = false });
 
+    // `entries` is already filtered and ranked by `rankEntries` — best match first.
     var shown: usize = 0;
     for (entries) |entry| {
-        if (!matchesFilter(entry, filter_text)) continue;
         shown += 1;
         drawStoreCard(entry);
     }
@@ -823,7 +874,6 @@ fn drawInstalledSection(entries: []const StoreEntry, filter_text: []const u8) us
     var shown_local: usize = 0;
     for (entries) |entry| {
         if (isBuiltIn(entry.id)) continue;
-        if (!matchesFilter(entry, filter_text)) continue;
         if (shown_local == 0) drawSectionHeader("Local", 0);
         shown_local += 1;
         shown += 1;
@@ -833,7 +883,6 @@ fn drawInstalledSection(entries: []const StoreEntry, filter_text: []const u8) us
     var shown_builtin: usize = 0;
     for (entries) |entry| {
         if (!isBuiltIn(entry.id)) continue;
-        if (!matchesFilter(entry, filter_text)) continue;
         if (shown_builtin == 0) drawSectionHeader("Built-in", 1);
         shown_builtin += 1;
         shown += 1;

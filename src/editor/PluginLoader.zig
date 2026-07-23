@@ -101,12 +101,14 @@ pub fn pluginExtension() []const u8 {
     };
 }
 
-/// `{name}.{ext}` — flat layout under `{dir}/plugins/`.
+/// Bare `{name}.{ext}` filename (no directory) — the basename inside a plugin's own
+/// `{plugins_dir}/{name}/` directory (see docs/PLUGIN_MANIFEST_PLAN.md R10; every plugin, built-in
+/// or third-party, gets its own directory rather than sitting flat in `plugins/`).
 pub fn pluginFilename(name: []const u8, allocator: std.mem.Allocator) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}.{s}", .{ name, pluginExtension() });
 }
 
-/// `{exe_dir}/plugins/{name}.{ext}`
+/// `{exe_dir}/plugins/{name}/{name}.{ext}`
 pub fn builtinPluginPath(
     allocator: std.mem.Allocator,
     exe_dir: []const u8,
@@ -114,7 +116,7 @@ pub fn builtinPluginPath(
 ) ![]const u8 {
     const file_name = try pluginFilename(name, allocator);
     defer allocator.free(file_name);
-    return std.fs.path.join(allocator, &.{ exe_dir, "plugins", file_name });
+    return std.fs.path.join(allocator, &.{ exe_dir, "plugins", name, file_name });
 }
 
 /// Resolve a plugin dylib path: `FIZZY_PLUGIN_PATH` when set, else the built-in layout above.
@@ -193,19 +195,42 @@ fn cleanupFreshLoadPath(path: []const u8) void {
     std.Io.Dir.deleteFileAbsolute(dvui.io, path) catch {};
 }
 
-/// Clears out leftover fresh-load temp copies from a previous run. Call once at startup, before
-/// any plugin is loaded this session — nothing can be mapped from this directory yet, so every
-/// file in it is safe to remove outright (this is exactly what `cleanupFreshLoadPath` couldn't
-/// do on Windows while the plugin was still loaded, or after a crash on any platform).
-pub fn sweepLoadTempDir(allocator: std.mem.Allocator, plugins_dir: []const u8) void {
-    const tmp_dir = std.fs.path.join(allocator, &.{ plugins_dir, ".load-tmp" }) catch return;
-    defer allocator.free(tmp_dir);
-    var dir = std.Io.Dir.cwd().openDir(dvui.io, tmp_dir, .{ .iterate = true }) catch return;
+/// Deletes every file directly inside `dir_path`, if it exists. Shared by `sweepLoadTempDir`'s
+/// per-plugin sweep and its legacy flat-layout sweep below.
+fn sweepOneTempDir(dir_path: []const u8) void {
+    var dir = std.Io.Dir.cwd().openDir(dvui.io, dir_path, .{ .iterate = true }) catch return;
     defer dir.close(dvui.io);
     var iter = dir.iterate();
     while (iter.next(dvui.io) catch null) |entry| {
         if (entry.kind != .file) continue;
         dir.deleteFile(dvui.io, entry.name) catch {};
+    }
+}
+
+/// Clears out leftover fresh-load temp copies from a previous run. Call once at startup, before
+/// any plugin is loaded this session — nothing can be mapped from this directory yet, so every
+/// file in it is safe to remove outright (this is exactly what `cleanupFreshLoadPath` couldn't
+/// do on Windows while the plugin was still loaded, or after a crash on any platform).
+///
+/// Since R10, each plugin gets its own `{plugins_dir}/{id}/` directory, so `copyToFreshLoadPath`'s
+/// temp dir is now per-plugin (`{plugins_dir}/{id}/.load-tmp`) rather than one shared
+/// `{plugins_dir}/.load-tmp` — sweep every plugin subdirectory's, plus the old flat location in
+/// case a leftover from before the R10 upgrade is still sitting there.
+pub fn sweepLoadTempDir(allocator: std.mem.Allocator, plugins_dir: []const u8) void {
+    {
+        const legacy_tmp_dir = std.fs.path.join(allocator, &.{ plugins_dir, ".load-tmp" }) catch return;
+        defer allocator.free(legacy_tmp_dir);
+        sweepOneTempDir(legacy_tmp_dir);
+    }
+
+    var dir = std.Io.Dir.cwd().openDir(dvui.io, plugins_dir, .{ .iterate = true }) catch return;
+    defer dir.close(dvui.io);
+    var iter = dir.iterate();
+    while (iter.next(dvui.io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        const tmp_dir = std.fs.path.join(allocator, &.{ plugins_dir, entry.name, ".load-tmp" }) catch continue;
+        defer allocator.free(tmp_dir);
+        sweepOneTempDir(tmp_dir);
     }
 }
 
@@ -374,13 +399,13 @@ pub fn probeVersionInfo(path: []const u8) ?PluginVersionInfo {
     };
 }
 
-test "builtin plugin path joins exe_dir/plugins" {
+test "builtin plugin path joins exe_dir/plugins/<name>/<name>.<ext>" {
     const path = try builtinPluginPath(std.testing.allocator, "/app", "pixi");
     defer std.testing.allocator.free(path);
     switch (builtin.os.tag) {
-        .windows => try std.testing.expectEqualStrings("/app/plugins/pixi.dll", path),
-        .macos => try std.testing.expectEqualStrings("/app/plugins/pixi.dylib", path),
-        else => try std.testing.expectEqualStrings("/app/plugins/pixi.so", path),
+        .windows => try std.testing.expectEqualStrings("/app/plugins/pixi/pixi.dll", path),
+        .macos => try std.testing.expectEqualStrings("/app/plugins/pixi/pixi.dylib", path),
+        else => try std.testing.expectEqualStrings("/app/plugins/pixi/pixi.so", path),
     }
 }
 

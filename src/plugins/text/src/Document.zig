@@ -219,6 +219,30 @@ pub fn save(self: *Document) !void {
     self.clean_op_id = self.history.topOpId();
 }
 
+/// Replace in-memory contents from disk and clear undo history (external change / discard).
+pub fn reloadFromDisk(self: *Document) !void {
+    if (comptime is_wasm) return error.Unsupported;
+    const gpa = sdk.allocator();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(dvui.io, self.path, gpa, .limited(max_file_bytes));
+    defer gpa.free(bytes);
+
+    self.text.clearRetainingCapacity();
+    try self.text.appendSlice(gpa, bytes);
+    self.history.deinit(gpa);
+    self.history = .{};
+    self.clean_op_id = 0;
+    self.refreshLineCount();
+    self.sel_start = 0;
+    self.sel_end = 0;
+    // Non-null `pending_cursor` is what tells `TextEditor.draw` to disable `cache_layout`
+    // for the next frame — required after a full buffer replace, otherwise dvui's text
+    // layout cache (built against the previous contents) asserts / panics on draw.
+    self.pending_cursor = 0;
+    self.clearCompletionItems();
+    self.completion_anchor = null;
+    self.completion_selected = 0;
+}
+
 /// Retarget the document at `new_path` and write it there (Save As). Once this succeeds the
 /// document behaves exactly like one opened from disk at `new_path` (no longer `unsaved`).
 pub fn saveAs(self: *Document, new_path: []const u8) !void {

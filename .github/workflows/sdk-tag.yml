@@ -2,12 +2,14 @@ name: SDK tag
 
 # Auto-pins the plugin ABI contract: on every push to main, if src/sdk/sdk_version.zig's
 # `sdk_version` doesn't already have a matching `sdk-v<major>.<minor>.<patch>` tag, create and
-# push one at this commit. This is the pin point third-party plugins' build.zig.zon `fizzy`
-# dependency uses (docs/PLUGINS.md §2.3) instead of an arbitrary commit SHA.
+# push one at this commit. Then pack the plugin-facing `sdk/` package (plus vendored
+# `src/core` + `src/sdk`) into `fizzy-sdk-v*.tar.gz` and publish it as a GitHub release asset
+# on that tag — the URL third-party plugins pin (docs/PLUGINS.md §2.3). The git archive of the
+# monorepo is *not* a valid plugin pin: its root zon owns Velopack.
 #
 # `sdk-v*` is a separate namespace from the app's `v*` release tags (release.yml triggers on
 # `tags: ["v*"]`, a glob on the ref's start — `sdk-v...` doesn't start with `v`, so this can
-# never fire the app build/package pipeline). No build/package step here: just a ref push.
+# never fire the app build/package pipeline).
 
 on:
   push:
@@ -15,6 +17,10 @@ on:
     paths:
       - "src/sdk/sdk_version.zig"
       - "src/sdk/version.zig"
+      - "sdk/sdk_version.zig"
+      - "sdk/**"
+      - "scripts/pack-sdk.sh"
+      - ".github/workflows/sdk-tag.yml"
   workflow_dispatch:
 
 concurrency:
@@ -22,7 +28,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  tag:
+  tag-and-release:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -32,7 +38,8 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Compute sdk_version and tag if missing
+      - name: Compute sdk_version
+        id: ver
         shell: bash
         run: |
           set -euo pipefail
@@ -48,15 +55,77 @@ jobs:
           fi
 
           tag="sdk-v${major}.${minor}.${patch}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${major}.${minor}.${patch}" >> "$GITHUB_OUTPUT"
           echo "Resolved sdk_version -> $tag"
 
+      - name: Create tag if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.ver.outputs.tag }}"
+
           if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-            echo "Tag $tag already exists, nothing to do."
+            echo "Tag $tag already exists."
             exit 0
           fi
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "$tag" -m "SDK $major.$minor.$patch (ABI fingerprint pin point)"
+          git tag -a "$tag" -m "SDK ${{ steps.ver.outputs.version }} (plugin pin + ABI fingerprint)"
           git push origin "$tag"
           echo "Pushed $tag"
+
+      - name: Pack SDK tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/pack-sdk.sh
+          ./scripts/pack-sdk.sh "$PWD/zig-out/sdk"
+          ls -la zig-out/sdk/
+
+      - name: Publish GitHub release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.ver.outputs.tag }}"
+          version="${{ steps.ver.outputs.version }}"
+          asset="zig-out/sdk/fizzy-sdk-v${version}.tar.gz"
+          test -f "$asset"
+
+          notes_file="$(mktemp)"
+          cat >"$notes_file" <<EOF
+          Plugin-facing SDK package for Fizzy \`${version}\`.
+
+          Pin in your plugin's \`build.zig.zon\`:
+
+          \`\`\`zig
+          .fizzy = .{
+              .url = "https://github.com/fizzyedit/fizzy/releases/download/${tag}/fizzy-sdk-v${version}.tar.gz",
+              .hash = "…", // zig fetch --save=fizzy <url>
+          },
+          \`\`\`
+
+          Do **not** pin the git archive of this tag — that is the full monorepo (app zon / Velopack).
+          This asset is the \`sdk/\` package with \`src/core\` + \`src/sdk\` vendored in.
+          Locally, \`.path = "../fizzy/sdk"\` is fine while developing against an unreleased SDK.
+
+          See [docs/PLUGINS.md](https://github.com/fizzyedit/fizzy/blob/main/docs/PLUGINS.md) §2.3.
+          EOF
+          # Strip the common leading indent from the YAML-embedded heredoc.
+          sed -i 's/^          //' "$notes_file"
+
+          # Idempotent: create the release if missing, else replace the sdk asset.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag exists — uploading/replacing asset."
+            gh release upload "$tag" "$asset" --clobber
+          else
+            gh release create "$tag" "$asset" \
+              --title "Fizzy SDK $version" \
+              --notes-file "$notes_file"
+          fi
+
+          echo "Published $asset on $tag"
+          gh release view "$tag" --json assets --jq '.assets[].name'

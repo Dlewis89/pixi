@@ -9,12 +9,12 @@ Cross-platform, open-source general editor written in Zig, UI via [DVUI](https:/
 Fizzy the app is a near-empty **shell** (window, frame loop, menu/sidebar/panel layout, document model) that owns **no editing features**. Everything the user sees — pixel-art editing, the file explorer/tabs/splits, text editing — is contributed by **plugins** that register against a stable SDK. Plugins never import each other; they meet only at the SDK.
 
 ```
-Shell (Editor)  ←── Host registries + EditorAPI ──→  Plugin (register(host) + vtable)
+Shell (Editor) ←── Host registries + EditorAPI ──→ Plugin (register(host) + vtable)
 ```
 
 - **`src/sdk/`** — the entire contract. `Host` (registries + service locator), `Plugin` (identity + vtable of hooks the shell calls), `DocHandle` (opaque `{ptr, id, owner}` — shell routes every doc op to `owner`, never inspects `ptr`), `EditorAPI` (shell read/util surface plugins reach back through), `regions.zig` (sidebar/bottom/center/menu/settings/command contribution structs), `dylib.zig`/`dvui_context.zig` (runtime-library C-ABI + dvui injection).
 - **`src/editor/`** — the shell itself: `Editor.zig` (frame loop, plugin registration/loading), `PluginLoader.zig` (dlopen), `Menu.zig`, `Sidebar.zig`, `Settings.zig`, etc.
-- **`src/core/`** — shared infra (Atlas/Sprite, math, gfx, fs, paths, platform detection) used by shell *and* plugins. Not plugin-owned; don't move it.
+- **`src/core/`** — shared infra (Atlas/Sprite, math, gfx, fs, paths, platform detection) used by shell *and* plugins. Not plugin-owned; don't move it. `core.fuzzy` is the one matcher behind every filter box in the app (settings tree, file tree, plugin store, LSP completions) — wrap zf through it rather than matching by hand, and remember **lower scores are better**.
 - **`src/plugins/`** — bundled built-in plugins. Each is file-for-file the **same shape a third-party plugin would use**: root `plugin.zig` + identity-only `plugin.zig.zon` + `build.zig` + `build.zig.zon` (optional `src/**`), plus fizzy-internal glue in `static/`. No author `root.zig` or `<name>.zig` hub — the build helper generates the dylib entry; files use named imports (`fizzy_sdk`/`dvui`/…). Builds standalone with `cd src/plugins/<name> && zig build`.
 
 **Two link modes, one source:** built-in plugins compile **static** (linked directly, all targets incl. web) or **dynamic** (`.dylib`/`.so`/`.dll`, desktop-only, `dlopen`'d — this is how third-party plugins ship too). `FIZZY_STATIC_<NAME>=1` env var forces static for a given built-in (useful when debugging dylib loading).
@@ -36,7 +36,7 @@ Shell (Editor)  ←── Host registries + EditorAPI ──→  Plugin (registe
 3. Plugin prefs: `sdk.settings.Schema(struct { … })` then `.register(host, &plugin, …)` — shell draws them only while the plugin is loaded (no SettingsSection). User config on disk is ZON (`settings.zon` / `recents.zon`).
 4. Editor plugins implement the document vtable cluster; shell plugins (workbench-style) register a center provider + sidebar views instead.
 5. User-invoked actions are **`Command`s** — `"<active_owner_id>.<action>"`.
-6. `zig build install` drops `{id}.dylib` into the fizzy plugins dir (no sidecar `.zon`).
+6. `zig build install` drops `{id}/{id}.dylib` (its own directory) into the fizzy plugins dir (no sidecar `.zon`).
 7. Memory: `host.allocator` vs `host.arena()`; never touch `dvui.currentWindow().gpa` directly.
 8. ABI: structural fingerprint at `dlopen` (`fizzy_plugin_abi_fingerprint`); bumps are rare/deliberate.
 
@@ -60,25 +60,25 @@ Don't trust older narrative docs that call this forward-looking/not-yet-built.
 ## Build
 
 ```sh
-zig build            # native exe
-zig build check-web  # wasm
-zig build test       # unit/integration tests
-zig build test-sdk-version   # CI lock: ABI fingerprint bump must bump sdk_version too
+zig build              # native exe
+zig build check-web    # wasm
+zig build test         # unit/integration tests
+zig build test-sdk-version  # CI lock: ABI fingerprint bump must bump sdk_version too
 ```
 
 Run all of these after touching the SDK boundary (`src/sdk/**`) or a plugin's vtable usage.
 
 ### Keep the plugin build free of app-only dependencies
 
-Every plugin build (including third-party ones like pixi) compiles this repo's root `build.zig` via `b.dependency("fizzy", .{ .plugin_sdk = true })`. Because `@import` is **comptime + transitive**, anything the root `build()` can reach at comptime is pulled into *every* plugin build — even code guarded by a runtime `if (plugin_sdk) return;`. So an app-only dependency reached through a plain top-level `@import("<dep>")` (like Velopack, the host's self-installer/updater) leaks its whole graph — wrapper + prebuilt archives — into plugin builds that never use it.
+Plugins depend on the **`sdk/` package** (its own `build.zig` + `build.zig.zon`), not the repo root. The root zon owns the editor build and may list app-only deps (Velopack, nightwatch, …). A root-zon `.lazy = true` URL dep is **not** enough by itself: Zig eagerly unpacks lazy URL deps that already sit in the global cache into every consumer's `zig-pkg`, so after any app build a plugin depending on the root package would grow a Velopack tree even though `lazyDependency` never runs on the plugin path.
 
-Rule: **app-only deps must never be reachable via comptime `@import` from the root build graph.** The pattern (see Velopack):
+Pattern:
 
-- Mark the dep `.lazy = true` in `build.zig.zon`.
-- Never `@import("velopack_zig")` anywhere in the build graph. The helper surface is **vendored** in `build/velopack.zig` (pure `std.Build` glue) and takes the dependency as a handle.
-- Resolve it lazily *inside the app build only*: `const vz = b.lazyDependency("velopack_zig", .{}) orelse return;` in `build/app.zig`, then thread `vz` through `build/exe.zig` / `build/package.zig`.
+- **Plugins** (built-in + third-party): `.fizzy = .{ .path = ".../sdk" }` locally, or the `fizzy-sdk-v*` **release asset** URL from the matching `sdk-v*` tag (not the git archive — that is the monorepo root zon with Velopack). Call `fizzy.plugin.create` / `.install` as before; `b.dependency("fizzy", .{ .plugin_sdk = true })` still works (the option is accepted and ignored — `sdk/` always exports modules). Packing: `scripts/pack-sdk.sh` / `.github/workflows/sdk-tag.yml`.
+- **App**: repo-root `zig build` as usual. Velopack stays `.lazy = true` in the root zon; never `@import("velopack_zig")` — the helper surface is vendored in `build/velopack.zig` and resolved only in `build/app.zig` via `lazyDependency`.
+- Shared `core` import wiring lives in `sdk/core_module.zig` and is called from the app build *and* `sdk/plugin_sdk.zig`'s `exportModules` so the import set can't drift. Note the `with_tui = false` on the zf dependency: without it, zf's standalone terminal binary drags `libvaxis` into every plugin build.
 
-Acceptance test after any build-graph change: cross-build the image plugin and confirm no leak —
+Acceptance test after any build-graph change:
 
 ```sh
 cd src/plugins/image && rm -rf .zig-cache zig-out zig-pkg && zig build -Doptimize=ReleaseFast

@@ -164,7 +164,8 @@ const log_interval_frames: u64 = 120;
 /// When true, `endFrameAndMaybeLog` prints every frame (very noisy; hurts fps). Default off.
 pub var verbose_frame_log: bool = false;
 
-/// Mirrored from `Editor.settings.perf_logging`. Gates `std.log` / `std.debug` perf output.
+/// Mirrored from `Constants.perf_logging` at startup (build-time flag, not a user setting).
+/// Gates `std.log` / `std.debug` perf output.
 pub var console_logging_enabled: bool = false;
 
 /// Last split-composite rebuild: time spent in `renderLayersIntoTarget` for below / above (nanoseconds).

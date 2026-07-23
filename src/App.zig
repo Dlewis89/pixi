@@ -14,6 +14,7 @@ const auto_update = @import("backend/auto_update.zig");
 const update_notify = @import("backend/update_notify.zig");
 const singleton = @import("backend/singleton.zig");
 const paths = fizzy.paths;
+const Constants = @import("editor/Constants.zig");
 
 const App = @This();
 const Editor = fizzy.Editor;
@@ -46,8 +47,8 @@ var pref_path_buf: [std.fs.max_path_bytes]u8 = undefined;
 var pref_path_len: usize = 0;
 
 const start_options_base: dvui.App.StartOptions = .{
-    .size = .{ .w = 1200.0, .h = 800.0 },
-    .min_size = .{ .w = 640.0, .h = 480.0 },
+    .size = .{ .w = Constants.initial_window_size[0], .h = Constants.initial_window_size[1] },
+    .min_size = .{ .w = Constants.min_window_size[0], .h = Constants.min_window_size[1] },
     .title = "fizzy",
     .icon = icon,
     .transparent = if (builtin.os.tag == .macos or builtin.os.tag == .windows) true else false,
@@ -220,7 +221,7 @@ pub fn AppInit(win: *dvui.Window) !void {
         fizzy.backend.setWindowStyle(win);
     }
 
-    update_notify.startLaunchCheck(dvui.io, fizzy.editor.settings.debug_simulate_update_available);
+    update_notify.startLaunchCheck(dvui.io, Constants.debug_simulate_update_available);
 
     // From here on the monitor's pump timer may drive frames during macOS
     // window animations.

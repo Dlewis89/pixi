@@ -31,13 +31,16 @@ pub const MenuSectionContribution = regions.MenuSectionContribution;
 pub const NativeMenuItem = regions.NativeMenuItem;
 pub const Command = regions.Command;
 
-/// Per-plugin opaque settings blobs pending a write: plugin id -> serialized zon text. The
-/// Host owns the key + value strings. This is a write buffer only, not the source of
-/// truth — `flushPluginSettings` writes each entry to its own
-/// `<plugins_dir>/<id>.settings.zon` (a real, human-editable zon file living beside the
-/// plugin itself, not a blob embedded in the shell's own settings.zon) and never
-/// interprets the contents.
-pub const PluginSettings = std.StringArrayHashMapUnmanaged([]const u8);
+/// Per-plugin opaque settings blobs pending a write: plugin id -> serialized zon text, or `null`
+/// meaning "remove this id's `.settings` section entirely" (R12's non-default-only persistence —
+/// see `sdk/settings.zig`'s `Schema(T).diffSerialize`: a value that's back to all-defaults has
+/// nothing worth writing). The Host owns the key + (when present) value strings. This is a write
+/// buffer only, not the source of truth — `Editor.writeMergedSettings` (via
+/// `takePendingPluginSettings`) composes each entry into the shell's own `<config>/settings.zon`
+/// under `.plugins.<id>.settings` (a real, human-editable nested ZON struct literal, not an
+/// escaped-string blob — see `src/editor/SettingsPluginsZon.zig` and
+/// `docs/PLUGIN_MANIFEST_PLAN.md` R10/R12) and never interprets the contents.
+pub const PluginSettings = std.StringArrayHashMapUnmanaged(?[]const u8);
 
 /// Optional tint for a workbench file-tree row background. `color_index` is the row's
 /// stable index during the current tree draw (workbench increments per file). Return
@@ -64,15 +67,26 @@ pub const ServiceEntry = struct {
 /// glyph, a thumbnail, anything) instead of the shell hardcoding per-extension icons. `ext` is
 /// the extension including the dot, as on disk (compare case-insensitively); `path` is absolute;
 /// `color` is the row's themed icon color.
+///
+/// **Size is the host's to decide, not yours.** The row reserves a fixed square slot
+/// (`core.dvui.treeRowGlyph`, sized from the user's font settings) and your drawer runs inside
+/// it. Draw with `expand = .ratio` so your artwork fits that slot at its own aspect ratio; a
+/// hard-coded size or scale makes your rows taller than every other row and pushes their labels
+/// out of alignment with the rest of the tree.
 pub const FileIcon = struct {
     owner: ?*Plugin = null,
     ctx: ?*anyopaque = null,
     draw: *const fn (ctx: ?*anyopaque, ext: []const u8, path: []const u8, color: dvui.Color) bool,
 };
 
-/// A plugin-store card logo drawer. The Plugins tab calls registered drawers by matching
-/// `owner.id` to the card's plugin id; when none match (plugin not loaded, or no registration),
-/// the store falls back to a generic placeholder icon.
+/// A plugin logo drawer, used by the Plugins store card and by the Settings tree's branch for
+/// this plugin. Drawers are matched by `owner.id`; when none match (plugin not loaded, or no
+/// registration), the caller falls back to a placeholder — the store's generic glyph, or the
+/// plugin's initial letter in the settings tree.
+///
+/// Same sizing contract as `FileIcon`: the caller reserves the rect (32px on a store card, one
+/// row glyph in the settings tree) and your drawer fills it with `expand = .ratio`. Drawing at a
+/// fixed size means looking right in one of those two places and wrong in the other.
 pub const PluginIcon = struct {
     owner: ?*Plugin = null,
     ctx: ?*anyopaque = null,
@@ -103,19 +117,18 @@ services: std.StringHashMapUnmanaged(ServiceEntry) = .empty,
 shell_api: ?EditorAPI = null,
 
 /// Not-yet-flushed per-plugin settings writes (see `PluginSettings`); drained by
-/// `flushPluginSettings`.
+/// `takePendingPluginSettings`. Whether the composed merge write actually touches disk is
+/// decided once, over the *whole* merged file, by `Editor.writeMergedSettings` — there is no
+/// separate per-plugin dedup here (see R10's decision log for why that collapsed once settings
+/// moved into one file).
 plugin_settings_pending: PluginSettings = .empty,
 
-/// Hash of each plugin's last-written (or last-loaded-from-disk) settings text, keyed by
-/// plugin id. Lets `flushPluginSettings` skip a `writeFile` when the pending blob is
-/// byte-identical to what's already on disk, without keeping a full duplicate copy of the
-/// text around per plugin.
-plugin_settings_last_hash: std.StringHashMapUnmanaged(u64) = .empty,
-
-/// `<config_folder>/plugins` — where every plugin's own `<id>.settings.zon` lives beside its
-/// `<id>.{dylib,so,dll}` (built-ins that compile static have no dylib there, but still get a
-/// settings file). Set once by the shell during startup (`Editor.init`); null on wasm
-/// (no filesystem) or in headless/tests, in which case settings load/store are no-ops.
+/// `<config_folder>/plugins` — where every plugin's own `<id>/<id>.{dylib,so,dll}` directory
+/// lives (see `pluginInstallDir`; built-ins that compile static have no dylib there). No longer
+/// where settings live — those are a `.plugins.<id>` field inside the shell's own
+/// `<config_folder>/settings.zon` (see R10). Set once by the shell during startup
+/// (`Editor.init`); null on wasm (no filesystem) or in headless/tests, in which case settings
+/// load/store are no-ops.
 plugins_dir: ?[]const u8 = null,
 
 /// File-tree row fill tints (workbench asks the Host; editor plugins register).
@@ -183,14 +196,9 @@ pub fn deinit(self: *Host) void {
         var it = self.plugin_settings_pending.iterator();
         while (it.next()) |e| {
             self.allocator.free(e.key_ptr.*);
-            self.allocator.free(e.value_ptr.*);
+            if (e.value_ptr.*) |v| self.allocator.free(v);
         }
         self.plugin_settings_pending.deinit(self.allocator);
-    }
-    {
-        var it = self.plugin_settings_last_hash.keyIterator();
-        while (it.next()) |k| self.allocator.free(k.*);
-        self.plugin_settings_last_hash.deinit(self.allocator);
     }
 }
 
@@ -447,21 +455,18 @@ pub fn drawMenuItem(self: *Host, title: []const u8, keybind_name: ?[]const u8) b
 
 // ---- per-plugin settings store ---------------------------------------------
 //
-// Each plugin's settings live in their own real, human-editable `<id>.settings.zon` file
-// under `plugins_dir` — not an escaped-string blob embedded in the shell's own settings.zon.
-// This is deliberately not cached across calls: `loadPluginSettings` is only ever called once
-// per plugin, at `register()` time, so a fresh read costs nothing and keeps the Host from
-// having to reason about staleness.
+// Every plugin's settings live as a real, hand-editable ZON struct literal keyed by plugin id,
+// nested inside the shell's own `<config>/settings.zon` under a
+// `.plugins = .{ .<id> = .{...}, ... }` field — not an escaped-string blob, and not one file per
+// plugin (see `docs/PLUGIN_MANIFEST_PLAN.md` R10, superseding R8's one-file-per-plugin design).
+// `SettingsPluginsZon` (in `src/editor/`) does the actual ZON text surgery; the Host only buffers
+// pending writes and routes reads through `shell_api` — see `loadPluginSettings`'s doc comment
+// for why that indirection is required. This is deliberately not cached across calls:
+// `loadPluginSettings` is only ever called once per plugin, at `register()` time, so a fresh read
+// costs nothing and keeps the Host from having to reason about staleness.
 
-/// Public so `EditorAPI`'s host-side implementation (`Editor.shellLoadPluginSettingsFile`) can
-/// build the same path without duplicating the format string.
-pub fn pluginSettingsPath(self: *Host, id: []const u8) ?[]u8 {
-    const dir = self.plugins_dir orelse return null;
-    return std.fmt.allocPrint(self.allocator, "{s}/{s}.settings.zon", .{ dir, id }) catch null;
-}
-
-/// Reads `<plugins_dir>/<id>.settings.zon` fresh off disk, or null when unavailable (no shell
-/// installed, no `plugins_dir` set — wasm/headless — or the file doesn't exist yet).
+/// Reads `id`'s settings out of `<config>/settings.zon`'s `.plugins.<id>` field fresh off disk,
+/// or null when unavailable (no shell installed, wasm/headless, or the field doesn't exist yet).
 /// Caller-owned; free with `self.allocator`.
 ///
 /// Routed through `shell_api` rather than reading the file directly here: `register()` — the
@@ -473,34 +478,18 @@ pub fn pluginSettingsPath(self: *Host, id: []const u8) ?[]u8 {
 /// compiled code no matter which dylib holds the call site, so they see the host's real `dvui.io`.
 pub fn loadPluginSettings(self: *Host, id: []const u8) ?[]u8 {
     if (comptime builtin.target.cpu.arch == .wasm32) return null;
-    const blob = if (self.shell_api) |a| a.loadPluginSettingsFile(id) else null;
-    // Seed the dedup hash from what's already on disk, so a `store`/`persist` call that
-    // reproduces these exact bytes (without ever going through `storePluginSettings` first)
-    // is still recognized as a no-op by `flushPluginSettings`.
-    if (blob) |b| self.recordSettingsHash(id, std.hash.Wyhash.hash(0, b));
-    return blob;
+    return if (self.shell_api) |a| a.loadPluginSettingsFile(id) else null;
 }
 
-/// Upserts `id`'s last-known-written settings hash. Best-effort: an allocation failure here
-/// just means the next `flushPluginSettings` writes unconditionally instead of deduping —
-/// no correctness impact, so it's swallowed rather than propagated.
-fn recordSettingsHash(self: *Host, id: []const u8, hash: u64) void {
-    if (self.plugin_settings_last_hash.getPtr(id)) |slot| {
-        slot.* = hash;
-        return;
-    }
-    const key = self.allocator.dupe(u8, id) catch return;
-    self.plugin_settings_last_hash.put(self.allocator, key, hash) catch self.allocator.free(key);
-}
-
-/// Buffers `blob` (serialized zon text) as `id`'s pending settings write and marks the shell
-/// dirty; the debounced autosave calls `flushPluginSettings`, which writes it to
-/// `<plugins_dir>/<id>.settings.zon`. The Host copies both `id` and `blob`.
+/// Buffers `blob` (serialized zon text) as `id`'s pending `.settings` write and marks the shell
+/// dirty; the debounced autosave composes it into the merged `settings.zon` (see
+/// `Editor.writeMergedSettings`, which calls `takePendingPluginSettings` then
+/// `SettingsPluginsZon.composeMergedText`). The Host copies both `id` and `blob`.
 pub fn storePluginSettings(self: *Host, id: []const u8, blob: []const u8) !void {
     const dup = try self.allocator.dupe(u8, blob);
     errdefer self.allocator.free(dup);
     if (self.plugin_settings_pending.getPtr(id)) |slot| {
-        self.allocator.free(slot.*);
+        if (slot.*) |old| self.allocator.free(old);
         slot.* = dup;
     } else {
         const key = try self.allocator.dupe(u8, id);
@@ -509,39 +498,43 @@ pub fn storePluginSettings(self: *Host, id: []const u8, blob: []const u8) !void 
     self.markSettingsDirty();
 }
 
-/// Writes every buffered `storePluginSettings` blob to its own `<plugins_dir>/<id>.settings.zon`
-/// and clears the buffer. Skips the write (but still clears the pending entry) when the blob
-/// hashes the same as the last thing written or loaded for that plugin, so a `persist()`/`save()`
-/// call that didn't actually change anything doesn't touch disk. Called by the shell's debounced
-/// autosave (`Editor.saveSettingsGuarded`/`saveSettingsRaw`) — plugins never call this directly.
-pub fn flushPluginSettings(self: *Host) void {
-    if (comptime builtin.target.cpu.arch == .wasm32) return;
-    if (self.plugin_settings_pending.count() == 0) return;
-    const dir = self.plugins_dir orelse return;
-    std.Io.Dir.createDirAbsolute(dvui.io, dir, .default_dir) catch {}; // best-effort; exists is fine
-
-    var it = self.plugin_settings_pending.iterator();
-    while (it.next()) |e| {
-        const hash = std.hash.Wyhash.hash(0, e.value_ptr.*);
-        if (self.plugin_settings_last_hash.get(e.key_ptr.*) == hash) continue;
-
-        const path = self.pluginSettingsPath(e.key_ptr.*) orelse continue;
-        defer self.allocator.free(path);
-        std.Io.Dir.cwd().writeFile(dvui.io, .{ .sub_path = path, .data = e.value_ptr.* }) catch |err| {
-            dvui.log.warn("flushPluginSettings: failed to write '{s}': {s}", .{ e.key_ptr.*, @errorName(err) });
-            continue;
-        };
-        self.recordSettingsHash(e.key_ptr.*, hash);
+/// Buffers an explicit "remove `id`'s `.settings` section" — the non-default-only counterpart to
+/// `storePluginSettings` (see `PluginSettings`). Used by `sdk.settings.Schema(T).store`/
+/// `persist` when every field is back to its declared default.
+pub fn removePluginSettings(self: *Host, id: []const u8) !void {
+    if (self.plugin_settings_pending.getPtr(id)) |slot| {
+        if (slot.*) |old| self.allocator.free(old);
+        slot.* = null;
+    } else {
+        const key = try self.allocator.dupe(u8, id);
+        try self.plugin_settings_pending.put(self.allocator, key, null);
     }
+    self.markSettingsDirty();
+}
 
-    var doomed = self.plugin_settings_pending;
+/// Moves every buffered `storePluginSettings`/`removePluginSettings` entry out and resets the
+/// pending buffer to empty. Called once by `Editor.writeMergedSettings`, right before composing
+/// the merged file's `.plugins` block — the caller now owns every key/(optional) value in the
+/// returned map and must free them (see `PluginSettings`'s doc comment). There is no per-plugin
+/// write-dedup here anymore: whether the merge actually touches disk is decided once, over the
+/// whole composed file, by the caller.
+pub fn takePendingPluginSettings(self: *Host) PluginSettings {
+    const taken = self.plugin_settings_pending;
     self.plugin_settings_pending = .empty;
-    var it2 = doomed.iterator();
-    while (it2.next()) |e| {
-        self.allocator.free(e.key_ptr.*);
-        self.allocator.free(e.value_ptr.*);
-    }
-    doomed.deinit(self.allocator);
+    return taken;
+}
+
+// ---- plugin install directory -----------------------------------------------
+
+/// `<plugins_dir>/<id>` — the directory a plugin (built-in or third-party) is installed into,
+/// beside its own `<id>.{dylib,so,dll}` (see docs/PLUGIN_MANIFEST_PLAN.md R10: every plugin gets
+/// its own directory rather than sitting flat in `plugins/`). A plugin can use this for its own
+/// assets/data; the directory is not guaranteed to exist yet — create it (and any subpath) before
+/// writing into it. Null when `plugins_dir` itself is unset (wasm/headless). Pure path join, no
+/// filesystem access — caller-owned, free with `self.allocator`.
+pub fn pluginInstallDir(self: *Host, id: []const u8) ?[]u8 {
+    const dir = self.plugins_dir orelse return null;
+    return std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, id }) catch null;
 }
 
 /// Register a plugin under its self-declared `id`. The `id` is the single source of truth
@@ -1336,6 +1329,9 @@ test "unregisterPlugin removes a plugin's contributions, service, and resets act
         }.f,
         .persist = struct {
             fn f(_: *anyopaque, _: *Plugin) void {}
+        }.f,
+        .applyBlob = struct {
+            fn f(_: *anyopaque, _: *Plugin, _: []const u8) void {}
         }.f,
     };
     var dummy_value: u8 = 0;

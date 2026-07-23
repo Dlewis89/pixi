@@ -12,10 +12,9 @@ pub const default_theme = "Fizzy Dark";
 pub const autosave_timeout_ns: i128 = 500 * 1_000_000;
 
 /// The zon-parsed on-disk value backing the most recent successful `load`, kept alive
-/// for the process lifetime (freed in `deinit`) because `disabled_plugins` below borrows
-/// straight out of it — see `Editor.seedDisabledPlugins`, which runs well after `load`
-/// returns. `theme` is independently heap-owned (duped in `load`), so it survives even
-/// though this is freed at shutdown rather than right after load.
+/// for the process lifetime (freed in `deinit`). `theme` is independently heap-owned
+/// (duped in `load`), so it survives even though this is freed at shutdown rather than
+/// right after load.
 var loaded: ?Settings = null;
 
 pub const FlipbookView = enum { sequential, grid };
@@ -28,27 +27,9 @@ pub const InputScheme = enum { auto, mouse, trackpad };
 /// Resolved zoom/pan style after applying `input_scheme`.
 pub const ResolvedPanZoomScheme = enum { mouse, trackpad };
 
-/// The ratio of the explorer to the artboard.
-explorer_ratio: f32 = 0.35,
-
-/// Height of the flipbook window.
-panel_ratio: f32 = 0.25,
-
-min_window_size: [2]f32 = .{ 640, 480 },
-
-initial_window_size: [2]f32 = .{ 1280, 720 },
-
 /// Touch or long-press duration (ms) before a context menu opens instead of a normal click.
+/// A real user (accessibility/touch) preference, unlike the dev-only knobs in `Constants.zig`.
 hold_menu_duration_ms: u32 = 500,
-
-/// When true, print frame/draw perf stats to the console (Debug / ReleaseSafe only for tick stats).
-perf_logging: bool = false,
-
-/// Pretend an app update is available (badge + launch toast). Restart after toggling.
-debug_simulate_update_available: bool = false,
-
-/// Maximum number of recents before removing oldest
-max_recents: usize = 10,
 
 /// Last selected UI theme (`dvui.Theme.name`). Always allocator-owned after `load`; see `setThemeName` / `deinit`.
 theme: []const u8 = default_theme,
@@ -70,17 +51,6 @@ content_opacity: f32 = 0.7,
 /// Canvas zoom/pan control scheme shared by the image viewer, pixi, and any other
 /// `CanvasWidget` consumer. `auto` picks mouse vs trackpad from `dvui.mouseType()`.
 input_scheme: InputScheme = .auto,
-
-/// Plugin ids the user has disabled in the store. Skipped at startup by
-/// `Editor.loadUserPlugins` and unloaded live by `Editor.setPluginEnabled`. The slice
-/// is pointed at an `Editor`-owned list at runtime (see `Editor.disabled_plugin_ids`);
-/// it is only read here for (de)serialization.
-disabled_plugins: []const []const u8 = &.{},
-
-titlebar_height: f32 = 26.0, // This is the height of the titlebar in pixels
-
-/// Empty strip below the top window edge (non-macOS), above the main title row (in-window menu, etc.).
-titlebar_top_buffer: f32 = 10.0,
 
 fn default(allocator: std.mem.Allocator) !Settings {
     return .{
@@ -108,26 +78,24 @@ pub fn setThemeName(settings: *Settings, allocator: std.mem.Allocator, name: []c
 }
 
 /// Loads settings (`theme` is always heap-owned after successful return — see `setThemeName` / `deinit`).
-/// One-shot migrates a legacy `settings.json` sibling to `settings.zon` first (see
-/// `SettingsMigration.migrateIfNeeded`), splitting any legacy per-plugin blobs out to their own
-/// `<plugins_dir>/<id>.settings.zon` files. Unknown fields are ignored (forward-compat with
-/// newer on-disk shapes).
+/// One-shot migrates any pre-R10 `<plugins_dir>/<id>.settings.zon` files into this file's
+/// `.plugins.<id>` field first (see `SettingsMigration.mergeLegacyPerPluginFiles`), then any
+/// pre-R12 flat plugin blocks + top-level `disabled_plugins` into nested
+/// `.{ .enabled, .settings }` (see `SettingsMigration.migrateToPerPluginEnabled`). Unknown
+/// fields (including `.plugins`, which this struct doesn't itself model — see
+/// `serialize`'s doc comment) are ignored, both for forward-compat with newer on-disk shapes and
+/// because `.plugins` is read separately, per-plugin, via `Host.loadPluginSettings`.
 pub fn load(allocator: std.mem.Allocator, path: []const u8, plugins_dir: ?[]const u8) !Settings {
     // Wasm: no on-disk config; `fizzy.fs` uses `Io.Dir.cwd()` (posix.AT).
     if (comptime builtin.target.cpu.arch == .wasm32) return default(allocator);
 
-    @setEvalBranchQuota(10_000);
-    SettingsMigration.migrateIfNeeded(allocator, path, plugins_dir);
+    SettingsMigration.mergeLegacyPerPluginFiles(allocator, path, plugins_dir);
+    SettingsMigration.migrateToPerPluginEnabled(allocator, path, plugins_dir);
 
     const data = fizzy.fs.readZ(allocator, dvui.io, path) catch return default(allocator);
     defer allocator.free(data);
 
-    // Older builds embedded each plugin's settings as an escaped-string blob in settings.zon's
-    // own `plugins` list; split any of those out to their own file before parsing (which just
-    // ignores the now-unknown `plugins` key below).
-    SettingsMigration.splitEmbeddedPluginsIfNeeded(allocator, data, plugins_dir);
-
-    const parsed = std.zon.parse.fromSliceAlloc(Settings, allocator, data, null, .{ .ignore_unknown_fields = true }) catch |err| {
+    const parsed = parseOnly(allocator, data) catch |err| {
         dvui.log.warn("Could not parse settings.zon ({s}); using defaults.", .{@errorName(err)});
         return default(allocator);
     };
@@ -141,22 +109,32 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8, plugins_dir: ?[]cons
     return result;
 }
 
-/// Serialize the shell's own settings into `settings.zon`. Per-plugin settings no longer live
-/// here at all — each plugin persists its own `<plugins_dir>/<id>.settings.zon` directly (see
-/// `Host.flushPluginSettings`), so there is nothing opaque left to splice in.
+/// Parses `data` (already-read `settings.zon` bytes) into a `Settings` value, ignoring unknown
+/// fields (forward-compat + `.plugins` is handled separately — see `load`'s doc comment above).
+/// Unlike `load`, this returns the raw parse error on failure instead of falling back to
+/// defaults — defaulting is only correct when there's no existing live state to fall back *to*
+/// (startup); `Editor.reconcileExternalSettingsChange` (external hand-edit reconciliation, R11)
+/// has existing state and must not let a transient torn-write read reset every shell field and
+/// every plugin's settings. Caller frees the result with `std.zon.parse.free` (not
+/// `Settings.deinit`, which manages this module's own `loaded` snapshot — bypassed here on
+/// purpose for a lightweight one-off parse).
+pub fn parseOnly(allocator: std.mem.Allocator, data: [:0]const u8) !Settings {
+    @setEvalBranchQuota(10_000);
+    return std.zon.parse.fromSliceAlloc(Settings, allocator, data, null, .{ .ignore_unknown_fields = true });
+}
+
+/// Serialize the shell's own fields as `.{ ...shell fields... }`. This is *not* the whole
+/// `settings.zon` file — plugin settings are a separate `.plugins = .{ .<id> = .{...}, ... }`
+/// field spliced on afterward by `Editor.composeSettingsText`/`SettingsPluginsZon.composeMergedText`
+/// (see `docs/PLUGIN_MANIFEST_PLAN.md` R10). `Editor.writeMergedSettings` is the only writer of
+/// `settings.zon` — there is no standalone shell-only save path anymore, since writing this half
+/// alone would silently drop the `.plugins` half.
 pub fn serialize(settings: *const Settings, allocator: std.mem.Allocator) ![]u8 {
     @setEvalBranchQuota(10_000);
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try std.zon.stringify.serialize(settings.*, .{}, &aw.writer);
     return aw.toOwnedSlice();
-}
-
-pub fn save(settings: *Settings, allocator: std.mem.Allocator, path: []const u8) !void {
-    const str = try serialize(settings, allocator);
-    defer allocator.free(str);
-
-    try std.Io.Dir.cwd().writeFile(dvui.io, .{ .sub_path = path, .data = str });
 }
 
 pub fn deinit(settings: *Settings, allocator: std.mem.Allocator) void {

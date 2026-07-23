@@ -18,6 +18,58 @@ pub const TreeSelection = @import("widgets/TreeSelection.zig");
 pub var modal_dim_titlebar: bool = false;
 pub var dialog_close_rect_override: ?dvui.Rect.Physical = null;
 
+/// Side of the square every glyph in a tree row occupies — the expand/collapse caret, a folder
+/// or file-type icon, a plugin's own icon, the app logo, or a letter standing in for a missing
+/// icon.
+///
+/// Derived from the body font so it tracks the user's font-size setting instead of pinning rows
+/// to a fixed pixel height, and a little *under* the text height so glyphs read as sitting beside
+/// the label rather than looming over it.
+pub fn treeRowGlyphSize() dvui.Size {
+    const h = @round(dvui.Font.theme(.body).textHeight() * 0.9);
+    return .{ .w = h, .h = h };
+}
+
+/// Options for the shell's own icons/images drawn inside a `treeRowGlyph` slot — the same
+/// `expand = .ratio` fit asked of plugin icons, centred in the slot.
+pub fn treeRowIconOptions(over: dvui.Options) dvui.Options {
+    const defaults: dvui.Options = .{
+        .gravity_x = 0.5,
+        .gravity_y = 0.5,
+        .expand = .ratio,
+        .padding = dvui.Rect.all(0),
+        .margin = dvui.Rect.all(0),
+        .background = false,
+    };
+    return defaults.override(over);
+}
+
+/// Reserve one tree-row glyph slot: a box of exactly `treeRowGlyphSize()`, into which the caller
+/// draws a caret, an icon, an image, or a letter.
+///
+/// **This is the contract for plugin-drawn icons** (`Host.registerFileIcon` /
+/// `registerPluginIcon`). The shell reserves the rect; the plugin draws into it with
+/// `expand = .ratio`, which fits its artwork to whatever the row can spare while preserving the
+/// aspect ratio. Both halves are needed: a plugin that draws at a hard-coded size ignores the
+/// slot and knocks the row out of line, and a slot with no fixed size lets each icon dictate its
+/// own row height. `min` and `max` are both set so the slot is a genuinely fixed rect rather than
+/// a floor that any large icon can push open.
+///
+/// Caller deinits, as with `dvui.box`.
+pub fn treeRowGlyph(src: std.builtin.SourceLocation, opts: dvui.Options) *dvui.BoxWidget {
+    const size = treeRowGlyphSize();
+    const defaults: dvui.Options = .{
+        .gravity_y = 0.5,
+        .min_size_content = size,
+        .max_size_content = .size(size),
+        .expand = .none,
+        .background = false,
+        .padding = dvui.Rect.all(0),
+        .margin = dvui.Rect.all(0),
+    };
+    return dvui.box(src, .{ .dir = .horizontal }, defaults.override(opts));
+}
+
 /// Currently this is specialized for the layers paned widget, just includes icon and dragging flag so we know when the pane is dragging
 pub fn paned(src: std.builtin.SourceLocation, init_opts: PanedWidget.InitOptions, opts: dvui.Options) *PanedWidget {
     var ret = dvui.widgetAlloc(PanedWidget);

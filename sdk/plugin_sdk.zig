@@ -17,7 +17,26 @@
 const std = @import("std");
 
 /// Shared with the runtime loader so install + load locations never drift (see its doc comment).
-const core_paths = @import("src/core/paths.zig");
+/// Lives in this package; keep `localConfigRoot` in sync with `src/core/paths.zig`.
+const core_paths = @import("paths.zig");
+
+/// The `core` module's import set, shared with the app build so a dependency can't reach four of
+/// the five `core` compiles and miss this one (see its doc comment).
+const core_module = @import("core_module.zig");
+
+/// LazyPath to a repo-relative source file (`src/core/…`, `src/sdk/…`).
+///
+/// Two layouts share this package:
+/// - **In-repo** (`fizzy/sdk/`): sources live at `../src/…` beside this package.
+/// - **Release tarball** (`fizzy-sdk-v*.tar.gz`): `src/` is vendored next to `build.zig`
+///   so the archive root *is* this package (see `scripts/pack-sdk.sh`).
+fn repoPath(b: *std.Build, sub_path: []const u8) std.Build.LazyPath {
+    b.build_root.handle.access(b.graph.io, sub_path, .{}) catch {
+        const root = b.build_root.path orelse @panic("fizzy sdk: missing build_root");
+        return .{ .cwd_relative = b.pathJoin(&.{ root, "..", sub_path }) };
+    };
+    return b.path(sub_path);
+}
 
 /// C-ABI entry symbols every plugin dylib must export.
 pub const dylib_exports = [_][]const u8{
@@ -56,9 +75,9 @@ pub const ModuleOptions = struct {
 /// `manifest_identity.zig`'s doc comment for why this is a plain relative `@import` (shared
 /// with `src/plugins/shared/build/helpers.zig`'s twin `readManifestAt`) rather than a duplicate
 /// struct.
-pub const IdentityManifest = @import("src/sdk/manifest_identity.zig").IdentityManifest;
+pub const IdentityManifest = @import("manifest_identity.zig").IdentityManifest;
 
-/// Derived from `src/sdk/sdk_version.zig` (`std`-only, unlike `src/sdk/version.zig` itself,
+/// Derived from `sdk_version.zig` (`std`-only, unlike `src/sdk/version.zig` itself,
 /// which transitively reaches "dvui"/"proxy_bridge" — named imports this compilation unit
 /// doesn't carry; see `dylib_exports` above for the same "avoid a deep import" reasoning) rather
 /// than duplicated as a literal: a hand-copied version string here silently drifted out of sync
@@ -69,7 +88,7 @@ pub const current_sdk_version: []const u8 = std.fmt.comptimePrint("{d}.{d}.{d}",
     version_number.sdk_version.minor,
     version_number.sdk_version.patch,
 });
-const version_number = @import("src/sdk/sdk_version.zig");
+const version_number = @import("sdk_version.zig");
 
 /// Read and validate a plugin's `plugin.zig.zon` (identity only; `ignore_unknown_fields` so a
 /// field the build doesn't read doesn't need to be part of `Target` below). Panics clearly on a
@@ -197,11 +216,15 @@ pub const InstallOptions = struct {
     name: ?[]const u8 = null,
 };
 
-/// Wire `zig build install` for a plugin: emit `zig-out/{name}.{ext}` (for packaging / store CI)
-/// **and** drop it into this OS's fizzy plugins dir, so the editor loads it on next launch.
-/// `{name}` must equal the plugin's manifest `id`. This is the canonical plugin-dev command —
-/// `zig build install` is all an author needs. There is no on-disk `.zon` sidecar — the plugins
-/// dir holds only the built dylib; the loader reads identity from the dylib's own exports.
+/// Wire `zig build install` for a plugin: emit `zig-out/{name}.{ext}` (a flat single-file
+/// artifact for packaging / store CI / release uploads) **and** drop a copy into this OS's fizzy
+/// plugins dir, under its own `{name}/{name}.{ext}` directory (see
+/// docs/PLUGIN_MANIFEST_PLAN.md R10 — every installed plugin gets its own directory; only this
+/// dev-convenience copy is nested, not the flat release artifact above), so the editor loads it
+/// on next launch. `{name}` must equal the plugin's manifest `id`. This is the canonical
+/// plugin-dev command — `zig build install` is all an author needs. There is no on-disk `.zon`
+/// sidecar — the plugin's directory holds only the built dylib; the loader reads identity from
+/// the dylib's own exports.
 ///
 /// Also wires a `check` step (see `addSdkCheck`) and emits `zig-out/sdk-meta.json` (see
 /// `addSdkMeta`) so store CI can read `fizzy_sdk_version` / `abi_fingerprint` on every target —
@@ -225,7 +248,7 @@ pub fn install(b: *std.Build, lib: *std.Build.Step.Compile, opts: InstallOptions
     // zig-out/sdk-meta.json — same pin/optimize-class as the dylib; CI reads this on all targets.
     b.getInstallStep().dependOn(addSdkMeta(b, lib));
 
-    // {config}/fizzy/plugins/{name}.{ext} — so the running editor picks it up (dev convenience).
+    // {config}/fizzy/plugins/{name}/{name}.{ext} — so the running editor picks it up (dev convenience).
     const dev = b.allocator.create(DevInstall) catch @panic("OOM");
     dev.* = .{
         .step = std.Build.Step.init(.{
@@ -235,6 +258,7 @@ pub fn install(b: *std.Build, lib: *std.Build.Step.Compile, opts: InstallOptions
             .makeFn = DevInstall.make,
         }),
         .lib = lib,
+        .name = name,
         .file_name = dest,
     };
     dev.step.dependOn(&lib.step);
@@ -260,7 +284,7 @@ fn addSdkMeta(b: *std.Build, lib: *std.Build.Step.Compile) *std.Build.Step {
 
     const fizzy_dep = fizzyDep(b, .{ .target = b.graph.host, .optimize = optimize });
     const meta_mod = b.createModule(.{
-        .root_source_file = fizzy_dep.path("build/plugin_sdk_meta.zig"),
+        .root_source_file = fizzy_dep.path("plugin_sdk_meta.zig"),
         .target = b.graph.host,
         .optimize = optimize,
     });
@@ -292,7 +316,7 @@ fn addSdkCheck(b: *std.Build) *std.Build.Step {
 
     const fizzy_dep = fizzyDep(b, .{ .target = b.graph.host, .optimize = .ReleaseFast });
     const check_mod = b.createModule(.{
-        .root_source_file = fizzy_dep.path("build/plugin_sdk_check.zig"),
+        .root_source_file = fizzy_dep.path("plugin_sdk_check.zig"),
         .target = b.graph.host,
         .optimize = .ReleaseFast,
     });
@@ -331,12 +355,15 @@ fn fizzyPluginsDir(b: *std.Build) ![]const u8 {
     return std.fs.path.join(b.allocator, &.{ config_root, "fizzy", "plugins" });
 }
 
-/// Custom step: copy the built dylib into the host's fizzy plugins dir as `{id}.{ext}`. No
-/// `.zon` sidecar — the dylib's own exports (`fizzy_plugin_id`/`fizzy_plugin_manifest_zon`/…)
-/// are identity's only on-disk-adjacent copy.
+/// Custom step: copy the built dylib into the host's fizzy plugins dir, under its own
+/// `{id}/{id}.{ext}` directory (see docs/PLUGIN_MANIFEST_PLAN.md R10). No `.zon` sidecar — the
+/// dylib's own exports (`fizzy_plugin_id`/`fizzy_plugin_manifest_zon`/…) are identity's only
+/// on-disk-adjacent copy.
 const DevInstall = struct {
     step: std.Build.Step,
     lib: *std.Build.Step.Compile,
+    /// Bare plugin name (the manifest `id`) — its own subdirectory name under the plugins dir.
+    name: []const u8,
     file_name: []const u8,
 
     fn make(step: *std.Build.Step, _: std.Build.Step.MakeOptions) anyerror!void {
@@ -346,14 +373,17 @@ const DevInstall = struct {
 
         // Skip gracefully if the host has no resolvable config home (e.g. a bare CI runner) so a
         // plain `zig build` for packaging never fails on the dev convenience.
-        const dir = fizzyPluginsDir(b) catch |err| {
+        const plugins_dir = fizzyPluginsDir(b) catch |err| {
             std.log.warn("fizzy: skipping plugin dev install (no config home: {s})", .{@errorName(err)});
             return;
         };
-        // Create `{config}/fizzy` then `{config}/fizzy/plugins` (the config root already exists);
-        // "already exists" is fine.
-        const fizzy_dir = std.fs.path.dirname(dir).?;
+        // Create `{config}/fizzy`, `{config}/fizzy/plugins`, then this plugin's own
+        // `{config}/fizzy/plugins/{name}` directory (the config root already exists);
+        // "already exists" is fine at every level.
+        const fizzy_dir = std.fs.path.dirname(plugins_dir).?;
         std.Io.Dir.createDirAbsolute(io, fizzy_dir, .default_dir) catch {};
+        std.Io.Dir.createDirAbsolute(io, plugins_dir, .default_dir) catch {};
+        const dir = try std.fs.path.join(b.allocator, &.{ plugins_dir, self.name });
         std.Io.Dir.createDirAbsolute(io, dir, .default_dir) catch {};
 
         // `getPath2` is relative to the build root (the runner's cwd); the dest is absolute.
@@ -521,18 +551,15 @@ pub fn exportModules(
     const core_mod = b.addModule("core", .{
         .target = target,
         .optimize = optimize,
-        .root_source_file = b.path("src/core/core.zig"),
+        .root_source_file = repoPath(b, "src/core/core.zig"),
         .link_libc = true,
     });
-    core_mod.addImport("dvui", dvui_proxy_mod);
-    if (b.lazyDependency("icons", .{ .target = target, .optimize = optimize })) |dep| {
-        core_mod.addImport("icons", dep.module("icons"));
-    }
+    _ = core_module.addImports(b, core_mod, dvui_proxy_mod, target, optimize);
 
     const sdk_mod = b.addModule("fizzy_sdk", .{
         .target = target,
         .optimize = optimize,
-        .root_source_file = b.path("src/sdk/sdk.zig"),
+        .root_source_file = repoPath(b, "src/sdk/sdk.zig"),
     });
     sdk_mod.addImport("dvui", dvui_proxy_mod);
     sdk_mod.addImport("proxy_bridge", proxy_bridge_mod);
@@ -542,8 +569,10 @@ pub fn exportModules(
     b.modules.put(b.graph.arena, b.dupe("proxy_bridge"), proxy_bridge_mod) catch @panic("OOM");
 }
 
-/// Install a built-in plugin dylib as `{name}.{ext}` under `plugins/`. No `.zon` sidecar — the
-/// dylib's own exports carry identity (see `helpers.zig`'s `addDylib`/`generatedDylibRoot`).
+/// Install a built-in plugin dylib as `{name}/{name}.{ext}` under `plugins/` — each plugin gets
+/// its own directory (see docs/PLUGIN_MANIFEST_PLAN.md R10), which it can also use at runtime for
+/// its own assets/data (`Host.pluginInstallDir`). No `.zon` sidecar — the dylib's own exports
+/// carry identity (see `helpers.zig`'s `addDylib`/`generatedDylibRoot`).
 pub fn installBuiltinPlugin(
     b: *std.Build,
     lib: *std.Build.Step.Compile,
@@ -557,6 +586,6 @@ pub fn installBuiltinPlugin(
     };
     return b.addInstallArtifact(lib, .{
         .dest_dir = .{ .override = plugins_install_dir },
-        .dest_sub_path = b.fmt("{s}.{s}", .{ name, ext }),
+        .dest_sub_path = b.fmt("{s}/{s}.{s}", .{ name, name, ext }),
     });
 }

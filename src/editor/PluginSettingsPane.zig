@@ -1,62 +1,19 @@
-//! Schema-driven half of the Settings sidebar (see `Editor.drawSettingsPane`).
+//! Draws a single plugin settings control.
 //!
 //! Plugins register a typed settings value + field metadata (`sdk.settings.SettingsSchema`);
-//! **this pane draws all controls** so every plugin's settings share the same appearance.
+//! **this file draws all controls** so every plugin's settings share the same appearance.
 //! Plugins do not supply a `draw` callback.
 //!
-//! Loaded-only: disabled plugins get an Enabled toggle only; failed plugins show the reason.
+//! Which controls appear, and where, is `SettingsTree`'s decision — it owns the Settings pane and
+//! calls `drawField` for each schema field that survived the search filter. Loaded-with-settings-
+//! only still holds: a plugin gets rows only if it registered a schema. Enabling/disabling a
+//! plugin is the Plugins store tab's job (`PluginStore.zig`), never this one's.
 const std = @import("std");
 const dvui = @import("dvui");
 const fizzy = @import("../fizzy.zig");
-const PluginStore = @import("PluginStore.zig");
 const settings = fizzy.sdk.settings;
 
-pub fn draw() !void {
-    const editor = fizzy.editor;
-    const host = &editor.host;
-
-    for (host.settings_schemas.items) |*schema| try drawLoaded(schema);
-    for (editor.disabled_plugin_ids.items) |id| drawDisabled(id);
-    for (editor.failed_user_plugins.items) |f| drawFailed(f);
-}
-
-/// Loaded / disabled / failed are drawn from three independent lists that can legitimately
-/// contain the same plugin id at once (e.g. a built-in's own dylib rediscovered in the shared
-/// user plugins directory used to show up as both loaded *and* failed — see `loadUserPlugins`).
-/// Each section gets its own hash seed so an id shared across sections can never collide on the
-/// same heading widget id — same story dvui's own "duplicate widget id" hint points at, just
-/// scoped per section instead of per loop index.
-const Section = enum(u64) { loaded = 0, disabled = 1, failed = 2 };
-
-fn hashId(section: Section, s: []const u8) usize {
-    return @truncate(std.hash.Wyhash.hash(@intFromEnum(section), s));
-}
-
-fn drawHeading(text: []const u8, id_extra: usize) void {
-    dvui.labelNoFmt(@src(), text, .{}, .{
-        .id_extra = id_extra,
-        .font = dvui.Font.theme(.heading),
-        .margin = .{ .x = 2, .y = 12, .w = 2, .h = 2 },
-    });
-}
-
-fn drawLoaded(schema: *const settings.SettingsSchema) !void {
-    const title = if (schema.title.len > 0) schema.title else schema.owner.display_name;
-    const id_extra = hashId(.loaded, schema.owner.id);
-    drawHeading(title, id_extra);
-
-    var box = dvui.box(@src(), .{ .dir = .vertical }, .{
-        .id_extra = id_extra,
-        .expand = .horizontal,
-    });
-    defer box.deinit();
-
-    for (schema.fields, 0..) |field, fi| {
-        try drawField(schema, field, fi, id_extra +% fi +% 1);
-    }
-}
-
-fn drawField(schema: *const settings.SettingsSchema, field: settings.Setting, field_index: usize, id_extra: usize) !void {
+pub fn drawField(schema: *const settings.SettingsSchema, field: settings.Setting, field_index: usize, id_extra: usize) !void {
     const access = schema.access;
     const value = schema.value;
 
@@ -177,33 +134,4 @@ fn drawIntChoices(schema: *const settings.SettingsSchema, field: settings.Settin
             }
         }
     }
-}
-
-fn drawDisabled(id: []const u8) void {
-    const id_extra = hashId(.disabled, id);
-    drawHeading(PluginStore.displayName(id), id_extra);
-
-    var enabled = false;
-    if (dvui.checkbox(@src(), &enabled, "Enabled", .{ .id_extra = id_extra })) {
-        PluginStore.queueSetEnabled(id, enabled);
-    }
-}
-
-fn drawFailed(f: fizzy.Editor.FailedPlugin) void {
-    const id_extra = hashId(.failed, f.id);
-    drawHeading(PluginStore.displayName(f.id), id_extra);
-
-    var buf: [256]u8 = undefined;
-    const text = if (f.detail) |d|
-        std.fmt.bufPrint(&buf, "Failed to load: {s} ({s})", .{ f.reason, d }) catch f.reason
-    else
-        std.fmt.bufPrint(&buf, "Failed to load: {s}", .{f.reason}) catch f.reason;
-
-    var tl = dvui.textLayout(@src(), .{}, .{
-        .id_extra = id_extra,
-        .expand = .horizontal,
-        .background = false,
-    });
-    tl.addText(text, .{ .color_text = dvui.themeGet().color(.err, .text) });
-    tl.deinit();
 }

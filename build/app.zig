@@ -1,8 +1,17 @@
 const std = @import("std");
 
-const plugin = @import("../plugin_sdk.zig");
+const plugin = @import("../sdk/plugin_sdk.zig");
+const core_mod = @import("../sdk/core_module.zig");
 const dvui = @import("dvui");
 const velopack = @import("velopack.zig");
+
+// `sdk/sdk_version.zig` mirrors `src/sdk/sdk_version.zig` for the plugin package boundary.
+comptime {
+    const pack = @import("../sdk/sdk_version.zig").sdk_version;
+    const runtime = @import("../src/sdk/sdk_version.zig").sdk_version;
+    if (pack.major != runtime.major or pack.minor != runtime.minor or pack.patch != runtime.patch)
+        @compileError("sdk/sdk_version.zig drifted from src/sdk/sdk_version.zig — bump both");
+}
 
 pub const Options = struct {
     windows_msvc_libc_opt: ?[]const u8 = null,
@@ -19,10 +28,9 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const macos_sign_install_identity = opts.macos_sign_install_identity;
     const macos_notary_profile = opts.macos_notary_profile;
 
-    // Resolve Velopack lazily. This runs only on app builds (never on the plugin-SDK path,
-    // which returns from the root build before reaching here), so plugin builds never fetch
-    // it. On the first configure pass this returns null → Zig fetches velopack_zig and
-    // re-runs build(); the second pass proceeds with a valid handle.
+    // Resolve Velopack lazily (app-only; plugins depend on `sdk/` which has no Velopack).
+    // First configure pass returns null → Zig fetches velopack_zig and re-runs build();
+    // the second pass proceeds with a valid handle.
     const vz = b.lazyDependency("velopack_zig", .{}) orelse return;
 
     const common = @import("common.zig");
@@ -425,9 +433,6 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     fizzy_test_module.addImport("backend", dvui_testing_dep.module("testing"));
     fizzy_test_module.addImport("assets", assets_module);
     fizzy_test_module.addOptions("build_opts", build_opts);
-    if (b.lazyDependency("icons", .{ .target = target, .optimize = optimize })) |dep| {
-        fizzy_test_module.addImport("icons", dep.module("icons"));
-    }
 
     // Shared `core` module for the test build (dvui testing backend variant).
     const core_module_test = b.createModule(.{
@@ -435,18 +440,19 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .optimize = optimize,
         .root_source_file = b.path("src/core/core.zig"),
     });
-    core_module_test.addImport("dvui", dvui_testing_dep.module("dvui_testing"));
-    if (b.lazyDependency("icons", .{ .target = target, .optimize = optimize })) |dep| {
-        core_module_test.addImport("icons", dep.module("icons"));
-    }
+    const icons_test = core_mod.addImports(b, core_module_test, dvui_testing_dep.module("dvui_testing"), target, optimize);
     fizzy_test_module.addImport("core", core_module_test);
+    if (icons_test) |icons| fizzy_test_module.addImport("icons", icons);
+    if (b.lazyDependency("nightwatch", .{ .target = target, .optimize = optimize })) |dep| {
+        fizzy_test_module.addImport("nightwatch", dep.module("nightwatch"));
+    }
 
     const sdk_module_test = sdk.wireSdkModule(b, target, optimize, dvui_testing_dep.module("dvui_testing"), dvui_test_proxy_bridge, core_module_test, fizzy_test_module);
     _ = workbench_plugin.addStaticModule(b, target, optimize, .{
         .dvui = dvui_testing_dep.module("dvui_testing"),
         .core = core_module_test,
         .sdk = sdk_module_test,
-        .icons = if (b.lazyDependency("icons", .{ .target = target, .optimize = optimize })) |dep| dep.module("icons") else null,
+        .icons = icons_test,
         .backend = dvui_testing_dep.module("testing"),
     }, workbench_opts, fizzy_test_module);
     _ = text_plugin.addStaticModule(b, target, optimize, .{

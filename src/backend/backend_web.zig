@@ -71,6 +71,15 @@ pub fn showWindow(_: *dvui.Window) void {}
 /// Symmetric with the native API: no window geometry to persist on web.
 pub fn saveWindowGeometry(_: *dvui.Window) void {}
 
+/// Symmetric with the native API: no `window.zon` to persist on web.
+pub fn saveWindowRatios(_: []const u8, _: f32, _: f32) void {}
+
+/// Symmetric with the native API: no `window.zon` to read on web — same defaults
+/// `SavedFrame` itself declares natively.
+pub fn loadWindowRatios(_: []const u8) struct { explorer_ratio: f32, panel_ratio: f32 } {
+    return .{ .explorer_ratio = 0.35, .panel_ratio = 0.25 };
+}
+
 /// Symmetric with the native API: no AppKit pump on web.
 pub fn macosLaunchComplete() void {}
 

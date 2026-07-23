@@ -1,172 +1,219 @@
-//! One-shot migration of the legacy `settings.json` into `settings.zon` (see
-//! docs/PLUGIN_MANIFEST_PLAN.md R3). All `std.json` usage on the shell settings path is
-//! isolated to this file so it can be deleted once every install has migrated.
+//! One-shot migrations for `settings.zon` layout changes — see docs/PLUGIN_MANIFEST_PLAN.md.
+//!
+//! 1. `mergeLegacyPerPluginFiles` — pre-R10 one-file-per-plugin (`<plugins_dir>/<id>.settings.zon`)
+//!    into the merged `.plugins.<id>` field (R10).
+//! 2. `migrateToPerPluginEnabled` — pre-R12 flat `.plugins.<id> = .{ <author fields> }` + top-level
+//!    `disabled_plugins` into nested `.{ .enabled = …, .settings = .{ … } }` (R12).
 const std = @import("std");
 const fizzy = @import("../fizzy.zig");
 const dvui = @import("dvui");
 const Settings = @import("Settings.zig");
+const SettingsPluginsZon = @import("SettingsPluginsZon.zig");
 
-/// If `zon_path` doesn't exist yet but its sibling `<name>.json` does, parse the legacy
-/// JSON, write an equivalent `zon_path`, split any legacy `"plugins"` blobs out to their own
-/// `<plugins_dir>/<id>.settings.zon` files, and delete the JSON file. No-op (including on any
-/// failure along the way — the caller falls back to defaults as usual) otherwise. `plugins_dir`
-/// is null on wasm/headless, in which case plugin blobs are silently dropped (no filesystem).
-pub fn migrateIfNeeded(allocator: std.mem.Allocator, zon_path: []const u8, plugins_dir: ?[]const u8) void {
-    if (fizzy.fs.read(allocator, dvui.io, zon_path) catch null) |existing| {
-        allocator.free(existing);
-        return;
-    }
+const legacy_suffix = ".settings.zon";
 
-    const json_path = siblingJsonPath(allocator, zon_path) catch return;
-    defer allocator.free(json_path);
+/// Scans `<plugins_dir>/*.settings.zon` (the pre-R10 per-plugin layout) and, for each one, upserts
+/// its content into `settings_zon_path`'s `.plugins.<id>` field (via `SettingsPluginsZon.upsertOne`,
+/// which never clobbers an id already present there) and deletes the old file on success. No-op
+/// if `plugins_dir` is null (wasm/headless) or the directory doesn't exist yet. Best-effort: a
+/// single bad entry is logged and skipped rather than aborting the rest.
+pub fn mergeLegacyPerPluginFiles(allocator: std.mem.Allocator, settings_zon_path: []const u8, plugins_dir: ?[]const u8) void {
+    const dir_path = plugins_dir orelse return;
+    var dir = std.Io.Dir.cwd().openDir(dvui.io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(dvui.io);
 
-    const data = fizzy.fs.read(allocator, dvui.io, json_path) catch return;
-    defer allocator.free(data);
+    var iter = dir.iterate();
+    while (iter.next(dvui.io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, legacy_suffix)) continue;
+        const id = entry.name[0 .. entry.name.len - legacy_suffix.len];
+        if (id.len == 0) continue;
 
-    migrate(allocator, zon_path, json_path, data, plugins_dir) catch |err| {
-        dvui.log.warn("settings: failed to migrate {s} to zon: {s}", .{ json_path, @errorName(err) });
-    };
-}
-
-fn siblingJsonPath(allocator: std.mem.Allocator, zon_path: []const u8) ![]u8 {
-    if (std.mem.endsWith(u8, zon_path, ".zon")) {
-        return std.fmt.allocPrint(allocator, "{s}json", .{zon_path[0 .. zon_path.len - 3]});
-    }
-    return std.fmt.allocPrint(allocator, "{s}.json", .{zon_path});
-}
-
-fn migrate(allocator: std.mem.Allocator, zon_path: []const u8, json_path: []const u8, data: []const u8, plugins_dir: ?[]const u8) !void {
-    const options = std.json.ParseOptions{ .duplicate_field_behavior = .use_first, .ignore_unknown_fields = true };
-    var parsed = try std.json.parseFromSlice(Settings, allocator, data, options);
-    defer parsed.deinit();
-
-    const zon_text = try Settings.serialize(&parsed.value, allocator);
-    defer allocator.free(zon_text);
-
-    try std.Io.Dir.cwd().writeFile(dvui.io, .{ .sub_path = zon_path, .data = zon_text });
-    writePluginBlobs(allocator, data, plugins_dir);
-    std.Io.Dir.deleteFileAbsolute(dvui.io, json_path) catch |err| {
-        dvui.log.warn("settings: migrated to zon but failed to delete legacy {s}: {s}", .{ json_path, @errorName(err) });
-    };
-}
-
-/// Splits the legacy `"plugins"` object in `data` out into `<plugins_dir>/<id>.settings.zon`
-/// files, converting each JSON blob to zon text. Mirrors the pre-R3 `Settings.loadPluginStore`'s
-/// JSON handling, including the legacy-flat-file fallback that seeds the pixel-art blob from
-/// the whole root. Best-effort throughout: a single bad entry, or no `plugins_dir` (wasm/
-/// headless), just means that plugin starts over with defaults.
-fn writePluginBlobs(allocator: std.mem.Allocator, data: []const u8, plugins_dir: ?[]const u8) void {
-    const dir = plugins_dir orelse return;
-
-    var parsed_v = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch return;
-    defer parsed_v.deinit();
-
-    const root = switch (parsed_v.value) {
-        .object => |o| o,
-        else => return,
-    };
-
-    if (root.get("plugins")) |plugins_val| {
-        switch (plugins_val) {
-            .object => |plugins| {
-                var it = plugins.iterator();
-                while (it.next()) |e| writePluginBlob(allocator, dir, e.key_ptr.*, e.value_ptr.*);
-                return;
-            },
-            else => {},
-        }
-    }
-
-    // Legacy flat settings.json (no "plugins" object): seed the pixel-art blob from the
-    // whole root so its moved fields survive the format change.
-    writePluginBlob(allocator, dir, "pixi", parsed_v.value);
-}
-
-fn writePluginBlob(allocator: std.mem.Allocator, dir: []const u8, id: []const u8, value: std.json.Value) void {
-    const blob = jsonValueToZonAlloc(allocator, value) catch return;
-    defer allocator.free(blob);
-
-    const path = std.fmt.allocPrint(allocator, "{s}/{s}.settings.zon", .{ dir, id }) catch return;
-    defer allocator.free(path);
-
-    std.Io.Dir.createDirAbsolute(dvui.io, dir, .default_dir) catch {}; // best-effort; exists is fine
-    std.Io.Dir.cwd().writeFile(dvui.io, .{ .sub_path = path, .data = blob }) catch |err| {
-        dvui.log.warn("settings: failed to migrate '{s}' plugin settings: {s}", .{ id, @errorName(err) });
-    };
-}
-
-/// One-shot (per plugin id) split of a pre-R7 `settings.zon`'s embedded `plugins` list (each
-/// entry an escaped-zon-text blob under a shared `plugins = .{ .{ .id = ..., .data = ... }, ... }`
-/// key) out to its own `<plugins_dir>/<id>.settings.zon` file — see docs/PLUGIN_MANIFEST_PLAN.md.
-/// Runs on every load but is a no-op per id once that id's file already exists, so a live edit
-/// made through the new per-file system is never clobbered by a stale embedded blob that just
-/// hasn't been overwritten by a save yet (`Settings.serialize` no longer emits `plugins` at all).
-/// `zon_data` is `settings.zon`'s raw (already-read) bytes; a null `plugins_dir` (wasm/headless)
-/// makes this a no-op.
-pub fn splitEmbeddedPluginsIfNeeded(allocator: std.mem.Allocator, zon_data: [:0]const u8, plugins_dir: ?[]const u8) void {
-    const dir = plugins_dir orelse return;
-
-    const Embedded = struct {
-        plugins: []const struct { id: []const u8, data: []const u8 } = &.{},
-    };
-    const parsed = std.zon.parse.fromSliceAlloc(Embedded, allocator, zon_data, null, .{ .ignore_unknown_fields = true }) catch return;
-    defer std.zon.parse.free(allocator, parsed);
-    if (parsed.plugins.len == 0) return;
-
-    for (parsed.plugins) |entry| {
-        const path = std.fmt.allocPrint(allocator, "{s}/{s}.settings.zon", .{ dir, entry.id }) catch continue;
-        defer allocator.free(path);
-
-        // Don't clobber a file already written through the new per-plugin system.
-        if (fizzy.fs.read(allocator, dvui.io, path) catch null) |existing| {
-            allocator.free(existing);
-            continue;
-        }
-
-        std.Io.Dir.createDirAbsolute(dvui.io, dir, .default_dir) catch {}; // best-effort; exists is fine
-        std.Io.Dir.cwd().writeFile(dvui.io, .{ .sub_path = path, .data = entry.data }) catch |err| {
-            dvui.log.warn("settings: failed to split embedded '{s}' plugin settings: {s}", .{ entry.id, @errorName(err) });
+        mergeOne(allocator, settings_zon_path, dir_path, id) catch |err| {
+            dvui.log.warn("settings: failed to migrate legacy '{s}' settings: {s}", .{ id, @errorName(err) });
         };
     }
 }
 
-/// Recursively renders a `std.json.Value` as zon source text (a plugin's `<id>.settings.zon`
-/// file's actual contents — see docs/PLUGIN_MANIFEST_PLAN.md). Covers every `Value` variant
-/// that can appear in a plugin's own settings blob.
-fn jsonValueToZonAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-    try writeJsonValueAsZon(&aw.writer, value);
-    return aw.toOwnedSlice();
+fn mergeOne(allocator: std.mem.Allocator, settings_zon_path: []const u8, plugins_dir: []const u8, id: []const u8) !void {
+    const legacy_path = try std.fmt.allocPrint(allocator, "{s}/{s}{s}", .{ plugins_dir, id, legacy_suffix });
+    defer allocator.free(legacy_path);
+
+    const legacy_text = try fizzy.fs.read(allocator, dvui.io, legacy_path);
+    defer allocator.free(legacy_text);
+
+    const existing = fizzy.fs.readZ(allocator, dvui.io, settings_zon_path) catch null;
+    defer if (existing) |e| allocator.free(e);
+
+    const composed = try SettingsPluginsZon.upsertOne(allocator, existing, .{ .id = id, .text = legacy_text });
+    defer allocator.free(composed);
+
+    try std.Io.Dir.cwd().writeFile(dvui.io, .{ .sub_path = settings_zon_path, .data = composed });
+    std.Io.Dir.deleteFileAbsolute(dvui.io, legacy_path) catch |err| {
+        dvui.log.warn("settings: migrated legacy '{s}' settings but failed to delete old file: {s}", .{ id, @errorName(err) });
+    };
 }
 
-fn writeJsonValueAsZon(w: *std.Io.Writer, value: std.json.Value) !void {
-    switch (value) {
-        .null => try w.writeAll("null"),
-        .bool => |b| try w.writeAll(if (b) "true" else "false"),
-        .integer => |i| try w.print("{d}", .{i}),
-        .float => |f| try w.print("{d}", .{f}),
-        .number_string => |s| try w.writeAll(s),
-        .string => |s| try w.print("\"{f}\"", .{std.zig.fmtString(s)}),
-        .array => |arr| {
-            try w.writeAll(".{");
-            for (arr.items, 0..) |item, i| {
-                if (i != 0) try w.writeAll(", ");
-                try writeJsonValueAsZon(w, item);
+/// Pre-R12 on-disk shape still parseable for this one-shot: a top-level `disabled_plugins` list
+/// plus flat `.plugins.<id> = .{ <author fields> }` blocks (no nested `.settings` / `.enabled`).
+const LegacyDisk = struct {
+    disabled_plugins: []const []const u8 = &.{},
+};
+
+/// Rewrites pre-R12 flat `.plugins.<id>` blocks + top-level `disabled_plugins` into the nested
+/// `.{ .enabled = …, .settings = .{ … } }` shape (and drops `disabled_plugins` from the file).
+/// Also writes `.enabled = true` for any on-disk plugin directory that was previously enabled by
+/// default (absent from `disabled_plugins`) but had no settings block — under R12, absence means
+/// disabled. Idempotent: already-nested blocks are left alone; a file with no legacy list and no
+/// flat blocks is a no-op. Best-effort throughout.
+pub fn migrateToPerPluginEnabled(allocator: std.mem.Allocator, settings_zon_path: []const u8, plugins_dir: ?[]const u8) void {
+    const data = fizzy.fs.readZ(allocator, dvui.io, settings_zon_path) catch return;
+    defer allocator.free(data);
+
+    @setEvalBranchQuota(10_000);
+    const legacy = std.zon.parse.fromSliceAlloc(LegacyDisk, allocator, data, null, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| {
+        dvui.log.warn("settings: could not parse settings.zon for R12 enabled migration ({s}); skipping", .{@errorName(err)});
+        return;
+    };
+    defer std.zon.parse.free(allocator, legacy);
+
+    const blocks = SettingsPluginsZon.listPluginBlocks(allocator, data) catch return;
+    defer SettingsPluginsZon.freeEntries(allocator, blocks);
+
+    var overlay: std.ArrayListUnmanaged(SettingsPluginsZon.Entry) = .empty;
+    defer {
+        for (overlay.items) |e| {
+            // overlay ids are borrowed (from blocks / dupe below); texts we allocate are freed here.
+            if (e.text) |t| allocator.free(t);
+        }
+        // Free any id we duped for on-disk plugins that had no prior block.
+        for (overlay.items) |e| {
+            var borrowed = false;
+            for (blocks) |b| {
+                if (e.id.ptr == b.id.ptr) {
+                    borrowed = true;
+                    break;
+                }
             }
-            try w.writeAll("}");
-        },
-        .object => |obj| {
-            try w.writeAll(".{ ");
-            var it = obj.iterator();
-            var first = true;
-            while (it.next()) |e| {
-                if (!first) try w.writeAll(", ");
-                first = false;
-                try w.print(".{f} = ", .{std.zig.fmtId(e.key_ptr.*)});
-                try writeJsonValueAsZon(w, e.value_ptr.*);
-            }
-            try w.writeAll(" }");
-        },
+            if (!borrowed) allocator.free(e.id);
+        }
+        overlay.deinit(allocator);
     }
+
+    var needs_write = legacy.disabled_plugins.len > 0;
+
+    for (blocks) |e| {
+        const text = e.text orelse continue;
+        if (isAlreadyNested(allocator, text)) continue;
+        needs_write = true;
+        const enabled = !containsId(legacy.disabled_plugins, e.id);
+        const settings_text: ?[]const u8 = if (isEmptyStructLiteral(text)) null else text;
+        const new_block = SettingsPluginsZon.composePluginIdBlock(allocator, enabled, settings_text) catch |err| {
+            dvui.log.warn("settings: failed to compose R12 block for '{s}': {s}", .{ e.id, @errorName(err) });
+            continue;
+        };
+        overlay.append(allocator, .{ .id = e.id, .text = new_block }) catch {
+            allocator.free(new_block);
+        };
+    }
+
+    // Old default was "enabled unless listed in disabled_plugins." New default is disabled
+    // (no entry). Any on-disk plugin that was previously auto-loaded needs an explicit
+    // `.enabled = true` written now, even if it had no settings block.
+    if (plugins_dir) |dir_path| {
+        var dir = std.Io.Dir.cwd().openDir(dvui.io, dir_path, .{ .iterate = true }) catch null;
+        if (dir) |*d| {
+            defer d.close(dvui.io);
+            var iter = d.iterate();
+            while (iter.next(dvui.io) catch null) |entry| {
+                if (entry.kind != .directory) continue;
+                const id = entry.name;
+                if (id.len == 0 or id[0] == '.') continue;
+                if (containsId(legacy.disabled_plugins, id)) continue;
+                if (hasBlock(blocks, id)) continue;
+                // Already covered by an overlay entry? (shouldn't be — no prior block)
+                if (overlayHas(overlay.items, id)) continue;
+                needs_write = true;
+                const new_block = SettingsPluginsZon.composePluginIdBlock(allocator, true, null) catch continue;
+                const id_dup = allocator.dupe(u8, id) catch {
+                    allocator.free(new_block);
+                    continue;
+                };
+                overlay.append(allocator, .{ .id = id_dup, .text = new_block }) catch {
+                    allocator.free(id_dup);
+                    allocator.free(new_block);
+                };
+            }
+        }
+    }
+
+    if (!needs_write) return;
+
+    // Regenerate shell fields from a Settings parse (unknown fields — including the legacy
+    // `disabled_plugins` list — are ignored), so the rewritten file drops that list for free.
+    const parsed = Settings.parseOnly(allocator, data) catch |err| {
+        dvui.log.warn("settings: could not re-serialize shell fields for R12 migration ({s}); skipping", .{@errorName(err)});
+        return;
+    };
+    defer std.zon.parse.free(allocator, parsed);
+
+    const shell_text = Settings.serialize(&parsed, allocator) catch |err| {
+        dvui.log.warn("settings: could not serialize shell fields for R12 migration ({s}); skipping", .{@errorName(err)});
+        return;
+    };
+    defer allocator.free(shell_text);
+
+    const composed = SettingsPluginsZon.composeMergedText(allocator, shell_text, data, overlay.items) catch |err| {
+        dvui.log.warn("settings: failed to compose R12-migrated settings.zon ({s}); skipping", .{@errorName(err)});
+        return;
+    };
+    defer allocator.free(composed);
+
+    std.Io.Dir.cwd().writeFile(dvui.io, .{ .sub_path = settings_zon_path, .data = composed }) catch |err| {
+        dvui.log.warn("settings: failed to write R12-migrated settings.zon ({s})", .{@errorName(err)});
+        return;
+    };
+    dvui.log.info("settings: migrated plugin blocks to per-plugin .enabled/.settings (R12)", .{});
+}
+
+fn isAlreadyNested(gpa: std.mem.Allocator, text: []const u8) bool {
+    const z = gpa.dupeZ(u8, text) catch return false;
+    defer gpa.free(z);
+    if (SettingsPluginsZon.extractField(gpa, z, "settings")) |s| {
+        gpa.free(s);
+        return true;
+    }
+    if (SettingsPluginsZon.extractField(gpa, z, "enabled")) |s| {
+        gpa.free(s);
+        return true;
+    }
+    return false;
+}
+
+fn isEmptyStructLiteral(text: []const u8) bool {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    return std.mem.eql(u8, trimmed, ".{}") or std.mem.eql(u8, trimmed, ".{ }");
+}
+
+fn containsId(ids: []const []const u8, id: []const u8) bool {
+    for (ids) |x| {
+        if (std.mem.eql(u8, x, id)) return true;
+    }
+    return false;
+}
+
+fn hasBlock(blocks: []const SettingsPluginsZon.Entry, id: []const u8) bool {
+    for (blocks) |e| {
+        if (std.mem.eql(u8, e.id, id)) return true;
+    }
+    return false;
+}
+
+fn overlayHas(overlay: []const SettingsPluginsZon.Entry, id: []const u8) bool {
+    for (overlay) |e| {
+        if (std.mem.eql(u8, e.id, id)) return true;
+    }
+    return false;
 }

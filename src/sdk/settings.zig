@@ -6,7 +6,7 @@
 //!       format_on_save: bool = false,
 //!   });
 //!   MySettings.load(host, plugin.id, &values);
-//!   try MySettings.register(host, &plugin, .{ .title = "Text Editor", .value = &values });
+//!   try MySettings.register(host, &plugin, .{ .title = "Text", .value = &values });
 //!
 //! Plugins register a typed value + field metadata only. The **shell** draws a shared
 //! settings UI from `SettingsSchema.fields` (see `PluginSettingsPane`) — plugins do not
@@ -70,6 +70,11 @@ pub const Access = struct {
     setString: *const fn (value: *anyopaque, field_index: usize, v: []const u8) void,
     /// Persist `value` via `host.storePluginSettings(owner.id, zon)` and notify `owner`.
     persist: *const fn (value: *anyopaque, owner: *Plugin) void,
+    /// Parse `blob` into `value` and notify `owner.settingsChanged(blob)` — the reconciliation-
+    /// path counterpart to `persist` (which goes the other direction: live value → disk). Used
+    /// only by external-change reconciliation (see R11 in docs/PLUGIN_MANIFEST_PLAN.md), never
+    /// by an in-app edit through the settings pane.
+    applyBlob: *const fn (value: *anyopaque, owner: *Plugin, blob: []const u8) void,
 };
 
 pub const SettingsSchema = struct {
@@ -79,6 +84,13 @@ pub const SettingsSchema = struct {
     /// Pointer to the plugin's `Schema(T).Value` (stable for the loaded lifetime).
     value: *anyopaque,
     access: *const Access,
+    /// Hash of the last `.settings` blob text actually applied to `value` (seeded at `register()`
+    /// time from whatever `loadPluginSettings` returned, if anything). Lets external-change
+    /// reconciliation skip re-parsing/re-notifying a plugin whose own `.plugins.<id>.settings`
+    /// hasn't changed, even when *some other* part of settings.zon has (see R11) — without this,
+    /// any change anywhere in the file would spuriously renotify every loaded plugin, not just
+    /// the one that changed.
+    last_applied_hash: u64 = 0,
 };
 
 fn typeTagFor(comptime T: type) TypeTag {
@@ -140,10 +152,23 @@ fn buildSettings(comptime T: type) [std.meta.fields(T).len]Setting {
     return out;
 }
 
-/// Build a settings namespace for plain struct `T`.
+/// Build a settings namespace for plain struct `T`. Every field of `T` must declare a default
+/// value — required to compute `default_value` below, which the non-default-only persistence
+/// (see `diffSerialize`, R12 in docs/PLUGIN_MANIFEST_PLAN.md) diffs every value against.
 pub fn Schema(comptime T: type) type {
     const struct_fields = std.meta.fields(T);
     const built_settings = buildSettings(T);
+
+    const default_value: T = blk: {
+        inline for (struct_fields) |f| {
+            _ = f.defaultValue() orelse @compileError(
+                "sdk.settings.Schema: field '" ++ f.name ++ "' of " ++ @typeName(T) ++
+                    " needs a default value (required so settings.zon only has to record what " ++
+                    "differs from it)",
+            );
+        }
+        break :blk .{};
+    };
 
     return struct {
         pub const Value = T;
@@ -155,17 +180,69 @@ pub fn Schema(comptime T: type) type {
             applyZon(out, blob);
         }
 
+        /// Serializes the *whole* current value — used only to notify `settingsChanged`, which
+        /// documents `blob` as "the whole, freshly-serialized zon text." What's actually
+        /// persisted to disk is `diffSerialize`'s smaller, non-default-only blob instead; the two
+        /// don't need to match byte-for-byte, and a plugin's own `applyZon`-based re-parse can't
+        /// tell the difference either way (missing fields fill from `T`'s own defaults).
+        fn fullSerialize(gpa: std.mem.Allocator, value: T) ![]u8 {
+            var aw: std.Io.Writer.Allocating = .init(gpa);
+            errdefer aw.deinit();
+            try std.zon.stringify.serialize(value, .{}, &aw.writer);
+            return aw.toOwnedSlice();
+        }
+
+        fn fieldEqual(comptime FT: type, a: FT, b: FT) bool {
+            return switch (@typeInfo(FT)) {
+                .bool, .int, .float, .@"enum" => a == b,
+                .pointer => |p| if (p.size == .slice and p.child == u8) std.mem.eql(u8, a, b) else false,
+                else => false,
+            };
+        }
+
+        fn isAllDefault(value: T) bool {
+            inline for (struct_fields) |f| {
+                if (!fieldEqual(f.type, @field(value, f.name), @field(default_value, f.name))) return false;
+            }
+            return true;
+        }
+
+        /// Serializes only the fields of `value` that differ from `T`'s own declared defaults —
+        /// e.g. `.{ .tab_size = 8 }` instead of every field. Returns `null` when `value` is
+        /// entirely default, signaling "nothing to persist" (the caller removes any existing
+        /// on-disk entry for this id entirely, rather than writing an empty/default blob).
+        fn diffSerialize(gpa: std.mem.Allocator, value: T) !?[]u8 {
+            if (isAllDefault(value)) return null;
+            var aw: std.Io.Writer.Allocating = .init(gpa);
+            errdefer aw.deinit();
+            try aw.writer.writeAll(".{\n");
+            inline for (struct_fields) |f| {
+                if (!fieldEqual(f.type, @field(value, f.name), @field(default_value, f.name))) {
+                    try aw.writer.print("    .{f} = ", .{std.zig.fmtId(f.name)});
+                    try std.zon.stringify.serialize(@field(value, f.name), .{}, &aw.writer);
+                    try aw.writer.writeAll(",\n");
+                }
+            }
+            try aw.writer.writeAll("}");
+            return try aw.toOwnedSlice();
+        }
+
         pub fn store(host: anytype, id: []const u8, value: T) void {
             const gpa = host.allocator;
-            var aw: std.Io.Writer.Allocating = .init(gpa);
-            defer aw.deinit();
-            std.zon.stringify.serialize(value, .{}, &aw.writer) catch |err| {
+            const blob = diffSerialize(gpa, value) catch |err| {
                 dvui.log.warn("sdk.settings: failed to serialize '{s}': {s}", .{ id, @errorName(err) });
                 return;
             };
-            host.storePluginSettings(id, aw.written()) catch |err| {
-                dvui.log.warn("sdk.settings: failed to store '{s}': {s}", .{ id, @errorName(err) });
-            };
+            if (blob) |b| {
+                defer gpa.free(b);
+                host.storePluginSettings(id, b) catch |err| {
+                    dvui.log.warn("sdk.settings: failed to store '{s}': {s}", .{ id, @errorName(err) });
+                };
+            } else {
+                host.removePluginSettings(id) catch |err| {
+                    dvui.log.warn("sdk.settings: failed to remove '{s}': {s}", .{ id, @errorName(err) });
+                };
+            }
         }
 
         pub fn applyZon(out: *T, blob: []const u8) void {
@@ -319,22 +396,74 @@ pub fn Schema(comptime T: type) type {
             .getString = getString,
             .setString = setString,
             .persist = persistValue,
+            .applyBlob = applyBlobValue,
         };
 
-        fn persistValue(ptr: *anyopaque, owner: *Plugin) void {
+        /// Queues `value`'s **non-default fields only** for the next merged settings.zon write, or
+        /// queues the whole entry's removal when nothing differs from `T`'s declared defaults.
+        /// Returns false (already logged) if it couldn't queue anything.
+        ///
+        /// Shared by both writers — the in-app edit path (`persistValue`) and the external
+        /// hand-edit reconciliation path (`applyBlobValue`) — so settings.zon lands in the same
+        /// normalized, non-default-only shape (R12) no matter which one got there. Routing the
+        /// external path through here too is what prunes a field the user hand-edited back to its
+        /// default, including when *other* fields in the same block are still non-default.
+        ///
+        /// Cost of normalizing on the external path: this re-emits the plugin's `.settings` block
+        /// canonically, so comments/formatting the user wrote *inside that block* don't survive
+        /// (R10's verbatim-span preservation still protects every other part of the file, and any
+        /// plugin block that wasn't touched this cycle).
+        fn queueNormalizedPersist(owner_id: []const u8, value: T) bool {
             const host = runtime.host();
             const gpa = host.allocator;
-            var aw: std.Io.Writer.Allocating = .init(gpa);
-            defer aw.deinit();
-            std.zon.stringify.serialize(asValue(ptr).*, .{}, &aw.writer) catch |err| {
-                dvui.log.warn("sdk.settings: failed to serialize '{s}': {s}", .{ owner.id, @errorName(err) });
+
+            const diff_blob = diffSerialize(gpa, value) catch |err| {
+                dvui.log.warn("sdk.settings: failed to serialize '{s}': {s}", .{ owner_id, @errorName(err) });
+                return false;
+            };
+            if (diff_blob) |b| {
+                defer gpa.free(b);
+                host.storePluginSettings(owner_id, b) catch |err| {
+                    dvui.log.warn("sdk.settings: failed to store '{s}': {s}", .{ owner_id, @errorName(err) });
+                    return false;
+                };
+            } else {
+                host.removePluginSettings(owner_id) catch |err| {
+                    dvui.log.warn("sdk.settings: failed to remove '{s}': {s}", .{ owner_id, @errorName(err) });
+                    return false;
+                };
+            }
+            return true;
+        }
+
+        fn persistValue(ptr: *anyopaque, owner: *Plugin) void {
+            const value = asValue(ptr).*;
+            if (!queueNormalizedPersist(owner.id, value)) return;
+
+            const gpa = runtime.host().allocator;
+            const notify_blob = fullSerialize(gpa, value) catch |err| {
+                dvui.log.warn("sdk.settings: failed to serialize '{s}' for notification: {s}", .{ owner.id, @errorName(err) });
                 return;
             };
-            const blob = aw.written();
-            host.storePluginSettings(owner.id, blob) catch |err| {
-                dvui.log.warn("sdk.settings: failed to store '{s}': {s}", .{ owner.id, @errorName(err) });
-                return;
-            };
+            defer gpa.free(notify_blob);
+            owner.settingsChanged(notify_blob);
+        }
+
+        /// The reconciliation-path counterpart to `persistValue` — parses a freshly-read blob
+        /// (from external-change reconciliation, see R11) into the live value, re-queues it in
+        /// normalized form, and notifies the plugin, same as an in-app edit would. Caller
+        /// (`Editor.reconcileExternalSettingsChange`) is responsible for only calling this when
+        /// `blob`'s hash actually differs from `SettingsSchema.last_applied_hash` — this function
+        /// itself doesn't check.
+        ///
+        /// The re-queue is what keeps a hand-edited file converging on R12's non-default-only
+        /// shape: any field the user spelled back out at its default drops out on the next write,
+        /// whether or not its siblings are still non-default. See `queueNormalizedPersist` for
+        /// what that costs.
+        fn applyBlobValue(ptr: *anyopaque, owner: *Plugin, blob: []const u8) void {
+            const value = asValue(ptr);
+            applyZon(value, blob);
+            _ = queueNormalizedPersist(owner.id, value.*);
             owner.settingsChanged(blob);
         }
 
@@ -343,12 +472,22 @@ pub fn Schema(comptime T: type) type {
             title: []const u8,
             value: *T,
         }) !void {
+            // Seed `last_applied_hash` from whatever's on disk right now (the same blob `load()`
+            // was just called with, immediately before this, per this module's documented
+            // calling convention) so the *first* reconciliation after startup doesn't spuriously
+            // renotify a plugin whose settings haven't actually changed since load.
+            const seed_hash: u64 = blk: {
+                const blob = host.loadPluginSettings(plugin.id) orelse break :blk 0;
+                defer host.allocator.free(blob);
+                break :blk std.hash.Wyhash.hash(0, blob);
+            };
             try host.registerSettingsSchema(.{
                 .owner = plugin,
                 .title = opts.title,
                 .fields = settings,
                 .value = opts.value,
                 .access = &access_vtable,
+                .last_applied_hash = seed_hash,
             });
         }
     };
@@ -406,4 +545,65 @@ test "applyZon parses a zon blob into the value type" {
 
     try testing.expectEqual(@as(u8, 8), value.tab_size);
     try testing.expectEqual(true, value.format_on_save);
+}
+
+test "diffSerialize returns null when every field is default (R12 non-default-only persistence)" {
+    const S = Schema(struct {
+        insert_spaces_on_tab: bool = true,
+        tab_size: u8 = 4,
+        format_on_save: bool = false,
+    });
+
+    const all_default: S.Value = .{};
+    try testing.expect(try S.diffSerialize(testing.allocator, all_default) == null);
+}
+
+test "isAllDefault treats a field explicitly spelled out at its default as still default" {
+    // Drives `queueNormalizedPersist`'s remove-the-whole-entry branch: the user writes
+    // `.{ .insert_spaces_on_tab = true }` (the declared default) back into settings.zon by hand,
+    // so the entry is redundant and should come back out of the file. (The partial case — some
+    // fields default, some not — is `diffSerialize`'s job; see the test below.)
+    const S = Schema(struct {
+        insert_spaces_on_tab: bool = true,
+        tab_size: u8 = 4,
+    });
+
+    try testing.expect(S.isAllDefault(.{}));
+    try testing.expect(S.isAllDefault(.{ .insert_spaces_on_tab = true, .tab_size = 4 }));
+    try testing.expect(!S.isAllDefault(.{ .insert_spaces_on_tab = false }));
+    try testing.expect(!S.isAllDefault(.{ .tab_size = 8 }));
+}
+
+test "diffSerialize emits only the fields that differ from T's own defaults" {
+    const S = Schema(struct {
+        insert_spaces_on_tab: bool = true,
+        tab_size: u8 = 4,
+        format_on_save: bool = false,
+    });
+
+    const changed: S.Value = .{ .tab_size = 8 };
+    const blob = (try S.diffSerialize(testing.allocator, changed)).?;
+    defer testing.allocator.free(blob);
+
+    try testing.expect(std.mem.indexOf(u8, blob, "tab_size") != null);
+    try testing.expect(std.mem.indexOf(u8, blob, "insert_spaces_on_tab") == null);
+    try testing.expect(std.mem.indexOf(u8, blob, "format_on_save") == null);
+}
+
+test "a partial (diff-only) blob still fills the rest from T's own declared defaults" {
+    runtime.installRuntime(&testing.allocator, null, null);
+
+    const S = Schema(struct {
+        insert_spaces_on_tab: bool = true,
+        tab_size: u8 = 4,
+        format_on_save: bool = false,
+    });
+
+    var value: S.Value = .{};
+    // Exactly the shape `diffSerialize` would have produced for `.{ .tab_size = 8 }`.
+    S.applyZon(&value, ".{ .tab_size = 8 }");
+
+    try testing.expectEqual(@as(u8, 8), value.tab_size);
+    try testing.expectEqual(true, value.insert_spaces_on_tab);
+    try testing.expectEqual(false, value.format_on_save);
 }

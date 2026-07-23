@@ -1,7 +1,7 @@
 //! Nine-way anchor placement for padded layout (paste smaller bitmap in larger rectangle)
 //! and symmetrical cropping (viewport origin when cutting a smaller viewport from larger bitmap).
 //!
-//! Pure scalar logic, std-only — pulled in by `tests/root.zig`.
+//! Pure scalar logic, std-only — its own `b.addTest` root in `build/app.zig`.
 
 const std = @import("std");
 

@@ -1,10 +1,13 @@
-//! Layer 2 (headless integration) test target.
+//! `fizzy-integration-tests` artifact under `zig build test-integration`.
 //!
 //! These tests run real fizzy drawing functions against a *headless*
 //! `dvui.Window` provided by dvui's testing backend. The shim in
 //! `fizzy_shim.zig` brings up just enough of `fizzy.app` / `fizzy.editor`
 //! for the code paths exercised here to read the globals they need
 //! without booting the full editor (no assets, no themes, no SDL).
+//!
+//! The same step also runs `fizzy-sdk-tests` (rooted at `src/sdk/sdk.zig`)
+//! for SDK/dylib/settings coverage that needs dvui — see `build/app.zig`.
 //!
 //! Pixel-art-specific coverage (`Internal.File`, `Layer`, `Packer`,
 //! `Animation`, grid/pack/flood-fill regressions) moved out with the

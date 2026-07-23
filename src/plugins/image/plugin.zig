@@ -47,6 +47,7 @@ const vtable: sdk.Plugin.VTable = .{
     .documentHasRecognizedSaveExtension = documentHasRecognizedSaveExtension,
     .drawDocument = drawDocument,
     .closeDocument = closeDocument,
+    .reloadDocument = reloadDocument,
     .isDirty = isDirty,
     .saveDocument = saveDocument,
 };
@@ -91,9 +92,14 @@ fn fileTypePriority(_: *anyopaque, ext: []const u8) ?u8 {
 
 fn drawFileIcon(_: ?*anyopaque, ext: []const u8, _: []const u8, color: dvui.Color) bool {
     if (!isFlatImageExtension(ext)) return false;
+    // `expand = .ratio` fits the glyph to the fixed slot the file tree reserved for it — see
+    // `Host.FileIcon`.
     dvui.icon(@src(), "ImageFileIcon", dvui.entypo.image, .{ .stroke_color = color, .fill_color = color }, .{
+        .expand = .ratio,
+        .gravity_x = 0.5,
         .gravity_y = 0.5,
-        .padding = dvui.Rect.all(3),
+        .padding = dvui.Rect.all(0),
+        .margin = dvui.Rect.all(0),
         .background = false,
     });
     return true;
@@ -171,6 +177,10 @@ fn drawDocument(_: *anyopaque, handle: DocHandle) anyerror!void {
 
 fn closeDocument(_: *anyopaque, handle: DocHandle) void {
     (docFrom(handle) orelse return).deinit();
+}
+fn reloadDocument(_: *anyopaque, handle: DocHandle) anyerror!void {
+    const doc = docFrom(handle) orelse return error.DocumentNotFound;
+    try doc.reloadFromDisk();
 }
 fn isDirty(_: *anyopaque, _: DocHandle) bool {
     return false;

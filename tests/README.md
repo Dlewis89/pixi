@@ -6,9 +6,11 @@ tests in a Zig project before, start here.
 ## Running the tests
 
 ```sh
-zig build test                 # compile + run all tests
-zig build check                # compile tests, don't run (fast feedback loop)
-zig build test --summary all   # show step-by-step results
+zig build test                 # pure-logic unit tests (CI entry point)
+zig build check                # compile unit tests, don't run
+zig build test --summary all   # show per-artifact pass/fail counts
+zig build test-integration     # headless dvui + SDK tests (needs MSVC on Windows)
+zig build test-all             # unit + integration + test-sdk-version
 ```
 
 To narrow down to a single failing test while you debug:
@@ -18,7 +20,7 @@ zig build test -Dtest-filter="lerp endpoints"
 ```
 
 `-Dtest-filter` accepts any substring of a test name and may be passed
-multiple times.
+multiple times. It applies to every test artifact under the step.
 
 ## How Zig tests work (quick orientation)
 
@@ -32,10 +34,16 @@ test "lerp halfway" {
 }
 ```
 
-A `test "..."` block compiles only when Zig builds a *test binary*. We
-produce that binary with `b.addTest(...)` in `build.zig`. The runner
-discovers every `test` block in the test binary's root file and any
-file it transitively imports.
+A `test "..."` block compiles only when Zig builds a *test binary* via
+`b.addTest(...)` in `build/app.zig`. **Important:** Zig only registers
+`test` blocks from that artifact's **root module**. Files pulled in as
+a separate module (`addImport` / `addAnonymousImport` +
+`_ = @import("name")`) are analyzed but their tests are never collected.
+So every pure-logic file under test is itself a `b.addTest` root.
+
+Same-module file imports (`@import("sibling.zig")` from the root file)
+*do* collect tests — that is how `store.zig` picks up tests in
+`registry.zig` / `download.zig`.
 
 There is no separate framework. The standard library has assertions in
 `std.testing`: `expect`, `expectEqual`, `expectEqualSlices`,
@@ -43,59 +51,61 @@ There is no separate framework. The standard library has assertions in
 
 ## How fizzy tests are organized
 
-fizzy has both pure logic (math, palette parsing, layer reorder) and a
-GUI on top. Tests are split into two targets, cheapest first, so most
-code gets fast unit-level coverage and only the parts that genuinely
-need a window pay the integration cost. Both run under a single
-`zig build test`.
+fizzy has both pure logic and a GUI. Tests are split into two steps,
+cheapest first. Wiring lives in `build/app.zig`.
 
 
-| Target                   | What it tests                                                              | Needs a window? | Source root             |
-| ------------------------ | -------------------------------------------------------------------------- | --------------- | ----------------------- |
-| `fizzy-unit-tests`        | Pure logic: math helpers, easing, palette parser, layer-reorder algorithm  | No              | `tests/root.zig`        |
-| `fizzy-integration-tests` | Real fizzy drawing / file functions against dvui's headless testing backend | Yes (no GPU)    | `tests/integration.zig` |
+| Step                   | Artifacts                                                                 | Needs a window? | Notes |
+| ---------------------- | ------------------------------------------------------------------------- | --------------- | ----- |
+| `zig build test`       | One `b.addTest` per pure-logic file (`fizzy-direction-tests`, …, `fizzy-fuzzy-tests`) | No | CI entry; no dvui/SDL/Velopack |
+| `zig build test-integration` | `fizzy-sdk-tests` (`src/sdk/sdk.zig`) + `fizzy-integration-tests` (`tests/integration.zig`) | Headless (dvui testing backend) | Not run by CI today |
 
+
+`tests/root.zig` is a historical stub only — it is not a test root.
 
 ### Unit tests (pure logic)
 
-`tests/root.zig` `@import`s a small set of source files that depend
-only on `std` — no dvui, no fizzy globals, no SDL. Every `test "..."`
-block in those files becomes part of the test binary. Currently
-covered (named imports wired in `build/app.zig`):
+Each covered file is its own test artifact root in `build/app.zig`
+(std-only, or std + a named dep like `zf` for fuzzy). Currently:
 
-- `[src/core/math/direction.zig](../src/core/math/direction.zig)` — 8-way / 4-way
-direction encoding, `fromRadians`, rotation inverses.
-- `[src/core/math/easing.zig](../src/core/math/easing.zig)` — `lerp`, `ease`,
-endpoint pinning, midpoint bias.
-- `[src/core/math/layout_anchor.zig](../src/core/math/layout_anchor.zig)` —
-anchor math shared by grid/layout code.
-- `[src/backend/window_layout.zig](../src/backend/window_layout.zig)` —
-macOS window/Space transition geometry helpers.
-- `[src/sdk/dylib.zig](../src/sdk/dylib.zig)` — plugin dylib ABI fingerprint helpers.
-- `[src/backend/plugin_store/store.zig](../src/backend/plugin_store/store.zig)` —
-plugin store manifest/catalog parsing.
+- [`src/core/math/direction.zig`](../src/core/math/direction.zig) —
+  `fizzy-direction-tests` — 8-way / 4-way direction encoding,
+  `fromRadians`, rotation inverses.
+- [`src/core/math/easing.zig`](../src/core/math/easing.zig) —
+  `fizzy-easing-tests` — `lerp`, `ease`, endpoint pinning, midpoint bias.
+- [`src/core/math/layout_anchor.zig`](../src/core/math/layout_anchor.zig) —
+  `fizzy-layout-anchor-tests` — anchor math shared by grid/layout code.
+- [`src/backend/window_layout.zig`](../src/backend/window_layout.zig) —
+  `fizzy-window-layout-tests` — macOS window/Space transition geometry helpers.
+- [`src/backend/plugin_store/store.zig`](../src/backend/plugin_store/store.zig) —
+  `fizzy-plugin-store-tests` — catalog/registry/download parsing (sibling
+  file imports keep those tests in the same module).
+- [`src/core/fuzzy.zig`](../src/core/fuzzy.zig) —
+  `fizzy-fuzzy-tests` — fuzzy matcher wrapper over `zf` (needs a `zf` import).
 
-The `_ = @import("...")` lines in `tests/root.zig` exist purely so
-their `test` blocks are reachable from the test binary. Each module is
-exposed as a named import (e.g. `fizzy-direction`) by `build.zig`,
-because Zig 0.15 modules cannot import source files outside their own
-directory via `../`.
+### Integration / SDK tests (headless)
 
-### Integration tests (headless)
+`zig build test-integration` runs two artifacts:
 
-`tests/integration.zig` exercises real fizzy code that needs a live
-`dvui.Window` and `fizzy.app` / `fizzy.editor` globals. dvui ships a
-`testing` backend that creates a real `dvui.Window` with no GPU and no
-SDL window; `tests/fizzy_shim.zig` heap-allocates `fizzy.app` and a
-mostly-zeroed `fizzy.editor`, setting only the fields tests actually
-read. The shim is deliberately minimal — when a new test needs a field
-the shim doesn't set, set just that field at the top of that test
-rather than expanding the shim.
+1. **`fizzy-sdk-tests`** — root module `src/sdk/sdk.zig`, with
+   dvui-testing + `proxy_bridge` + `core` wired the same way as the app.
+   Collects every same-module `test` block under `src/sdk/`
+   (`dylib.zig` ABI fingerprint, `fingerprint.zig`, `settings.zig`,
+   `manifest.zig`, `Host.zig`, `version.zig`, …). These cannot live under
+   `zig build test` because the SDK imports dvui.
 
-Currently covered:
+2. **`fizzy-integration-tests`** — `tests/integration.zig` exercises
+   real fizzy code that needs a live `dvui.Window` and `fizzy.app` /
+   `fizzy.editor` globals. dvui's `testing` backend creates a window with
+   no GPU and no SDL; `tests/fizzy_shim.zig` heap-allocates just enough
+   of those globals. The shim is deliberately minimal — when a new test
+   needs a field the shim doesn't set, set just that field at the top of
+   that test rather than expanding the shim.
+
+Currently covered in the integration artifact:
 
 - A single smoke test that the shim brings up a working headless
-`dvui.Window` with `fizzy.app` / `fizzy.editor` globals set.
+  `dvui.Window` with `fizzy.app` / `fizzy.editor` globals set.
 
 Pixel-art-specific coverage that used to live here (`Internal.File`,
 `Layer`, `Packer`, `Animation`, grid/pack/flood-fill regressions, the
@@ -108,9 +118,9 @@ What's intentionally **not** here yet:
 
 - Any pixi-specific coverage (see above — belongs in the pixi repo).
 - Full shell UI flows (workbench tabs/splits, menu/sidebar, real
-undo through `App.zig`) driven via `dvui.testing.settle`. Needs asset
-loading to work in CI without a real project root, theme bring-up
-without a config dir, and a way to dismiss startup dialogs.
+  undo through `App.zig`) driven via `dvui.testing.settle`. Needs asset
+  loading to work in CI without a real project root, theme bring-up
+  without a config dir, and a way to dismiss startup dialogs.
 - Anything that goes through SDL (file dialogs, native menus).
 
 ## Adding a new test
@@ -118,37 +128,43 @@ without a config dir, and a way to dismiss startup dialogs.
 ### Pure-logic (preferred — fastest, no window)
 
 1. Find a source file that has no dvui / fizzy imports, or extract the
-  pure piece you want to test into one (look at how
-   `src/math/easing.zig` was extracted from `src/math/math.zig` for a
+   pure piece you want to test into one (look at how
+   `src/core/math/easing.zig` was extracted from `math.zig` for a
    minimal example).
 2. Add a `test "..."` block at the bottom of the file:
-  ```zig
+   ```zig
    const std = @import("std");
 
    test "my new thing" {
        try std.testing.expectEqual(@as(u32, 42), myFunction(...));
    }
-  ```
-3. If the file isn't already wired up, add it to the `inline for`
-  table in `build.zig` (so it becomes a named import on the unit-test
-   target) and add an `_ = @import("...")` line to `tests/root.zig`.
+   ```
+3. If the file isn't already a unit-test root, add a
+   `{ "fizzy-<name>-tests", "path/to/file.zig" }` entry to the
+   `inline for` table in `build/app.zig` (or mirror the `fuzzy` block
+   if it needs named imports like `zf`). Do **not** wire it through
+   `tests/root.zig` or `addAnonymousImport` — those do not collect tests.
 4. Run `zig build test`.
+
+### SDK (needs dvui / `proxy_bridge` / `core`)
+
+1. Add a `test "..."` block in the relevant `src/sdk/*.zig` file.
+2. No build wiring: `fizzy-sdk-tests` is already rooted at `sdk.zig`, so
+   same-module file imports pick the new block up automatically.
+3. Run `zig build test-integration`.
 
 ### Integration (when a test needs `dvui.currentWindow()` or fizzy globals)
 
 1. Add the test to `tests/integration.zig`.
 2. Bring up the shim at the top of the test:
-  ```zig
+   ```zig
    var ctx = try shim.init(std.testing.allocator);
    defer ctx.deinit(std.testing.allocator);
-  ```
-3. Construct a small in-memory `Internal.File` with the `makeBlankFile`
-  helper, and tear it down with `deinitFile` (not `file.deinit()` —
-   see the comment on `deinitFile` for why).
-4. Drive the function under test directly (`fillPoint`, `drawPoint`,
-  etc.) and assert on the resulting state.
-5. If the code under test reads a `fizzy.editor` field the shim hasn't
-  set, set it at the top of your test instead of broadening the shim.
+   ```
+3. Drive the function under test and assert on the resulting state.
+4. If the code under test reads a `fizzy.editor` field the shim hasn't
+   set, set it at the top of your test instead of broadening the shim.
+5. Run `zig build test-integration`.
 
 ## CI
 
@@ -157,7 +173,7 @@ Ubuntu job (`zig build test`, `zig build check-web`, `zig build
 test-sdk-version`). **Pull requests** and **manual**
 (`workflow_dispatch`) runs additionally matrix across Linux/Windows/macOS.
 Note `test-integration` / `test-all` are not run by CI at all today —
-run them locally before relying on integration coverage.
+run them locally before relying on integration or SDK coverage.
 `paths-ignore` skips doc-only changes on both `push` and
 `pull_request`. Releases are handled separately by
 `.github/workflows/release.yml`, triggered by pushing a `v*` tag.

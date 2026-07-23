@@ -166,7 +166,7 @@ test "parseSummary reads plugins including latest_version" {
     try std.testing.expectEqual(@as(u32, 1), idx.schema);
     const entry = idx.pluginById("markdown") orelse return error.MissingPlugin;
     try std.testing.expectEqualStrings("Markdown Editor", entry.name);
-    try std.testing.expectEqualStrings("WRONG_ON_PURPOSE", entry.latest_version);
+    try std.testing.expectEqualStrings("1.3.0", entry.latest_version);
 }
 
 test "parseSummary tolerates unknown fields and missing optionals" {

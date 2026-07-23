@@ -63,6 +63,31 @@ pub fn isDirty(_: *const Document) bool {
 
 pub fn save(_: *Document) !void {}
 
+/// Re-decode pixels from `path`, keeping id/path/grouping/canvas. Used when the file
+/// changes on disk while this tab is open.
+pub fn reloadFromDisk(self: *Document) !void {
+    if (comptime is_wasm) return error.Unsupported;
+    const gpa = sdk.allocator();
+    const name = std.fs.path.basename(self.path);
+    const new_source = try core.image.fromImageFilePath(name, self.path, .ptr);
+    const size = core.image.size(new_source);
+
+    switch (self.source) {
+        .pixelsPMA => |p| gpa.free(p.rgba),
+        .pixels => |p| gpa.free(p.rgba),
+        .imageFile => |f| gpa.free(f.bytes),
+        .texture => |t| dvui.textureDestroyLater(t),
+    }
+    if (self.checkerboard_tile) |t| {
+        dvui.textureDestroyLater(t);
+        self.checkerboard_tile = null;
+    }
+
+    self.source = new_source;
+    self.width = @intFromFloat(size.w);
+    self.height = @intFromFloat(size.h);
+}
+
 pub fn deinit(self: *Document) void {
     const gpa = sdk.allocator();
     switch (self.source) {

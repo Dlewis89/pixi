@@ -13,7 +13,7 @@
     .fingerprint = 0xc23e2206858de248,
     .dependencies = .{
         .fizzy = .{
-            .path = "../../..",
+            .path = "../../../sdk",
         },
         .icons = .{
             .url = "https://github.com/foxnne/zig-lib-icons/archive/db034786a1286ab28dc35aba534c098aa4f1a3aa.tar.gz",

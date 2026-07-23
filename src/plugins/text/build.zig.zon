@@ -14,7 +14,7 @@
     .fingerprint = 0x3b8ba7c7af3f1a7e,
     .dependencies = .{
         .fizzy = .{
-            .path = "../../..",
+            .path = "../../../sdk",
         },
     },
 }

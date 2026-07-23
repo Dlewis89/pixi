@@ -83,7 +83,6 @@ pub fn main(main_init: std.process.Init) !void {
     }
 
     if (!any_legacy) {
-        std.debug.print("release.yml has no hand-copied sdk/fingerprint inputs — good.\n", .{});
         return;
     }
 
