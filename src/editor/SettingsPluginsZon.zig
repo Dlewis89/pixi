@@ -428,6 +428,23 @@ test "listPluginBlocks retains a disabled/unloaded plugin's block untouched" {
     try testing.expectEqual(@as(usize, 2), entries.len);
 }
 
+test "composeMergedText accepts an empty shell struct (every shell field at its default)" {
+    // Since the shell serializes non-default fields only (`Settings.serialize`, R12), an
+    // untouched shell hands this `.{}` — the `.plugins` field must still splice on as valid ZON
+    // rather than producing a stray leading comma.
+    const overlay = [_]Entry{.{ .id = "pixi", .text = ".{ .enabled = true }" }};
+
+    const composed = try composeMergedText(testing.allocator, ".{}", null, &overlay);
+    defer testing.allocator.free(composed);
+
+    const composed_z = try testing.allocator.dupeZ(u8, composed);
+    defer testing.allocator.free(composed_z);
+
+    const pixi = extractPluginBlob(testing.allocator, composed_z, "pixi").?;
+    defer testing.allocator.free(pixi);
+    try testing.expectEqualStrings(".{ .enabled = true }", pixi);
+}
+
 test "upsertOne inserts a new id into an existing .plugins block, leaving the rest untouched" {
     const composed = try upsertOne(testing.allocator, sample_source, .{ .id = "markdown", .text = ".{ .enabled = true }" });
     defer testing.allocator.free(composed);

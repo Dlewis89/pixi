@@ -2,8 +2,9 @@
 //! docs/PLUGIN_MANIFEST_PLAN.md R11/R12.
 //!
 //! Thin adapter over [`neurocyte/nightwatch`](https://github.com/neurocyte/nightwatch): one
-//! recursive `watch(config_folder)` covers both `settings.zon` reconciliation and discovery of
-//! newly-created plugin directories under `plugins/`. Nightwatch owns the background thread; this
+//! recursive `watch(config_folder)` covers `settings.zon` reconciliation, discovery of
+//! newly-created plugin directories under `plugins/`, and hot-reload of a plugin whose dylib was
+//! rebuilt in place (`Editor.reconcileChangedPluginBinaries`). Nightwatch owns the thread; this
 //! layer only implements its `Handler` (atomic flag + `backend.refresh()`, never file content /
 //! `dvui.io` / a shared allocator from the callback) and a ~200ms coalesce on the main thread
 //! via `tick`.
@@ -140,4 +141,8 @@ pub fn tick(self: *SettingsWatcher, editor: *fizzy.Editor) void {
     }
     self.coalesce_deadline_ns = 0;
     editor.reconcileExternalSettingsChange();
+    // Same watch, different trigger: a rebuilt/reinstalled plugin dylib is an event in this tree
+    // but never moves `settings.zon`'s hash, so it needs its own pass (which must run after the
+    // settings one — an external enable/disable should settle before we consider reloading).
+    editor.reconcileChangedPluginBinaries();
 }

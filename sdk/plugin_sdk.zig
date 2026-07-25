@@ -390,7 +390,13 @@ const DevInstall = struct {
         const src = self.lib.getEmittedBin().getPath2(b, step);
         const dest = try std.fs.path.join(b.allocator, &.{ dir, self.file_name });
         const data = try std.Io.Dir.cwd().readFileAlloc(io, src, b.allocator, .limited(512 * 1024 * 1024));
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dest, .data = data });
+        // Sibling temp file + rename, not a truncating write onto `dest`: a running fizzy may be
+        // reading `dest` right now (`PluginLoader.stableLoadCopyPath` copies from it), and on
+        // Windows a plain overwrite of a file the editor still has open fails outright. The rename
+        // also means a crash mid-write never leaves a half-written dylib at the load path.
+        const tmp = try std.fmt.allocPrint(b.allocator, "{s}.part", .{dest});
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = data });
+        try std.Io.Dir.renameAbsolute(tmp, dest, io);
         std.log.info("fizzy: installed plugin → {s}", .{dest});
     }
 };

@@ -95,6 +95,13 @@ disabled_plugin_ids: std.ArrayListUnmanaged([]const u8) = .empty,
 /// plugin itself — only by `setPluginEnabled` / store install. Keys are app-allocator-owned.
 plugin_enabled_pending: std.StringArrayHashMapUnmanaged(bool) = .empty,
 
+/// Snapshot of dvui's *built-in* keybinds (`char_left`, `copy`, `next_widget`, …), taken in
+/// `init` before the shell adds its own. `Window.init` installs these once and never again,
+/// so `rebuildKeybinds` — which wipes the map to drop an unloaded plugin's binds — must put
+/// them back or every widget's caret/clipboard handling silently dies after the first plugin
+/// load or unload. Keys are dvui's own static literals; only the map itself is owned here.
+dvui_default_keybinds: std.StringHashMapUnmanaged(dvui.enums.Keybind) = .empty,
+
 /// User plugins that failed to load this session, so the UI can tell the author what
 /// went wrong instead of failing silently into the log. Populated by `loadUserPlugins`;
 /// strings are owned here and freed in `deinit`. Surfaced in the Plugins store tab
@@ -501,6 +508,10 @@ pub fn init(
     editor.open_files = .empty;
     try editor.workbench.initDefaultWorkspace();
 
+    // Capture dvui's defaults before the shell's own binds land, so `rebuildKeybinds` can
+    // restore them after clearing the map.
+    editor.dvui_default_keybinds = try dvui.currentWindow().keybinds.clone(fizzy.app.allocator);
+
     try Keybinds.register();
 
     // Collect the initial settings.zon text for autosave dedup — must match exactly what
@@ -893,6 +904,7 @@ pub fn loadUserPlugins(editor: *Editor, config_folder: []const u8) void {
             continue;
         }
 
+        const load_start = std.Io.Clock.boot.now(dvui.io).nanoseconds;
         const loaded = PluginLoader.loadAndRegister(&editor.host, fizzy.app.allocator, path, plugin_id, .{
             .gpa = &fizzy.app.allocator,
             .arg_b = @ptrCast(&editor.host),
@@ -915,7 +927,11 @@ pub fn loadUserPlugins(editor: *Editor, config_folder: []const u8) void {
             editor.recordPluginFailure(plugin_id, "ran out of memory while loading", null, loaded.version_info.plugin_version);
             continue;
         };
-        dvui.log.info("user plugin '{s}' loaded from {s}", .{ plugin_id, path });
+        dvui.log.info("user plugin '{s}' loaded from {s} in {d}ms", .{
+            plugin_id,
+            path,
+            @divTrunc(std.Io.Clock.boot.now(dvui.io).nanoseconds - load_start, std.time.ns_per_ms),
+        });
         loaded_any = true;
         loaded_count += 1;
     }
@@ -965,6 +981,8 @@ fn unloadPluginLibs(editor: *Editor) void {
         while (it.next()) |e| fizzy.app.allocator.free(e.key_ptr.*);
         editor.plugin_enabled_pending.deinit(fizzy.app.allocator);
     }
+
+    editor.dvui_default_keybinds.deinit(fizzy.app.allocator);
 }
 
 // ---- runtime plugin lifecycle (store: install / enable / disable / update) ---------
@@ -1120,6 +1138,11 @@ fn rebuildKeybinds(editor: *Editor) void {
     if (comptime builtin.target.cpu.arch == .wasm32) return;
     const window = dvui.currentWindow();
     window.keybinds.clearRetainingCapacity();
+    var defaults = editor.dvui_default_keybinds.iterator();
+    while (defaults.next()) |kv| {
+        window.keybinds.put(window.gpa, kv.key_ptr.*, kv.value_ptr.*) catch |err|
+            dvui.log.err("keybind rebuild (dvui default '{s}') failed: {s}", .{ kv.key_ptr.*, @errorName(err) });
+    }
     Keybinds.register() catch |err| dvui.log.err("keybind rebuild (shell) failed: {s}", .{@errorName(err)});
     for (editor.host.plugins.items) |plugin| {
         plugin.contributeKeybinds(window) catch |err|
@@ -2145,7 +2168,7 @@ pub fn reconcileExternalSettingsChange(editor: *Editor) void {
         dvui.log.warn("settings watcher: could not parse external settings.zon change ({s}); skipping this reconciliation", .{@errorName(err)});
         return;
     };
-    defer std.zon.parse.free(gpa, parsed);
+    defer Settings.freeParsed(gpa, parsed);
 
     // Shell fields, one at a time rather than `editor.settings = parsed` wholesale: `theme` is
     // runtime-owned (see its doc comment on `Settings`) and must not be clobbered by the raw
@@ -2222,6 +2245,68 @@ fn reconcilePluginEnabled(editor: *Editor, settings_data: [:0]const u8) void {
             // On disk, not enabled, not yet tracked — treat as a discovered-disabled entry.
             editor.trackDisabledPlugin(id) catch {};
         }
+    }
+}
+
+/// Hot-reloads any loaded user plugin whose installed dylib changed on disk since we loaded it —
+/// i.e. `zig build install` from a plugin repo, or the store writing an update, while fizzy runs.
+///
+/// Driven by `SettingsWatcher`'s existing recursive watch on `<config>/` (a plugin dylib write is
+/// already an event there), but deliberately *outside* `reconcileExternalSettingsChange`: that one
+/// gates on `settings.zon`'s content hash, which a dylib write never moves.
+///
+/// The comparison is mtime + size against the stamp `PluginLoader` recorded at load time. That
+/// stamp reads from the *installed* path, which is never the mapped file (see
+/// `PluginLoader.stableLoadCopyPath`), so a rebuild replacing it is safe on its own — this only
+/// decides whether to pick the new build up now instead of at next launch.
+pub fn reconcileChangedPluginBinaries(editor: *Editor) void {
+    if (comptime builtin.target.cpu.arch == .wasm32) return;
+    const gpa = fizzy.app.allocator;
+
+    // Collect first: `updatePlugin` unloads, which mutates `loaded_plugin_libs` (and frees the
+    // entry's `plugin_id`, so the id has to be our own copy — the same reason
+    // `setPluginEnabled`'s callers dupe before unloading).
+    var changed: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (changed.items) |id| gpa.free(id);
+        changed.deinit(gpa);
+    }
+
+    for (editor.loaded_plugin_libs.items) |loaded| {
+        if (isBundledPluginId(loaded.plugin_id)) continue; // shipped beside the exe, not user-managed
+        const st = std.Io.Dir.cwd().statFile(dvui.io, loaded.path, .{}) catch continue; // gone mid-write: leave it loaded
+        if (st.mtime.nanoseconds == loaded.source_mtime_ns and st.size == loaded.source_size) continue;
+        const id = gpa.dupe(u8, loaded.plugin_id) catch continue;
+        changed.append(gpa, id) catch {
+            gpa.free(id);
+            continue;
+        };
+    }
+
+    for (changed.items) |id| {
+        if (editor.updatePlugin(id, false)) {
+            dvui.log.info("plugin watcher: reloaded '{s}' from its rebuilt binary", .{id});
+        } else |err| {
+            dvui.log.warn("plugin watcher: could not reload rebuilt '{s}' ({s})", .{ id, @errorName(err) });
+            // Re-stamp so a plugin we chose not to reload (unsaved documents, most likely) doesn't
+            // re-trigger on every subsequent watcher event. The next rebuild moves the stamp again
+            // and gets a fresh attempt; until then the running build stays, which is what the
+            // failed unload already decided.
+            editor.restampLoadedPlugin(id);
+        }
+    }
+}
+
+/// Point a loaded plugin's stamp at whatever is on disk now. See the re-stamp comment in
+/// `reconcileChangedPluginBinaries`; no-op if `id` isn't loaded or the file can't be stat'd.
+fn restampLoadedPlugin(editor: *Editor, id: []const u8) void {
+    if (comptime builtin.target.cpu.arch == .wasm32) return;
+    for (editor.loaded_plugin_libs.items) |*loaded| {
+        if (!std.mem.eql(u8, loaded.plugin_id, id)) continue;
+        const st = std.Io.Dir.cwd().statFile(dvui.io, loaded.path, .{}) catch return;
+        loaded.source_mtime_ns = st.mtime.nanoseconds;
+        loaded.source_size = st.size;
+        return;
     }
 }
 
@@ -3997,6 +4082,33 @@ pub fn redo(editor: *Editor) !void {
 }
 
 pub fn openInFileBrowser(_: *Editor, path: []const u8) !void {
+    // Darwin goes through `darwin_spawn` rather than `std.process.run`: the latter walks the
+    // `environ` array captured at startup, which any `unsetenv` elsewhere in the process (SDL,
+    // a plugin, a system framework) shrinks *in place* — leaving a NULL before the captured
+    // length and segfaulting the whole app on the next spawn. See `darwin_spawn.zig`.
+    if (builtin.os.tag == .macos) {
+        // `posix_spawn` (unlike `posix_spawnp`) does not search `$PATH`, so name `open` in full.
+        const child = fizzy.core.darwin_spawn.spawn(fizzy.app.allocator, .{
+            .argv = &.{ "/usr/bin/open", path },
+            .stdin = .discard,
+            .stdout = .discard,
+            .stderr = .discard,
+        }, null) catch {
+            dvui.log.err("Failed to open file browser", .{});
+            return;
+        };
+        // `open` exits as soon as Finder has the request, but that can take long enough to
+        // stutter a frame — reap it off the draw thread so it doesn't linger as a zombie.
+        if (child.id) |pid| {
+            if (std.Thread.spawn(.{}, reapChild, .{pid})) |thread| {
+                thread.detach();
+            } else |_| {
+                var status: c_int = undefined;
+                _ = std.c.waitpid(pid, &status, 0);
+            }
+        }
+        return;
+    }
     // `start` is a cmd.exe builtin, not a standalone executable, so spawning it directly
     // (bypassing the shell) always fails on Windows — reveal via explorer.exe instead.
     if (builtin.os.tag == .windows) {
@@ -4008,11 +4120,16 @@ pub fn openInFileBrowser(_: *Editor, path: []const u8) !void {
         };
         return;
     }
-    const cmd = if (builtin.os.tag == .macos) "open" else "xdg-open";
-    _ = std.process.run(fizzy.app.allocator, dvui.io, .{ .argv = &.{ cmd, path } }) catch {
+    _ = std.process.run(fizzy.app.allocator, dvui.io, .{ .argv = &.{ "xdg-open", path } }) catch {
         dvui.log.err("Failed to open file browser", .{});
         return;
     };
+}
+
+/// Blocking `waitpid` for a fire-and-forget child, run on its own detached thread.
+fn reapChild(pid: std.posix.pid_t) void {
+    var status: c_int = undefined;
+    _ = std.c.waitpid(pid, &status, 0);
 }
 
 pub fn closeFileID(editor: *Editor, id: u64) !void {

@@ -245,6 +245,42 @@ pub fn Schema(comptime T: type) type {
             }
         }
 
+        /// True when `T`'s field `name` currently points at storage this schema allocated, rather
+        /// than at the declared default. See `freeOwned` for the rule this encodes.
+        fn fieldIsOwned(comptime name: []const u8, value: T) bool {
+            return @field(value, name).ptr != @field(default_value, name).ptr;
+        }
+
+        /// Releases every string field of `value` that this schema allocated.
+        ///
+        /// **Ownership rule for `[]const u8` settings fields:** a field's bytes belong to this
+        /// schema (allocated with `runtime.allocator()` by `applyZon`/`setString`) *unless* the
+        /// slice is exactly `T`'s declared default, which lives in the plugin image's constant
+        /// data and must never reach an allocator. Pointer identity is the test — a parsed value
+        /// that happens to *equal* the default string is still schema-owned and still freed.
+        ///
+        /// Whole-struct `std.zon.parse.free` can't be used here: a settings.zon that omits a
+        /// field (the normal case, since only non-default fields are persisted — R12) makes
+        /// `std.zon.parse` fill it from that same declared default, so freeing the parse result
+        /// wholesale would hand a string literal to the allocator. Non-string fields need no
+        /// release at all — `typeTagFor` restricts `T` to scalars, enums, and `[]const u8`.
+        fn freeOwned(gpa: std.mem.Allocator, value: T) void {
+            inline for (struct_fields) |f| {
+                if (comptime typeTagFor(f.type) == .string) {
+                    if (fieldIsOwned(f.name, value)) gpa.free(@field(value, f.name));
+                }
+            }
+        }
+
+        /// Releases anything this schema allocated into `value` and resets it to `T`'s declared
+        /// defaults. Plugins with a string setting should call this when they tear down the
+        /// value they passed to `register` (a plugin whose settings are all scalars/enums may
+        /// skip it — it's a no-op there). Safe to call more than once.
+        pub fn deinit(value: *T) void {
+            freeOwned(runtime.allocator(), value.*);
+            value.* = default_value;
+        }
+
         pub fn applyZon(out: *T, blob: []const u8) void {
             const gpa = runtime.allocator();
             const blob_z = gpa.dupeZ(u8, blob) catch |err| {
@@ -259,7 +295,7 @@ pub fn Schema(comptime T: type) type {
                 dvui.log.warn("sdk.settings: failed to parse settings: {s}", .{@errorName(err)});
                 return;
             };
-            std.zon.parse.free(gpa, out.*);
+            freeOwned(gpa, out.*);
             out.* = parsed;
         }
 
@@ -376,12 +412,25 @@ pub fn Schema(comptime T: type) type {
             return "";
         }
 
+        /// Copies `s` into schema-owned storage and releases whatever the field held before,
+        /// per `freeOwned`'s ownership rule. A failed dupe leaves the field untouched (logged) —
+        /// the settings pane simply keeps showing the old value.
         fn setString(ptr: *anyopaque, field_index: usize, s: []const u8) void {
-            _ = ptr;
-            _ = field_index;
-            _ = s;
-            // String fields that own memory need a plugin-specific allocator policy;
-            // not used by built-ins yet. Shell UI skips editable strings until then.
+            const v = asValue(ptr);
+            const gpa = runtime.allocator();
+            inline for (struct_fields, 0..) |f, i| {
+                if (i == field_index) {
+                    if (comptime typeTagFor(f.type) == .string) {
+                        const copy = gpa.dupe(u8, s) catch |err| {
+                            dvui.log.warn("sdk.settings: failed to set '{s}': {s}", .{ f.name, @errorName(err) });
+                            return;
+                        };
+                        if (fieldIsOwned(f.name, v.*)) gpa.free(@field(v.*, f.name));
+                        @field(v.*, f.name) = copy;
+                    }
+                    return;
+                }
+            }
         }
 
         const access_vtable: Access = .{
@@ -545,6 +594,74 @@ test "applyZon parses a zon blob into the value type" {
 
     try testing.expectEqual(@as(u8, 8), value.tab_size);
     try testing.expectEqual(true, value.format_on_save);
+}
+
+test "applyZon replaces a string field without freeing its declared default" {
+    // Regression: `applyZon` used to `std.zon.parse.free` the whole previous value. A string
+    // field still holding `T`'s declared default points at constant data, so that freed a
+    // non-allocation — and since R12 omits default fields from disk, a *parsed* value hits this
+    // too (missing fields are filled from the same literals). `testing.allocator` panics on
+    // both the invalid free and any leak, so this test covers both directions.
+    runtime.installRuntime(&testing.allocator, null, null);
+
+    const S = Schema(struct {
+        greeting: []const u8 = "hello",
+        tab_size: u8 = 4,
+    });
+
+    var value: S.Value = .{};
+    S.applyZon(&value, ".{ .greeting = \"hi\" }");
+    try testing.expectEqualStrings("hi", value.greeting);
+
+    // Second apply must free the first parse's allocation, not the literal.
+    S.applyZon(&value, ".{ .greeting = \"hey\", .tab_size = 8 }");
+    try testing.expectEqualStrings("hey", value.greeting);
+    try testing.expectEqual(@as(u8, 8), value.tab_size);
+
+    // A blob that omits the field puts the declared default literal back...
+    S.applyZon(&value, ".{ .tab_size = 2 }");
+    try testing.expectEqualStrings("hello", value.greeting);
+    // ...and releasing the value then has nothing to free for that field.
+    S.deinit(&value);
+    try testing.expectEqualStrings("hello", value.greeting);
+}
+
+test "setString copies into schema-owned storage and releases the previous value" {
+    runtime.installRuntime(&testing.allocator, null, null);
+
+    const S = Schema(struct {
+        greeting: []const u8 = "hello",
+    });
+
+    var value: S.Value = .{};
+    var scratch: [8]u8 = "howdy\x00\x00\x00".*;
+    S.access_vtable.setString(&value, 0, scratch[0..5]);
+    // Owned copy, not a borrow of the caller's buffer.
+    @memset(scratch[0..5], 'x');
+    try testing.expectEqualStrings("howdy", S.access_vtable.getString(&value, 0));
+
+    S.access_vtable.setString(&value, 0, "later");
+    try testing.expectEqualStrings("later", S.access_vtable.getString(&value, 0));
+    S.deinit(&value);
+}
+
+test "diffSerialize compares string fields by content, not pointer" {
+    runtime.installRuntime(&testing.allocator, null, null);
+
+    const S = Schema(struct {
+        greeting: []const u8 = "hello",
+    });
+
+    // An allocated copy that *equals* the default is still default for persistence purposes.
+    var value: S.Value = .{};
+    S.access_vtable.setString(&value, 0, "hello");
+    try testing.expect(try S.diffSerialize(testing.allocator, value) == null);
+
+    S.access_vtable.setString(&value, 0, "goodbye");
+    const blob = (try S.diffSerialize(testing.allocator, value)).?;
+    defer testing.allocator.free(blob);
+    try testing.expect(std.mem.indexOf(u8, blob, "goodbye") != null);
+    S.deinit(&value);
 }
 
 test "diffSerialize returns null when every field is default (R12 non-default-only persistence)" {

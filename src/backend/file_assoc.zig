@@ -67,8 +67,8 @@ pub const open_with_only_extensions = [_][]const u8{
     ".ts",   ".tsx",           ".txt",          ".vb",       ".vue",
     ".wxi",  ".wxl",           ".wxs",          ".xaml",     ".xcodeproj",
     ".xcworkspace", ".xhtml",  ".xml",          ".yaml",     ".yml",
-    ".zlogin", ".zlogout",     ".zprofile",     ".zsh",      ".zshenv",
-    ".zshrc",
+    ".zig",  ".zon",           ".zlogin",       ".zlogout",  ".zprofile",
+    ".zsh",  ".zshenv",        ".zshrc",
 };
 
 pub const ExtAssoc = struct {

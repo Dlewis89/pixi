@@ -222,6 +222,8 @@
 				<string>xml</string>
 				<string>yaml</string>
 				<string>yml</string>
+				<string>zig</string>
+				<string>zon</string>
 				<string>zlogin</string>
 				<string>zlogout</string>
 				<string>zprofile</string>

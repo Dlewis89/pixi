@@ -157,7 +157,7 @@ pub fn migrateToPerPluginEnabled(allocator: std.mem.Allocator, settings_zon_path
         dvui.log.warn("settings: could not re-serialize shell fields for R12 migration ({s}); skipping", .{@errorName(err)});
         return;
     };
-    defer std.zon.parse.free(allocator, parsed);
+    defer Settings.freeParsed(allocator, parsed);
 
     const shell_text = Settings.serialize(&parsed, allocator) catch |err| {
         dvui.log.warn("settings: could not serialize shell fields for R12 migration ({s}); skipping", .{@errorName(err)});

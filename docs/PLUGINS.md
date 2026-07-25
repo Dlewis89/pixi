@@ -369,6 +369,18 @@ id inside the shell's own `{config}/settings.zon`:
 }
 ```
 
+**String fields own their memory.** A `[]const u8` setting's bytes belong to the schema —
+allocated with the host allocator by `applyZon` (loading, or an external hand-edit) and by the
+settings pane's text entry through `Access.setString` — *unless* the slice is still exactly the
+default you declared, which lives in your plugin image's constant data. `Schema(T)` tests that by
+pointer identity, so it never hands a string literal to the allocator, and a persisted value that
+happens to equal the default is still schema-owned (comparisons for persistence are by content,
+so it still drops out of `settings.zon`). What this means for you: **if your settings struct has a
+string field, call `MySettings.deinit(&settings)` when you tear that value down** (plugin
+`deinit`). It resets the value to your declared defaults and is a no-op for a struct of only
+scalars/enums. Don't free a string field yourself, and don't assign one directly if you want it
+persisted — go through the settings pane or `applyZon`, or you'll leak the schema's copy.
+
 Author fields live under `.settings` so they can never collide with the shell-reserved
 `.enabled`. Only fields that differ from `T`'s own declared defaults are written; an all-default
 value removes that plugin's `.settings` (and if also disabled, the whole `.plugins.<id>` entry).

@@ -11,12 +11,6 @@ pub const default_theme = "Fizzy Dark";
 /// Duration after the last edit before autosave runs (during normal operation).
 pub const autosave_timeout_ns: i128 = 500 * 1_000_000;
 
-/// The zon-parsed on-disk value backing the most recent successful `load`, kept alive
-/// for the process lifetime (freed in `deinit`). `theme` is independently heap-owned
-/// (duped in `load`), so it survives even though this is freed at shutdown rather than
-/// right after load.
-var loaded: ?Settings = null;
-
 pub const FlipbookView = enum { sequential, grid };
 pub const Compatibility = enum { none, ldtk };
 
@@ -100,13 +94,24 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8, plugins_dir: ?[]cons
         return default(allocator);
     };
 
-    if (loaded) |old| std.zon.parse.free(allocator, old);
-    loaded = parsed;
+    defer freeParsed(allocator, parsed);
 
     var result = parsed;
-    // Own theme independently of `loaded` (freed in `deinit`, long after this returns).
+    // Own `theme` for the process lifetime (freed in `deinit`); every other field is scalar.
     result.theme = try allocator.dupe(u8, parsed.theme);
     return result;
+}
+
+/// Frees a `parseOnly`/`load` result. Not `std.zon.parse.free` directly: since R12 the file only
+/// records non-default fields, so a missing `theme` is filled by `std.zon.parse` with *this
+/// struct's declared default* — a comptime string literal, not an allocation — and handing that
+/// pointer to the allocator would be an invalid free. Zeroing it first makes the whole-struct
+/// free a no-op for that field (`Allocator.free` returns early on an empty slice) while still
+/// covering any other allocated field.
+pub fn freeParsed(allocator: std.mem.Allocator, parsed: Settings) void {
+    var value = parsed;
+    if (value.theme.ptr == default_theme.ptr) value.theme = "";
+    std.zon.parse.free(allocator, value);
 }
 
 /// Parses `data` (already-read `settings.zon` bytes) into a `Settings` value, ignoring unknown
@@ -115,32 +120,58 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8, plugins_dir: ?[]cons
 /// defaults — defaulting is only correct when there's no existing live state to fall back *to*
 /// (startup); `Editor.reconcileExternalSettingsChange` (external hand-edit reconciliation, R11)
 /// has existing state and must not let a transient torn-write read reset every shell field and
-/// every plugin's settings. Caller frees the result with `std.zon.parse.free` (not
-/// `Settings.deinit`, which manages this module's own `loaded` snapshot — bypassed here on
-/// purpose for a lightweight one-off parse).
+/// every plugin's settings. Caller frees the result with `freeParsed` (not `Settings.deinit`,
+/// which owns the live value's long-lived `theme`).
 pub fn parseOnly(allocator: std.mem.Allocator, data: [:0]const u8) !Settings {
     @setEvalBranchQuota(10_000);
     return std.zon.parse.fromSliceAlloc(Settings, allocator, data, null, .{ .ignore_unknown_fields = true });
 }
 
-/// Serialize the shell's own fields as `.{ ...shell fields... }`. This is *not* the whole
-/// `settings.zon` file — plugin settings are a separate `.plugins = .{ .<id> = .{...}, ... }`
-/// field spliced on afterward by `Editor.composeSettingsText`/`SettingsPluginsZon.composeMergedText`
-/// (see `docs/PLUGIN_MANIFEST_PLAN.md` R10). `Editor.writeMergedSettings` is the only writer of
-/// `settings.zon` — there is no standalone shell-only save path anymore, since writing this half
-/// alone would silently drop the `.plugins` half.
+/// The value every field is diffed against by `serialize` — this struct's own declared defaults.
+const default_value: Settings = .{};
+
+fn fieldEqual(comptime FT: type, a: FT, b: FT) bool {
+    return switch (@typeInfo(FT)) {
+        .bool, .int, .float, .@"enum" => a == b,
+        .pointer => |p| if (p.size == .slice and p.child == u8) std.mem.eql(u8, a, b) else false,
+        else => false,
+    };
+}
+
+/// Serialize the shell's own fields as `.{ ...shell fields... }`, emitting **only the fields that
+/// differ from the declared defaults above** — the same non-default-only rule plugin settings
+/// follow (`sdk.settings.Schema(T).diffSerialize`, R12 in docs/PLUGIN_MANIFEST_PLAN.md), so both
+/// halves of `settings.zon` record just what the user actually changed. An untouched shell
+/// serializes to `.{}`; a field hand-written back at its default drops out on the next write.
+/// Reading back is unaffected: `load`/`parseOnly` fill every missing field from these same
+/// defaults (see `freeParsed` for the one ownership wrinkle that creates).
+///
+/// This is *not* the whole `settings.zon` file — plugin settings are a separate
+/// `.plugins = .{ .<id> = .{...}, ... }` field spliced on afterward by
+/// `Editor.composeSettingsText`/`SettingsPluginsZon.composeMergedText` (R10).
+/// `Editor.writeMergedSettings` is the only writer of `settings.zon` — there is no standalone
+/// shell-only save path anymore, since writing this half alone would silently drop the
+/// `.plugins` half.
 pub fn serialize(settings: *const Settings, allocator: std.mem.Allocator) ![]u8 {
     @setEvalBranchQuota(10_000);
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    try std.zon.stringify.serialize(settings.*, .{}, &aw.writer);
+
+    var any = false;
+    inline for (std.meta.fields(Settings)) |f| {
+        if (!fieldEqual(f.type, @field(settings, f.name), @field(default_value, f.name))) {
+            if (!any) try aw.writer.writeAll(".{\n");
+            any = true;
+            try aw.writer.print("    .{f} = ", .{std.zig.fmtId(f.name)});
+            try std.zon.stringify.serialize(@field(settings, f.name), .{}, &aw.writer);
+            try aw.writer.writeAll(",\n");
+        }
+    }
+    if (!any) return allocator.dupe(u8, ".{}");
+    try aw.writer.writeAll("}");
     return aw.toOwnedSlice();
 }
 
 pub fn deinit(settings: *Settings, allocator: std.mem.Allocator) void {
     allocator.free(settings.theme);
-    if (loaded) |d| {
-        std.zon.parse.free(allocator, d);
-        loaded = null;
-    }
 }

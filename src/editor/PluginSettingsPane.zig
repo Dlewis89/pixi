@@ -92,15 +92,34 @@ pub fn drawField(schema: *const settings.SettingsSchema, field: settings.Setting
                 }
             }
         },
-        .string => {
-            // Read-only until setString owns allocation policy.
-            const s = access.getString(value, field_index);
-            dvui.label(@src(), "{s}", .{s}, .{ .id_extra = id_extra });
-        },
+        .string => try drawString(schema, field_index, id_extra),
         .color => {
             dvui.label(@src(), "(color picker TBD)", .{}, .{ .id_extra = id_extra });
         },
     }
+}
+
+/// Text entry for a `[]const u8` setting. Committed on Enter only — the entry re-seeds itself
+/// from the live value whenever it isn't focused, so an abandoned edit reverts on blur and an
+/// external change (a hand-edit reconciled by `SettingsWatcher`) shows up here without the pane
+/// needing its own change notification. `Access.setString` copies the bytes into schema-owned
+/// storage, so nothing here has to outlive the frame.
+fn drawString(schema: *const settings.SettingsSchema, field_index: usize, id_extra: usize) !void {
+    const access = schema.access;
+    const value = schema.value;
+    const current = access.getString(value, field_index);
+
+    var entry: dvui.TextEntryWidget = undefined;
+    entry.init(@src(), .{}, .{ .id_extra = id_extra, .expand = .horizontal });
+    const focused = dvui.focusedWidgetId() == entry.data().id;
+    if (!focused and !std.mem.eql(u8, entry.getText(), current)) entry.textSet(current, false);
+    entry.processEvents();
+    entry.draw();
+    if (entry.enter_pressed and !std.mem.eql(u8, entry.getText(), current)) {
+        access.setString(value, field_index, entry.getText());
+        access.persist(value, schema.owner);
+    }
+    entry.deinit();
 }
 
 fn drawIntChoices(schema: *const settings.SettingsSchema, field: settings.Setting, choices: []const i64, field_index: usize, id_extra: usize) !void {

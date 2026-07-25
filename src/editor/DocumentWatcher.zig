@@ -1,10 +1,11 @@
 //! Watches open on-disk documents for external changes while fizzy is running.
 //!
 //! Thin adapter over [`neurocyte/nightwatch`](https://github.com/neurocyte/nightwatch): each
-//! tracked path gets its own `watch(path)`. Nightwatch owns the background thread; this layer
-//! only implements its `Handler` (atomic flag + `backend.refresh()`, never file content /
-//! `dvui.io` / a shared allocator from the callback) and a ~200ms coalesce on the main thread
-//! via `tick`.
+//! tracked path gets its own `watch(path)` on a `doc_variant` watcher (see that decl — the
+//! variant choice is load-bearing for single-file watches). Nightwatch owns the background
+//! thread; this layer only implements its `Handler` (atomic flag + `backend.refresh()`, never
+//! file content / `dvui.io` / a shared allocator from the callback) and a ~200ms coalesce on
+//! the main thread via `tick`.
 //!
 //! On a real external change (content hash differs from the baseline captured at open / after
 //! our own save):
@@ -54,12 +55,27 @@ by_id: std.AutoHashMapUnmanaged(u64, Entry) = .empty,
 /// normalized path → doc id (event matching). Path keys are borrowed from `Entry.path`.
 by_path: std.StringHashMapUnmanaged(u64) = .empty,
 
+/// The nightwatch variant to drive open-document watching.
+///
+/// **Not `Default`.** We watch individual *files*, and on the BSD/macOS `.kqueue` variant a
+/// regular-file path silently lands in the directory watch map: its `NOTE_WRITE` is routed to
+/// `scan_dir`, which no-ops on a non-directory, so the write is dropped and no handler event
+/// ever fires. `.kqueuedir` `fstat`s the path at `add_watch` time and emits real-time
+/// `.modified` for regular files — the case nightwatch's README calls out as the supported way
+/// to watch single files. Its directory-tree trade-off (mtime-diff scans miss pure content
+/// writes) doesn't apply to us: we only ever pass file paths.
+const doc_variant: if (have_impl) @import("nightwatch").Variant else void = switch (builtin.os.tag) {
+    .macos, .freebsd, .openbsd, .netbsd, .dragonfly => .kqueuedir,
+    else => if (have_impl) @import("nightwatch").default_variant else {},
+};
+
 const Impl = if (have_impl) struct {
     const nightwatch = @import("nightwatch");
-    const Handler = nightwatch.Default.Handler;
+    const Watcher = nightwatch.Create(doc_variant);
+    const Handler = Watcher.Handler;
 
     handler: Handler = .{ .vtable = &vtable },
-    nw: ?nightwatch.Default = null,
+    nw: ?Watcher = null,
     raw_dirty: ?*std.atomic.Value(bool) = null,
 
     const vtable = Handler.VTable{
@@ -97,9 +113,8 @@ pub fn init(gpa: Allocator) DocumentWatcher {
 /// as `SettingsWatcher.start` — nightwatch retains `&self.impl.handler`).
 pub fn start(self: *DocumentWatcher) !void {
     if (comptime !have_impl) return error.Unsupported;
-    const nightwatch = @import("nightwatch");
     self.impl.raw_dirty = &self.raw_dirty;
-    var nw = try nightwatch.Default.init(dvui.io, self.gpa, &self.impl.handler);
+    var nw = try Impl.Watcher.init(dvui.io, self.gpa, &self.impl.handler);
     errdefer nw.deinit();
     self.impl.nw = nw;
 }

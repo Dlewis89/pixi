@@ -12,9 +12,14 @@
 //! already order correctly.
 //!
 //! Matching is case-insensitive until the query itself contains an uppercase character
-//! ("smart case"), the convention every interactive fuzzy finder uses: `readme` finds `README`,
-//! but `README` no longer finds `readme.txt`. zf's own default is case-sensitive, which is the
-//! wrong default for a filter box.
+//! ("smart case"), the convention every interactive fuzzy finder uses: `readme` finds `README`.
+//! zf's own default is case-sensitive, which is the wrong default for a filter box.
+//!
+//! Smart case here *prefers* an exact-case match rather than requiring one: a candidate that only
+//! matches case-insensitively still matches, it just ranks behind every exact-case hit (see
+//! `case_fallback_penalty`). Strict smart case makes a mixed-case query silently return nothing —
+//! `Cl` would not find `CLAUDE.md`, because the `l` is upper there — which reads as a broken
+//! filter box rather than a precision feature.
 const std = @import("std");
 const zf = @import("zf");
 
@@ -67,15 +72,22 @@ pub const Options = struct {
     plain: bool = true,
 };
 
+/// Added to the score of a candidate that only matched once case was ignored, so exact-case hits
+/// always sort ahead of them. Far larger than any rank zf produces for a realistic label or path
+/// (those are single or double digits), so the two form clean bands rather than interleaving.
+pub const case_fallback_penalty: f64 = 1000;
+
 /// Score `haystack` against `query`. Null means "no match" — the candidate should be dropped,
 /// not merely sorted last. **Lower is better**; an empty query scores everything 0.
 pub fn score(haystack: []const u8, query: *const Query, opts: Options) ?f64 {
     if (query.isEmpty()) return 0;
     if (haystack.len == 0) return null;
-    return zf.rank(haystack, query.tokens(), .{
-        .case_sensitive = query.case_sensitive,
-        .plain = opts.plain,
-    });
+    if (query.case_sensitive) {
+        if (zf.rank(haystack, query.tokens(), .{ .case_sensitive = true, .plain = opts.plain })) |s| return s;
+        const relaxed = zf.rank(haystack, query.tokens(), .{ .case_sensitive = false, .plain = opts.plain }) orelse return null;
+        return relaxed + case_fallback_penalty;
+    }
+    return zf.rank(haystack, query.tokens(), .{ .case_sensitive = false, .plain = opts.plain });
 }
 
 /// Best (lowest) score across several fields of one candidate — a store row matching on any of
@@ -99,8 +111,12 @@ pub fn matches(haystack: []const u8, query: *const Query, opts: Options) bool {
 /// `highlight_buf_len` unless you know better. Returns empty for an empty query.
 pub fn highlight(haystack: []const u8, query: *const Query, buf: []usize, opts: Options) []const usize {
     if (query.isEmpty() or haystack.len == 0) return &.{};
+    // Mirror `score`'s smart-case fallback, or a candidate that only matched with case ignored
+    // would come back with no (or partial) highlights.
+    const case_sensitive = query.case_sensitive and
+        zf.rank(haystack, query.tokens(), .{ .case_sensitive = true, .plain = opts.plain }) != null;
     return zf.highlight(haystack, query.tokens(), buf, .{
-        .case_sensitive = query.case_sensitive,
+        .case_sensitive = case_sensitive,
         .plain = opts.plain,
     });
 }
@@ -158,7 +174,29 @@ test "smart case" {
     var upper = Query.init("README");
     try testing.expect(upper.case_sensitive);
     try testing.expect(matches("README", &upper, .{}));
-    try testing.expect(!matches("readme.txt", &upper, .{}));
+    // Case still only ranks — a wrong-case candidate matches, behind every exact-case one.
+    try testing.expect(matches("readme.txt", &upper, .{}));
+    try testing.expect(score("README", &upper, .{}).? < score("readme.txt", &upper, .{}).?);
+}
+
+test "a mixed-case query still finds an all-caps candidate" {
+    var q = Query.init("Cl");
+    try testing.expect(q.case_sensitive);
+    try testing.expect(matches("CLAUDE.md", &q, .{ .plain = false }));
+
+    // ...and it is highlighted, not left blank by the case-sensitive pass.
+    var buf: [highlight_buf_len]usize = undefined;
+    const hits = highlight("CLAUDE.md", &q, &buf, .{ .plain = false });
+    try testing.expectEqualSlices(usize, &.{ 0, 1 }, hits);
+}
+
+test "exact-case hits band ahead of case-folded ones" {
+    var q = Query.init("Cl");
+    const exact = score("src/Client.zig", &q, .{ .plain = false }).?;
+    const folded = score("CLAUDE.md", &q, .{ .plain = false }).?;
+    try testing.expect(exact < case_fallback_penalty);
+    try testing.expect(folded >= case_fallback_penalty);
+    try testing.expect(exact < folded);
 }
 
 test "scattered characters match, missing ones do not" {

@@ -9,16 +9,19 @@
 //!      thing the child touches that needs it crashes or hangs. `posix_spawn` doesn't
 //!      duplicate the caller's address space or thread state at all, so this hazard class
 //!      doesn't apply regardless of which thread calls it.
-//!   2. Every `std.process.spawn`/`.run` call unconditionally walks the process's raw
-//!      `environ` array (`Io.Threaded.scanEnviron`, "for PATH" — even when argv[0] is already
-//!      an absolute path and doesn't need PATH resolution at all), and that array is
-//!      apparently malformed specifically when fizzy is launched via Velopack's installer
-//!      auto-open right after install (a spurious NULL entry before the array's declared
-//!      end) — crashing with an unwrap-null panic. There is no public option on
-//!      `std.process.spawn`/`.run` to skip that scan. This implementation never reads the
-//!      live `environ` array at all — the child's environment is built from individual
-//!      `getenv()` lookups for a known set of keys, which degrade gracefully (stop at
-//!      whatever they find) rather than crash on the same malformed data.
+//!   2. Every `std.process.spawn`/`.run` call walks the `environ` array *as captured at
+//!      startup* — `std.start` records `envp` plus its length once, and `Environ`'s block
+//!      builders then index that slice up to the recorded length. But libc's `unsetenv`
+//!      shrinks the live array **in place**: entries shift down and the array gets a NULL
+//!      one slot earlier, while the captured length stays put. So a single `unsetenv`
+//!      anywhere in the process — SDL, a plugin dylib, a system framework — leaves the
+//!      captured slice with a NULL before its end, and the *next* spawn from anywhere
+//!      unwraps it and segfaults the whole app. (Reproduced standalone: capture at startup,
+//!      `unsetenv` one inherited variable, `std.process.run` → SIGSEGV in
+//!      `Environ.createPosixBlock`.) There is no public option on `std.process.spawn`/`.run`
+//!      to skip that walk. This implementation never reads the `environ` array at all — the
+//!      child's environment is built from individual `getenv()` lookups for a known set of
+//!      keys, which is unaffected by the in-place shuffle.
 //!
 //! Returns a normal `std.process.Child` — its `wait`/`kill` are plain POSIX
 //! `waitpid`/`kill` calls with no dependency on how the child was spawned, so callers use it

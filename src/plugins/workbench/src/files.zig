@@ -478,7 +478,10 @@ fn lessThan(_: void, lhs: SimpleEntry, rhs: SimpleEntry) bool {
     return std.mem.order(u8, lhs.name, rhs.name) == .lt;
 }
 
-pub fn editableLabel(id_extra: usize, label: []const u8, color: dvui.Color, kind: std.Io.File.Kind, full_path: []const u8) !void {
+/// `query`, when non-null, is the active filter — the bytes of `label` it matched are tinted so
+/// a row explains *why* it survived the filter (the same treatment the settings tree gives its
+/// rows). Null while no filter is active, which is the common case.
+pub fn editableLabel(id_extra: usize, label: []const u8, color: dvui.Color, kind: std.Io.File.Kind, full_path: []const u8, query: ?*const fuzzy.Query) !void {
     const padding = dvui.Rect.all(3);
     const font = dvui.Font.theme(.body);
 
@@ -563,26 +566,65 @@ pub fn editableLabel(id_extra: usize, label: []const u8, color: dvui.Color, kind
             .id_extra = id_extra,
         });
         defer row.deinit();
-        dvui.label(@src(), "{s}", .{label}, .{
-            .color_text = color,
-            .padding = padding,
-            .margin = dvui.Rect.all(0),
-            .id_extra = id_extra,
-            .font = font,
-            .expand = .horizontal,
-            .gravity_y = 0.5,
-        });
+        filterLabel(id_extra, label, color, font, padding, query);
         runtime.workbench().drawBranchDecorations(full_path, id_extra);
     } else {
-        dvui.label(@src(), "{s}", .{label}, .{
-            .color_text = color,
-            .padding = padding,
-            .margin = dvui.Rect.all(0),
-            .id_extra = id_extra,
-            .font = font,
-            .expand = .horizontal,
-            .gravity_y = 0.5,
-        });
+        filterLabel(id_extra, label, color, font, padding, query);
+    }
+}
+
+/// A row's text: a plain label normally, and a run-split label tinting the filter's matched bytes
+/// while a filter is active. Chrome (font, padding, expansion) is identical either way so rows
+/// don't shift when the filter box gains or loses text.
+fn filterLabel(
+    id_extra: usize,
+    label: []const u8,
+    color: dvui.Color,
+    font: dvui.Font,
+    padding: dvui.Rect,
+    query: ?*const fuzzy.Query,
+) void {
+    const opts: dvui.Options = .{
+        .color_text = color,
+        .padding = padding,
+        .margin = dvui.Rect.all(0),
+        .id_extra = id_extra,
+        .font = font,
+        .expand = .horizontal,
+        .gravity_y = 0.5,
+    };
+
+    const q = query orelse {
+        dvui.label(@src(), "{s}", .{label}, opts);
+        return;
+    };
+
+    var buf: [fuzzy.highlight_buf_len]usize = undefined;
+    // `.plain = false` matches how `rankedFilterRows` scored these rows: the label is a
+    // project-relative path, so zf weights its basename here too.
+    const hits = fuzzy.highlight(label, q, &buf, .{ .plain = false });
+    if (hits.len == 0) {
+        dvui.label(@src(), "{s}", .{label}, opts);
+        return;
+    }
+
+    var tl = dvui.textLayout(@src(), .{ .break_lines = false }, opts.override(.{ .background = false }));
+    defer tl.deinit();
+
+    const matched = dvui.themeGet().color(.highlight, .fill);
+    var i: usize = 0;
+    var h: usize = 0;
+    while (i < label.len) {
+        if (h < hits.len and hits[h] == i) {
+            // Consume the whole contiguous run of matched bytes in one addText.
+            const start = i;
+            while (h < hits.len and hits[h] == i) : (h += 1) i += 1;
+            tl.addText(label[start..i], .{ .color_text = matched });
+        } else {
+            const start = i;
+            i = if (h < hits.len) hits[h] else label.len;
+            tl.addText(label[start..i], .{ .color_text = color });
+        }
     }
 }
 
@@ -603,6 +645,10 @@ pub fn recurseFiles(root_directory: []const u8, outer_tree: *wdvui.TreeWidget, u
         /// match. That is what made typing in the filter box scale with project size.
         fn search(directory: []const u8, tree: *wdvui.TreeWidget, inner_unique_id: dvui.Id, inner_id_extra: *usize, color_id: *usize, filter_text: []const u8, parent_branch: ?*wdvui.TreeWidget.Branch, rows: ?[]const SimpleEntry) !void {
             const io = dvui.io;
+
+            // Borrows `filter_text`, which outlives this call — see `fuzzy.Query`.
+            const query = fuzzy.Query.init(filter_text);
+            const active_query: ?*const fuzzy.Query = if (query.isEmpty()) null else &query;
 
             var files = std.array_list.Managed(SimpleEntry).init(dvui.currentWindow().arena());
 
@@ -931,6 +977,7 @@ pub fn recurseFiles(root_directory: []const u8, outer_tree: *wdvui.TreeWidget, u
                             if (runtime.host().docFromPath(abs_path) != null) dvui.themeGet().color(.window, .text) else dvui.themeGet().color(.control, .text),
                             entry.kind,
                             abs_path,
+                            active_query,
                         ) catch {
                             dvui.log.err("Failed to draw editable label", .{});
                         };
@@ -1002,6 +1049,9 @@ pub fn recurseFiles(root_directory: []const u8, outer_tree: *wdvui.TreeWidget, u
                             dvui.themeGet().color(.control, .text),
                             entry.kind,
                             abs_path,
+                            // Folder rows only appear in the unfiltered walk, and their label is a
+                            // bare basename rather than the path the filter scored.
+                            null,
                         ) catch {
                             dvui.log.err("Failed to draw editable label", .{});
                         };
