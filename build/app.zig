@@ -343,43 +343,69 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         "Skip tests that do not match any filter",
     ) orelse &[0][]const u8{};
 
-    const tests_module = b.addModule("fizzy-tests", .{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("tests/root.zig"),
-    });
-
-    inline for (.{
-        .{ "fizzy-direction", "src/core/math/direction.zig" },
-        .{ "fizzy-easing", "src/core/math/easing.zig" },
-        .{ "fizzy-layout-anchor", "src/core/math/layout_anchor.zig" },
-        .{ "fizzy-window-layout", "src/backend/window_layout.zig" },
-        .{ "fizzy-plugin-dylib", "src/sdk/dylib.zig" },
-        .{ "fizzy-plugin-store", "src/backend/plugin_store/store.zig" },
-    }) |entry| {
-        tests_module.addAnonymousImport(entry[0], .{
-            .root_source_file = b.path(entry[1]),
-            .target = target,
-            .optimize = optimize,
-        });
-    }
-
-    const unit_tests = b.addTest(.{
-        .name = "fizzy-unit-tests",
-        .root_module = tests_module,
-        .filters = test_filters,
-    });
-
     // `zig build test` is the CI entry point and must stay self-contained: pure
     // unit tests only, no dvui/SDL/Velopack/MSVC. Integration tests live under
     // `zig build test-integration` (Velopack + dvui-testing + comctl32 on Windows
     // → needs MSVC SDK on Windows hosts). `zig build test-all` runs both.
     const test_step = b.step("test", "Run fizzy unit tests (pure-logic only, no dvui/SDL/Velopack)");
-    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
     // `check` mirrors the split so editor compile-error checking matches CI.
     const check_step = b.step("check", "Compile fizzy unit tests without running them");
-    check_step.dependOn(&unit_tests.step);
+
+    // Zig collects `test` blocks only from files belonging to an artifact's **root
+    // module** — a file pulled in as a *named* import (`addImport` /
+    // `addAnonymousImport`) is a separate module whose tests are never run. That is
+    // how `fizzy-unit-tests` silently ran zero tests behind a green build. So: one
+    // `addTest` per pure-logic root, each rooted directly at the file under test.
+    // Files reached from such a root by relative `@import` (plugin_store's
+    // registry/compat/download, say) are part of the same module and *are* collected.
+    var unit_test_artifacts: std.ArrayListUnmanaged(*std.Build.Step.Compile) = .empty;
+
+    inline for (.{
+        .{ "fizzy-direction-tests", "src/core/math/direction.zig" },
+        .{ "fizzy-easing-tests", "src/core/math/easing.zig" },
+        .{ "fizzy-layout-anchor-tests", "src/core/math/layout_anchor.zig" },
+        .{ "fizzy-window-layout-tests", "src/backend/window_layout.zig" },
+        .{ "fizzy-plugin-store-tests", "src/backend/plugin_store/store.zig" },
+        .{ "fizzy-lsp-protocol-tests", "src/core/lsp/Protocol.zig" },
+        .{ "fizzy-lsp-uri-tests", "src/core/lsp/UriUtil.zig" },
+        .{ "fizzy-settings-plugins-zon-tests", "src/editor/SettingsPluginsZon.zig" },
+        // std-only despite living under src/sdk/ — and the SDK-rooted test artifact
+        // below never reaches it (nothing in the graph forces `sdk.manifest`), so it
+        // needs its own root either way.
+        .{ "fizzy-sdk-manifest-tests", "src/sdk/manifest.zig" },
+    }) |entry| {
+        try unit_test_artifacts.append(b.allocator, b.addTest(.{
+            .name = entry[0],
+            .root_module = b.createModule(.{
+                .target = target,
+                .optimize = optimize,
+                .root_source_file = b.path(entry[1]),
+            }),
+            .filters = test_filters,
+        }));
+    }
+
+    // `core.fuzzy` is pure logic too, but wraps zf — wire that single dependency
+    // rather than dragging in all of `core`, which would pull in dvui.
+    {
+        const fuzzy_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/core/fuzzy.zig"),
+        });
+        fuzzy_module.addImport("zf", core_mod.zfModule(b, target, optimize));
+        try unit_test_artifacts.append(b.allocator, b.addTest(.{
+            .name = "fizzy-fuzzy-tests",
+            .root_module = fuzzy_module,
+            .filters = test_filters,
+        }));
+    }
+
+    for (unit_test_artifacts.items) |unit_test| {
+        test_step.dependOn(&b.addRunArtifact(unit_test).step);
+        check_step.dependOn(&unit_test.step);
+    }
 
     // ---------------------------------------------------------------
     // Layer 2: headless integration tests against dvui's testing
@@ -509,13 +535,46 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     test_integration_step.dependOn(&b.addRunArtifact(integration_tests).step);
     check_integration_step.dependOn(&integration_tests.step);
 
+    // Pure-logic tests that nevertheless sit in a file importing `dvui` (or the SDK)
+    // can't join the unit layer, so they get their own roots here. Rooting at
+    // `src/sdk/sdk.zig` collects every SDK file reachable from it by relative
+    // import *and actually referenced* — dylib.zig, fingerprint.zig, settings.zig,
+    // version.zig, Host.zig. A file only reached through an unreferenced `pub const
+    // x = @import(…)` in sdk.zig is analyzed lazily and its tests never run (that is
+    // why manifest.zig has its own root in the unit list above); when adding tests
+    // to a new SDK file, check the reported test count actually went up.
+    {
+        const sdk_tests_module = sdk.wireSdkModule(b, target, optimize, dvui_testing_dep.module("dvui_testing"), dvui_test_proxy_bridge, core_module_test, null);
+        const plugin_loader_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/editor/PluginLoader.zig"),
+        });
+        plugin_loader_module.addImport("dvui", dvui_testing_dep.module("dvui_testing"));
+        plugin_loader_module.addImport("fizzy_sdk", sdk_module_test);
+
+        inline for (.{
+            .{ "fizzy-sdk-tests", sdk_tests_module },
+            .{ "fizzy-plugin-loader-tests", plugin_loader_module },
+        }) |entry| {
+            const t = b.addTest(.{
+                .name = entry[0],
+                .root_module = entry[1],
+                .filters = test_filters,
+            });
+            test_integration_step.dependOn(&b.addRunArtifact(t).step);
+            check_integration_step.dependOn(&t.step);
+            if (win_libc.needs_setup) t.step.dependOn(&msvcup_before_compile.step);
+        }
+    }
+
     if (win_libc.needs_setup) {
         exe.step.dependOn(&msvcup_before_compile.step);
         if (!velopack_enabled and velopack_supported_for_target) {
             exe_for_package.step.dependOn(&msvcup_before_compile.step);
         }
         integration_tests.step.dependOn(&msvcup_before_compile.step);
-        unit_tests.step.dependOn(&msvcup_before_compile.step);
+        for (unit_test_artifacts.items) |unit_test| unit_test.step.dependOn(&msvcup_before_compile.step);
         inline for (.{ main_fizzy, package_fizzy }) |fizzy_exe_result| {
             if (fizzy_exe_result.workbench_dylib) |dylib| dylib.step.dependOn(&msvcup_before_compile.step);
             if (fizzy_exe_result.text_dylib) |dylib| dylib.step.dependOn(&msvcup_before_compile.step);
@@ -529,8 +588,8 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         var n: usize = 0;
         roots[n] = exe;
         n += 1;
-        roots[n] = unit_tests;
-        n += 1;
+        // The pure-logic unit tests are std-only (no C, hence no translate-c step
+        // to fix up), so only the integration side needs the MSVC shim here.
         roots[n] = integration_tests;
         n += 1;
         if (!velopack_enabled and velopack_supported_for_target) {

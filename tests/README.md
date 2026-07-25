@@ -58,10 +58,8 @@ cheapest first. Wiring lives in `build/app.zig`.
 | Step                   | Artifacts                                                                 | Needs a window? | Notes |
 | ---------------------- | ------------------------------------------------------------------------- | --------------- | ----- |
 | `zig build test`       | One `b.addTest` per pure-logic file (`fizzy-direction-tests`, …, `fizzy-fuzzy-tests`) | No | CI entry; no dvui/SDL/Velopack |
-| `zig build test-integration` | `fizzy-sdk-tests` (`src/sdk/sdk.zig`) + `fizzy-integration-tests` (`tests/integration.zig`) | Headless (dvui testing backend) | Not run by CI today |
+| `zig build test-integration` | `fizzy-sdk-tests` (`src/sdk/sdk.zig`) + `fizzy-plugin-loader-tests` (`src/editor/PluginLoader.zig`) + `fizzy-integration-tests` (`tests/integration.zig`) | Headless (dvui testing backend) | Not run by CI today |
 
-
-`tests/root.zig` is a historical stub only — it is not a test root.
 
 ### Unit tests (pure logic)
 
@@ -80,21 +78,38 @@ Each covered file is its own test artifact root in `build/app.zig`
 - [`src/backend/plugin_store/store.zig`](../src/backend/plugin_store/store.zig) —
   `fizzy-plugin-store-tests` — catalog/registry/download parsing (sibling
   file imports keep those tests in the same module).
+- [`src/core/lsp/Protocol.zig`](../src/core/lsp/Protocol.zig) —
+  `fizzy-lsp-protocol-tests` — LSP message framing/parsing.
+- [`src/core/lsp/UriUtil.zig`](../src/core/lsp/UriUtil.zig) —
+  `fizzy-lsp-uri-tests` — `file://` URI ↔ path conversion.
+- [`src/editor/SettingsPluginsZon.zig`](../src/editor/SettingsPluginsZon.zig) —
+  `fizzy-settings-plugins-zon-tests` — ZON-AST byte-span surgery on `settings.zon`.
+- [`src/sdk/manifest.zig`](../src/sdk/manifest.zig) —
+  `fizzy-sdk-manifest-tests` — `plugin.zig.zon` parsing (std-only, so it lives
+  in the unit layer even though it sits under `src/sdk/`).
 - [`src/core/fuzzy.zig`](../src/core/fuzzy.zig) —
   `fizzy-fuzzy-tests` — fuzzy matcher wrapper over `zf` (needs a `zf` import).
 
 ### Integration / SDK tests (headless)
 
-`zig build test-integration` runs two artifacts:
+`zig build test-integration` runs three artifacts:
 
 1. **`fizzy-sdk-tests`** — root module `src/sdk/sdk.zig`, with
    dvui-testing + `proxy_bridge` + `core` wired the same way as the app.
-   Collects every same-module `test` block under `src/sdk/`
-   (`dylib.zig` ABI fingerprint, `fingerprint.zig`, `settings.zig`,
-   `manifest.zig`, `Host.zig`, `version.zig`, …). These cannot live under
-   `zig build test` because the SDK imports dvui.
+   Collects same-module `test` blocks under `src/sdk/` (`dylib.zig` ABI
+   fingerprint, `fingerprint.zig`, `settings.zig`, `Host.zig`,
+   `version.zig`). These cannot live under `zig build test` because the
+   SDK imports dvui. Caveat: a file reached only through an *unreferenced*
+   `pub const x = @import("x.zig")` in `sdk.zig` is analyzed lazily and
+   contributes no tests — that is why `manifest.zig` has its own root in
+   the unit layer. Always confirm the reported test count went up.
 
-2. **`fizzy-integration-tests`** — `tests/integration.zig` exercises
+2. **`fizzy-plugin-loader-tests`** — root module
+   `src/editor/PluginLoader.zig`. Pure-logic tests (plugin dir/path
+   resolution) that only need the integration layer because the file
+   imports `dvui` and `fizzy_sdk`.
+
+3. **`fizzy-integration-tests`** — `tests/integration.zig` exercises
    real fizzy code that needs a live `dvui.Window` and `fizzy.app` /
    `fizzy.editor` globals. dvui's `testing` backend creates a window with
    no GPU and no SDL; `tests/fizzy_shim.zig` heap-allocates just enough
@@ -142,16 +157,19 @@ What's intentionally **not** here yet:
 3. If the file isn't already a unit-test root, add a
    `{ "fizzy-<name>-tests", "path/to/file.zig" }` entry to the
    `inline for` table in `build/app.zig` (or mirror the `fuzzy` block
-   if it needs named imports like `zf`). Do **not** wire it through
-   `tests/root.zig` or `addAnonymousImport` — those do not collect tests.
-4. Run `zig build test`.
+   if it needs named imports like `zf`). Do **not** wire it through an
+   aggregator root or `addAnonymousImport` — those do not collect tests.
+4. Run `zig build test --summary all` and check the count for your
+   artifact went up. A plain green run proves nothing.
 
 ### SDK (needs dvui / `proxy_bridge` / `core`)
 
 1. Add a `test "..."` block in the relevant `src/sdk/*.zig` file.
-2. No build wiring: `fizzy-sdk-tests` is already rooted at `sdk.zig`, so
-   same-module file imports pick the new block up automatically.
-3. Run `zig build test-integration`.
+2. Usually no build wiring: `fizzy-sdk-tests` is already rooted at
+   `sdk.zig`, so same-module file imports pick the new block up.
+3. Run `zig build test-integration --summary all` and verify the
+   `fizzy-sdk-tests` count grew. If it didn't, the file is only reached
+   through a lazily-analyzed decl — give it its own `addTest` root.
 
 ### Integration (when a test needs `dvui.currentWindow()` or fizzy globals)
 

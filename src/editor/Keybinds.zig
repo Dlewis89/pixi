@@ -69,7 +69,7 @@ pub fn tick() !void {
                     if (ke.matchBind("open_files") and ke.action == .down) {
                         if (try dvui.dialogNativeFileOpenMultiple(
                             dvui.currentWindow().arena(),
-                            .{ .title = "Open Files...", .filter_description = ".fiz, .pixi, .png, .jpg, .jpeg", .filters = &.{ "*.fiz", "*.pixi", "*.png", "*.jpg", "*.jpeg" } },
+                            .{ .title = "Open Files..." },
                         )) |files| {
                             for (files) |file| {
                                 _ = fizzy.editor.openFilePath(file, fizzy.editor.currentGroupingID()) catch {

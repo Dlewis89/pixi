@@ -37,7 +37,7 @@ pub fn addImports(
 /// plugin. `with_tui = false` matters: zf's default build wires up its standalone terminal
 /// binary, whose `libvaxis` dependency would otherwise be fetched into every plugin build for a
 /// binary nobody here builds.
-fn zfModule(
+pub fn zfModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,

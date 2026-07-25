@@ -678,7 +678,13 @@ pub fn spinner(src: std.builtin.SourceLocation, spinner_opts: SpinnerOptions, op
 
 pub fn toastDisplay(id: dvui.Id) !void {
     const message = dvui.dataGetSlice(null, id, "_message", []u8) orelse {
-        dvui.log.err("toastDisplay lost data for toast {x}\n", .{id});
+        // The `_message` slice is dvui frame-data: it is freed after any frame where
+        // nothing touches the key. A toast anchored to a subwindow that stops being
+        // drawn (tab switch, pane closed, canvas hidden) therefore loses its message
+        // permanently. Drop the toast like `dvui.toastDisplay` does — otherwise it
+        // sits in the queue forever and re-logs this every single frame.
+        dvui.log.err("toastDisplay lost data for toast {x}", .{id});
+        dvui.toastRemove(id);
         return;
     };
 
@@ -974,7 +980,9 @@ pub const save_toast_subwindow_id: dvui.Id = @enumFromInt(0xF12_5A4E_71D0_5A4E);
 /// toast id (set by `toastAdd` caller).
 pub fn saveCompleteToastDisplay(id: dvui.Id) !void {
     const message = dvui.dataGetSlice(null, id, "_message", []u8) orelse {
-        dvui.log.err("saveCompleteToastDisplay lost data for toast {x}\n", .{id});
+        // Same frame-data expiry as `toastDisplay` — remove instead of spinning.
+        dvui.log.err("saveCompleteToastDisplay lost data for toast {x}", .{id});
+        dvui.toastRemove(id);
         return;
     };
 

@@ -5,8 +5,6 @@ const builtin = @import("builtin");
 const dvui = @import("dvui");
 const fizzy = @import("../fizzy.zig");
 
-const open_accept = ".fiz,.pixi,.png,.jpg,.jpeg,image/png,image/jpeg";
-
 var open_callback: ?*const fn (?[][:0]const u8) void = null;
 var open_grouping: u64 = 0;
 /// Set when the picker is opened; must match `wasmFileUploadedMultiple` lookup.
@@ -48,7 +46,9 @@ pub fn showOpenFileDialog(
     open_callback = cb;
     open_grouping = fizzy.editor.currentGroupingID();
     open_picker_id = dvui.Id.extendId(null, @src(), 0);
-    dvui.dialogWasmFileOpenMultiple(open_picker_id.?, .{ .accept = open_accept });
+    // No accept filter — text is the fallback owner for any extension, and other plugins
+    // claim their own types via `fileTypePriority`.
+    dvui.dialogWasmFileOpenMultiple(open_picker_id.?, .{});
 }
 
 /// Opens the in-app save dialog; `Editor.processPendingSaveAs` consumes the chosen name.

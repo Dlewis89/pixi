@@ -56,7 +56,7 @@ pub fn dialog(_: dvui.Id) anyerror!bool {
 
     dvui.labelNoFmt(
         @src(),
-        "The file explorer is not available in the browser.\n\nUse Open Files to load .fiz, .png, or .jpg images from your device.",
+        "The file explorer is not available in the browser.\n\nUse Open Files to load files from your device.",
         .{},
         .{ .color_text = dvui.themeGet().color(.window, .text), .margin = .{ .h = 12 } },
     );

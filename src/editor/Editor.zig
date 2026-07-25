@@ -849,6 +849,10 @@ pub fn loadUserPlugins(editor: *Editor, config_folder: []const u8) void {
     defer dir.close(dvui.io);
 
     var loaded_any = false;
+    var loaded_count: usize = 0;
+    // Startup cost attributable to user plugins. `PluginLoader` logs any individual load over
+    // its slow threshold; this is the number to watch when "fizzy got slower to launch".
+    const scan_start = std.Io.Clock.boot.now(dvui.io).nanoseconds;
 
     var iter = dir.iterate();
     while (iter.next(dvui.io) catch null) |entry| {
@@ -913,7 +917,13 @@ pub fn loadUserPlugins(editor: *Editor, config_folder: []const u8) void {
         };
         dvui.log.info("user plugin '{s}' loaded from {s}", .{ plugin_id, path });
         loaded_any = true;
+        loaded_count += 1;
     }
+
+    dvui.log.info("loaded {d} user plugin(s) in {d}ms", .{
+        loaded_count,
+        @divTrunc(std.Io.Clock.boot.now(dvui.io).nanoseconds - scan_start, std.time.ns_per_ms),
+    });
 
     if (loaded_any) {
         syncLoadedPluginDvuiContexts(editor);
@@ -2992,8 +3002,6 @@ pub fn handleNativeMenuAction(editor: *Editor, action: fizzy.backend.NativeMenuA
                 );
             } else if (try dvui.dialogNativeFileOpenMultiple(dvui.currentWindow().arena(), .{
                 .title = "Open Files...",
-                .filter_description = ".fiz, .pixi, .png, .jpg, .jpeg",
-                .filters = &.{ "*.fiz", "*.pixi", "*.png", "*.jpg", "*.jpeg" },
             })) |files| {
                 for (files) |file| {
                     _ = editor.openFilePath(file, editor.currentGroupingID()) catch {
