@@ -4,6 +4,7 @@ const dvui = @import("dvui");
 const icons = @import("icons");
 const update_notify = @import("../backend/update_notify.zig");
 const Dialogs = fizzy.Editor.Dialogs;
+const Constants = @import("Constants.zig");
 
 pub const Infobar = @This();
 
@@ -23,23 +24,30 @@ pub fn deinit() void {
 
 pub fn draw(_: Infobar) !void {
     const font = dvui.Font.theme(.body).larger(-1.0);
+    const bar_h = Constants.infobar_height;
 
-    var scrollarea = dvui.scrollArea(@src(), .{}, .{
+    // Shell owns height: pin min+max so plugin (or icon) content cannot grow the bar.
+    // Horizontal scroll covers overflow width; vertical overflow is clipped.
+    var scrollarea = dvui.scrollArea(@src(), .{ .vertical = .none, .horizontal = .auto }, .{
         .expand = .horizontal,
         .background = false,
         .color_fill = dvui.themeGet().color(.control, .fill),
         .gravity_y = 1.0,
         .padding = .all(0),
         .margin = .all(0),
+        .min_size_content = .{ .h = bar_h },
+        .max_size_content = .height(bar_h),
     });
     defer scrollarea.deinit();
 
     last_top_y_physical = scrollarea.data().rectScale().r.y;
     var infobox = dvui.box(@src(), .{ .dir = .horizontal }, .{
-        .expand = .horizontal,
+        .expand = .both,
         .background = false,
         .padding = .all(0),
         .margin = .all(0),
+        .min_size_content = .{ .h = bar_h },
+        .max_size_content = .height(bar_h),
     });
     defer infobox.deinit();
 
@@ -105,9 +113,26 @@ pub fn draw(_: Infobar) !void {
 
     _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 12 } });
 
-    if (fizzy.editor.activeDoc()) |doc| {
-        doc.owner.drawDocumentInfobar(doc) catch {
-            dvui.log.err("Failed to draw document infobar", .{});
-        };
+    // Remaining width is the plugin slot: shell-sized, clipped, rect handed to the owner.
+    {
+        var plugin_slot = dvui.box(@src(), .{ .dir = .horizontal }, .{
+            .expand = .both,
+            .background = false,
+            .padding = .all(0),
+            .margin = .all(0),
+            .min_size_content = .{ .h = bar_h },
+            .max_size_content = .height(bar_h),
+        });
+        defer plugin_slot.deinit();
+
+        const rect = plugin_slot.data().contentRect();
+        const prev_clip = dvui.clip(plugin_slot.data().contentRectScale().r);
+        defer dvui.clipSet(prev_clip);
+
+        if (fizzy.editor.activeDoc()) |doc| {
+            doc.owner.drawDocumentInfobar(doc, rect) catch {
+                dvui.log.err("Failed to draw document infobar", .{});
+            };
+        }
     }
 }

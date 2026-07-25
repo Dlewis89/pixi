@@ -11,8 +11,8 @@
 //!     ▾ Pixi
 //!
 //! Everything a plugin contributes is still drawn by `PluginSettingsPane.drawField`, so plugin
-//! controls and shell controls look identical — this file only decides *what* is shown and
-//! *where*, never how an individual control renders.
+//! controls and shell controls look identical. This file owns *what* is shown, *where*, and the
+//! per-leaf setting name (with search-match highlighting); control drawers only draw the widget.
 //!
 //! **Search is a data pass, not a draw pass.** `collect` scores every leaf with `core.fuzzy`
 //! before a single widget exists, so a branch whose leaves all missed is simply never drawn (the
@@ -346,22 +346,41 @@ fn drawBranch(
         for (branch.children.items, 0..) |*child, ci| {
             try drawBranch(tree, child, query, searching, ci, .category);
         }
-        try drawLeaves(branch);
+        try drawLeaves(branch, query);
     }
 
     if (!searching) setOpen(branch.key, b.expanded);
 }
 
-/// Leaf controls are drawn by their owner — `explorer/settings.zig`'s per-item function for shell
-/// rows, `PluginSettingsPane.drawField` for plugin rows — so the query never reaches this far;
-/// only branch titles get match highlighting.
-fn drawLeaves(branch: *const Branch) !void {
+/// One setting row: the setting name (match-highlighted while searching), then the control body.
+/// Labels live here so shell and plugin rows share the same chrome; drawers only draw widgets.
+fn drawLeaves(branch: *const Branch, query: *const fuzzy.Query) !void {
     if (branch.failed) |f| {
         drawFailure(f);
         return;
     }
 
     for (branch.leaves.items) |leaf| {
+        var row = dvui.box(@src(), .{ .dir = .vertical }, .{
+            .id_extra = leaf.index,
+            .expand = .horizontal,
+            .background = false,
+            .margin = .{ .y = 2, .h = 2 },
+        });
+        defer row.deinit();
+
+        {
+            var tl = dvui.textLayout(@src(), .{ .break_lines = false }, .{
+                .background = false,
+                .expand = .horizontal,
+                .margin = dvui.Rect.all(0),
+                .padding = dvui.Rect.all(3),
+                .font = dvui.Font.theme(.body),
+            });
+            addHighlighted(tl, leaf.label, query);
+            tl.deinit();
+        }
+
         if (branch.group) |group| {
             group.items[leaf.index].draw();
         } else if (branch.schema) |schema| {

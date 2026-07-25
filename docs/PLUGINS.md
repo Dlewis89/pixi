@@ -417,7 +417,7 @@ plugin gets an Enabled-toggle-only row instead of its fields.
   `documentPath`, `setDocumentPath`, dirty/save indicators. These keep `DocHandle` opaque so the
   file-management plugin never sees a plugin-specific type.
 - **Rendering** — `drawDocument(doc)` (the document's content in a tab/pane),
-  `drawDocumentInfobar(doc)`.
+  `drawDocumentInfobar(doc, rect)` (active-doc status in the shell-sized infobar slot).
 - **Per-frame phases** — `beginFrame`, `prepareFrame`, `tickKeybinds`, `tickOpenDocuments`,
   `tickActiveDocument`, `drawOverlay`, `endFrame`, `needsContinuousRepaint`. A plugin does its own
   domain work *inside* these generic phases (see the lifecycle table below for exactly when each

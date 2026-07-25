@@ -257,17 +257,19 @@ fn drawTabs(self: *Workspace) void {
                     self.tabs_insert_before_index = i;
                 }
 
-                // The owning plugin draws the tab icon for its file types (same hook as the file
-                // tree); the workbench falls back to a generic file glyph.
+                // Same fixed glyph slot as the file tree — plugin drawers use `expand = .ratio`
+                // and expect a reserved rect. Calling them bare in this horizontal tab row lets
+                // ratio+gravity center the artwork in the whole tab instead of a leading icon.
                 const tab_doc_path = doc.owner.documentPath(doc);
                 const tab_icon_color = dvui.themeGet().color(.control, .text);
-                if (!runtime.host().drawFileIcon(std.fs.path.extension(tab_doc_path), tab_doc_path, tab_icon_color)) {
-                    dvui.icon(@src(), "file_icon", icons.tvg.lucide.file, .{
-                        .stroke_color = tab_icon_color,
-                    }, .{
-                        .gravity_y = 0.5,
-                        .padding = dvui.Rect.all(4),
-                    });
+                {
+                    var icon_slot = wdvui.treeRowGlyph(@src(), .{ .gravity_y = 0.5, .margin = .{ .x = 4, .w = 2 } });
+                    defer icon_slot.deinit();
+                    if (!runtime.host().drawFileIcon(std.fs.path.extension(tab_doc_path), tab_doc_path, tab_icon_color)) {
+                        dvui.icon(@src(), "file_icon", icons.tvg.lucide.file, .{
+                            .stroke_color = tab_icon_color,
+                        }, wdvui.treeRowIconOptions(.{}));
+                    }
                 }
 
                 dvui.label(@src(), "{s}", .{std.fs.path.basename(doc.owner.documentPath(doc))}, .{

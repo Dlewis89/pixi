@@ -21,6 +21,9 @@ const Readme = struct {
     /// built-in whose source lives in a subdirectory of the fizzy monorepo). Empty means repo root.
     subpath: []u8,
     io: std.Io,
+    /// Captured at select time so the worker can wake the blocked event loop when the fetch
+    /// finishes (otherwise the UI stays on "Loading…" until an unrelated input event).
+    window: *dvui.Window,
     status: std.atomic.Value(u8) = .init(@intFromEnum(Status.idle)),
     /// Fetched README bytes (app-allocator owned). Written once by the worker before it flips
     /// `status` to `ready` with release ordering; read on the UI thread only after an acquire
@@ -56,7 +59,13 @@ pub fn select(id: []const u8, repo: []const u8, subpath: []const u8) void {
         return;
     };
 
-    current = .{ .id = id_owned, .repo = repo_owned, .subpath = subpath_owned, .io = dvui.io };
+    current = .{
+        .id = id_owned,
+        .repo = repo_owned,
+        .subpath = subpath_owned,
+        .io = dvui.io,
+        .window = dvui.currentWindow(),
+    };
     const self = &current.?;
     self.status.store(@intFromEnum(Status.fetching), .release);
     self.thread = std.Thread.spawn(.{}, worker, .{self}) catch {
@@ -135,6 +144,8 @@ pub fn draw() void {
 }
 
 fn worker(self: *Readme) void {
+    defer dvui.refresh(self.window, @src(), null);
+
     const limit: std.Io.Limit = .limited(repo_asset.max_readme_bytes);
 
     if (self.subpath.len > 0) {

@@ -5,9 +5,9 @@
 //! user's search text against `label` + `keywords` without drawing anything, so a group with no
 //! surviving leaves can be skipped entirely.
 //!
-//! Each `Item.draw` still owns exactly the control body it always had — same widgets, same
-//! `markSettingsDirty()` / apply-side-effect calls. Adding a setting here means adding one entry
-//! and one small function; the tree, the search, and the highlighting come for free.
+//! Each `Item.draw` owns only the control body — `SettingsTree` draws `label` above it (and
+//! highlights matches while searching). Adding a setting here means adding one entry and one
+//! small function; the tree, the search, and the highlighting come for free.
 //!
 //! Plugin settings do **not** live here — those come from `host.settings_schemas` and are drawn
 //! by `PluginSettingsPane` (see `SettingsTree`), so a plugin's controls look identical to these.
@@ -65,7 +65,7 @@ pub const groups = [_]Group{
 
 fn drawTheme() void {
     var dropdown: dvui.DropdownWidget = undefined;
-    dropdown.init(@src(), .{ .label = "Theme" }, .{
+    dropdown.init(@src(), .{}, .{
         .expand = .horizontal,
         .corners = dvui.CornerRect.all(1000),
     });
@@ -100,8 +100,9 @@ fn drawTheme() void {
 }
 
 /// The four font sliders differ only in which settings field they drive, so they share one body.
-fn fontSizeSlider(src: std.builtin.SourceLocation, comptime fmt: []const u8, value: *f32) void {
-    if (dvui.sliderEntry(src, fmt, .{
+/// Format is value-only — `SettingsTree` draws the setting name above the control.
+fn fontSizeSlider(src: std.builtin.SourceLocation, value: *f32) void {
+    if (dvui.sliderEntry(src, "{d:0.0}", .{
         .value = value,
         .interval = 1.0,
         .max = 20.0,
@@ -114,23 +115,23 @@ fn fontSizeSlider(src: std.builtin.SourceLocation, comptime fmt: []const u8, val
 }
 
 fn drawBodyFontSize() void {
-    fontSizeSlider(@src(), "Body: {d:0.0}", &fizzy.editor.settings.font_body_size);
+    fontSizeSlider(@src(), &fizzy.editor.settings.font_body_size);
 }
 
 fn drawHeadingFontSize() void {
-    fontSizeSlider(@src(), "Heading: {d:0.0}", &fizzy.editor.settings.font_heading_size);
+    fontSizeSlider(@src(), &fizzy.editor.settings.font_heading_size);
 }
 
 fn drawTitleFontSize() void {
-    fontSizeSlider(@src(), "Title: {d:0.0}", &fizzy.editor.settings.font_title_size);
+    fontSizeSlider(@src(), &fizzy.editor.settings.font_title_size);
 }
 
 fn drawMonoFontSize() void {
-    fontSizeSlider(@src(), "Monospace: {d:0.0}", &fizzy.editor.settings.font_mono_size);
+    fontSizeSlider(@src(), &fizzy.editor.settings.font_mono_size);
 }
 
 fn drawWindowOpacity() void {
-    if (dvui.sliderEntry(@src(), "Window Opacity: {d:0.01}", .{
+    if (dvui.sliderEntry(@src(), "{d:0.01}", .{
         .value = &if (dvui.themeGet().dark) fizzy.editor.settings.window_opacity_dark else fizzy.editor.settings.window_opacity_light,
         .interval = 0.01,
         .max = 1.0,
@@ -143,7 +144,7 @@ fn drawWindowOpacity() void {
 }
 
 fn drawContentOpacity() void {
-    if (dvui.sliderEntry(@src(), "Content Opacity: {d:0.01}", .{
+    if (dvui.sliderEntry(@src(), "{d:0.01}", .{
         .value = &fizzy.editor.settings.content_opacity,
         .interval = 0.01,
         .max = 1.0,
@@ -159,7 +160,7 @@ fn drawContentOpacity() void {
 
 fn drawHoldMenuDuration() void {
     var hold_menu_ms: f32 = @floatFromInt(fizzy.editor.settings.hold_menu_duration_ms);
-    if (dvui.sliderEntry(@src(), "Context menu hold: {d:0.0} ms", .{
+    if (dvui.sliderEntry(@src(), "{d:0.0} ms", .{
         .value = &hold_menu_ms,
         .interval = 50,
         .max = 1500,
@@ -174,7 +175,7 @@ fn drawHoldMenuDuration() void {
 
 fn drawInputScheme() void {
     var dropdown: dvui.DropdownWidget = undefined;
-    dropdown.init(@src(), .{ .label = "Canvas control scheme" }, .{
+    dropdown.init(@src(), .{}, .{
         .expand = .horizontal,
         .corners = dvui.CornerRect.all(1000),
     });

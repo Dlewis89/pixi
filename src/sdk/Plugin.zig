@@ -135,8 +135,10 @@ pub const VTable = struct {
     // one is registered. Only per-document rendering routes through the vtable below.
     /// Draw an open document (center/workspace region), dispatched via `DocHandle.owner`.
     drawDocument: ?*const fn (state: *anyopaque, doc: DocHandle) anyerror!void = null,
-    /// Draw active-document status into the shell infobar (dimensions, cursor, etc.).
-    drawDocumentInfobar: ?*const fn (state: *anyopaque, doc: DocHandle) anyerror!void = null,
+    /// Draw active-document status into the shell-owned infobar slot. `rect` is the
+    /// natural-space content rect the shell has already sized/clipped — keep drawing
+    /// inside it; do not grow the bar.
+    drawDocumentInfobar: ?*const fn (state: *anyopaque, doc: DocHandle, rect: dvui.Rect) anyerror!void = null,
 
     // ---- shell contributions ----
     contributeMenu: ?*const fn (state: *anyopaque) anyerror!void = null,
@@ -419,8 +421,8 @@ pub fn drawDocument(self: Plugin, doc: DocHandle) !bool {
     return false;
 }
 
-pub fn drawDocumentInfobar(self: Plugin, doc: DocHandle) !void {
-    if (self.vtable.drawDocumentInfobar) |f| try f(self.state, doc);
+pub fn drawDocumentInfobar(self: Plugin, doc: DocHandle, rect: dvui.Rect) !void {
+    if (self.vtable.drawDocumentInfobar) |f| try f(self.state, doc, rect);
 }
 
 pub fn deinit(self: Plugin) void {

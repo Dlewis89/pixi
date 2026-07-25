@@ -61,18 +61,18 @@ pub const ServiceEntry = struct {
     owner: ?*Plugin = null,
 };
 
-/// A file-tree row icon drawer. The workbench file tree calls registered drawers in order at
-/// each file row's icon slot; the first that returns `true` wins, otherwise the workbench draws
-/// a generic filesystem default. This lets the plugin that owns a file type draw its own icon (a
-/// glyph, a thumbnail, anything) instead of the shell hardcoding per-extension icons. `ext` is
-/// the extension including the dot, as on disk (compare case-insensitively); `path` is absolute;
-/// `color` is the row's themed icon color.
+/// A file-type icon drawer. The workbench calls registered drawers in order from each reserved
+/// icon slot (file-tree rows and open-file tabs); the first that returns `true` wins, otherwise
+/// the workbench draws a generic filesystem default. This lets the plugin that owns a file type
+/// draw its own icon (a glyph, a thumbnail, anything) instead of the shell hardcoding
+/// per-extension icons. `ext` is the extension including the dot, as on disk (compare
+/// case-insensitively); `path` is absolute; `color` is the themed icon color.
 ///
-/// **Size is the host's to decide, not yours.** The row reserves a fixed square slot
+/// **Size is the host's to decide, not yours.** Every call site reserves a fixed square slot
 /// (`core.dvui.treeRowGlyph`, sized from the user's font settings) and your drawer runs inside
 /// it. Draw with `expand = .ratio` so your artwork fits that slot at its own aspect ratio; a
-/// hard-coded size or scale makes your rows taller than every other row and pushes their labels
-/// out of alignment with the rest of the tree.
+/// hard-coded size or scale makes tree rows taller than every other row, and drawing without a
+/// reserved slot (e.g. bare in a tab row) lets ratio+gravity center the icon in the whole parent.
 pub const FileIcon = struct {
     owner: ?*Plugin = null,
     ctx: ?*anyopaque = null,
