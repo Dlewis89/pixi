@@ -133,7 +133,11 @@ fn requestRepaint() void {
     wake();
 }
 
-/// Stops nightwatch and frees all tracking entries. Safe if `start` never ran.
+/// Stops nightwatch and frees all tracking entries. Safe if `start` never ran, and safe to call
+/// twice: the maps are reset to `.empty` rather than left as `std.HashMapUnmanaged.deinit`'s
+/// `undefined`, so a late `notifyPathChanged`/`untrack` during shutdown reads an empty map
+/// instead of dereferencing garbage metadata. `Editor.deinit` still clears its
+/// `document_watcher` right after calling this — this is the belt to that suspenders.
 pub fn stop(self: *DocumentWatcher) void {
     if (comptime have_impl) {
         if (self.impl.nw) |*nw| {
@@ -145,6 +149,8 @@ pub fn stop(self: *DocumentWatcher) void {
     while (it.next()) |e| self.gpa.free(e.value_ptr.path);
     self.by_id.deinit(self.gpa);
     self.by_path.deinit(self.gpa);
+    self.by_id = .empty;
+    self.by_path = .empty;
 }
 
 /// Begin watching `doc` if it has a real on-disk path. No-op on wasm / when nightwatch isn't

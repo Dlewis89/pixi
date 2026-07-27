@@ -4198,9 +4198,19 @@ pub fn rawCloseFileID(editor: *Editor, id: u64) !void {
 
 pub fn deinit(editor: *Editor) !void {
     // Stop watchers first, before touching anything they could still be querying —
-    // signals background threads, joins them, and tears down OS watches.
-    if (editor.document_watcher) |*w| w.stop();
-    if (editor.settings_watcher) |*w| w.stop();
+    // signals background threads, joins them, and tears down OS watches. Clearing the optionals
+    // is part of stopping, not tidiness: `stop` frees the watcher's own state, and the rest of
+    // this function still runs code that would otherwise query it — `saveSettingsRaw` below
+    // reaches `writeMergedSettings`' `notifyPathChanged` (only on a real write, which is why
+    // this crashed rarely rather than always).
+    if (editor.document_watcher) |*w| {
+        w.stop();
+        editor.document_watcher = null;
+    }
+    if (editor.settings_watcher) |*w| {
+        w.stop();
+        editor.settings_watcher = null;
+    }
 
     // Tear workspaces down first: `Workspace.deinit` calls back into the owning plugin
     // (e.g. `removeCanvasPane`), so it must run while plugin state is still alive — i.e. before
