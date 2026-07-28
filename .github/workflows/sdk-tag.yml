@@ -76,6 +76,49 @@ jobs:
           git push origin "$tag"
           echo "Pushed $tag"
 
+      - name: Build changelog since previous SDK tag
+        id: changelog
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.ver.outputs.tag }}"
+
+          # Newest sdk-v* tag (other than this one) that is an ancestor of HEAD.
+          prev=""
+          while read -r t; do
+            [[ "$t" == "$tag" ]] && continue
+            if git merge-base --is-ancestor "$t" HEAD 2>/dev/null; then
+              prev="$t"
+              break
+            fi
+          done < <(git tag --list 'sdk-v*' --sort=-v:refname)
+
+          out="${RUNNER_TEMP:-/tmp}/CHANGELOG_SDK.md"
+          echo "file=$out" >> "$GITHUB_OUTPUT"
+          if [[ -z "$prev" ]]; then
+            printf '## Changes\n\nFirst published SDK release — no previous `sdk-v*` tag to diff against.\n' >"$out"
+            echo "No previous SDK tag found."
+          else
+            range="${prev}..HEAD"
+            echo "Changelog range: $range"
+            printf '## Changes since `%s`\n\n' "$prev" >"$out"
+
+            sdk_log=$(git log "$range" --no-merges --format='- %s (%h)' -- sdk src/sdk scripts/pack-sdk.sh)
+            if [[ -n "$sdk_log" ]]; then
+              printf '### SDK\n\n%s\n\n' "$sdk_log" >>"$out"
+            fi
+
+            all_log=$(git log "$range" --no-merges --format='- %s (%h)')
+            if [[ -n "$all_log" ]]; then
+              printf '<details>\n<summary>All commits in this range</summary>\n\n%s\n\n</details>\n\n' "$all_log" >>"$out"
+            fi
+
+            printf '[Full diff](https://github.com/%s/compare/%s...%s)\n' \
+              "${{ github.repository }}" "$prev" "$tag" >>"$out"
+          fi
+
+          cat "$out"
+
       - name: Pack SDK tarball
         shell: bash
         run: |
@@ -117,10 +160,15 @@ jobs:
           # Strip the common leading indent from the YAML-embedded heredoc.
           sed -i 's/^          //' "$notes_file"
 
-          # Idempotent: create the release if missing, else replace the sdk asset.
+          # Append the commit changelog computed against the previous sdk-v* tag.
+          printf '\n---\n\n' >>"$notes_file"
+          cat "${{ steps.changelog.outputs.file }}" >>"$notes_file"
+
+          # Idempotent: create the release if missing, else replace the sdk asset + notes.
           if gh release view "$tag" >/dev/null 2>&1; then
-            echo "Release $tag exists — uploading/replacing asset."
+            echo "Release $tag exists — uploading/replacing asset and refreshing notes."
             gh release upload "$tag" "$asset" --clobber
+            gh release edit "$tag" --notes-file "$notes_file"
           else
             gh release create "$tag" "$asset" \
               --title "Fizzy SDK $version" \

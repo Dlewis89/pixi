@@ -28,7 +28,8 @@
 #   FIZZY_MACOS_SIGN_INSTALLER  - Developer ID Installer identity
 #   FIZZY_MACOS_NOTARY_PROFILE  - notarytool keychain profile name
 #   GITHUB_TOKEN               - for `gh` (or use `gh auth login` once)
-#   FIZZY_RELEASE_NOTES         - free-form notes; default: "Release v<VERSION>"
+#   FIZZY_RELEASE_NOTES         - free-form notes; default: a generated changelog
+#                                 of commits since the previous v* tag
 #   FIZZY_RELEASE_PUBLISH       - if "1", publishes the release (otherwise draft)
 #   FIZZY_RELEASE_SKIP_BUILD    - if "1", skip zig/dotnet checks, msvcup-setup,
 #                                and packageall (expects zig-out/<channel>/ from CI)
@@ -289,7 +290,42 @@ echo "==> Staged ${#uploads[@]} files in $staging"
 
 # ----- create + populate the release ---------------------------------------
 
-notes="${FIZZY_RELEASE_NOTES:-Release $tag}"
+# Notes default to a commit changelog against the previous v* tag. Explicit
+# FIZZY_RELEASE_NOTES still wins; set FIZZY_RELEASE_NOTES="Release $tag" for the
+# old bare one-liner. sdk-v* tags live in a separate namespace and can't match
+# the `v*` glob, so they never show up as the previous app release.
+generate_notes() {
+    local prev="" t
+    while read -r t; do
+        [[ "$t" == "$tag" ]] && continue
+        if git merge-base --is-ancestor "$t" "$tag" 2>/dev/null; then
+            prev="$t"
+            break
+        fi
+    done < <(git tag --list 'v*' --sort=-v:refname)
+
+    if [[ -z "$prev" ]]; then
+        printf 'Release %s\n\nFirst tagged release — no previous `v*` tag to diff against.\n' "$tag"
+        return 0
+    fi
+
+    printf 'Release %s\n\n## What'"'"'s changed since `%s`\n\n' "$tag" "$prev"
+    local log
+    log="$(git log "${prev}..${tag}" --no-merges --format='- %s (%h)')"
+    if [[ -n "$log" ]]; then
+        printf '%s\n\n' "$log"
+    else
+        printf '_No commits between `%s` and `%s`._\n\n' "$prev" "$tag"
+    fi
+
+    local slug
+    slug="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+    if [[ -n "$slug" ]]; then
+        printf '**Full changelog**: https://github.com/%s/compare/%s...%s\n' "$slug" "$prev" "$tag"
+    fi
+}
+
+notes="${FIZZY_RELEASE_NOTES:-$(generate_notes)}"
 
 # If the release already exists, upload missing assets to it (idempotent re-runs).
 if gh release view "$tag" >/dev/null 2>&1; then
