@@ -4,8 +4,8 @@ const dvui = @import("dvui");
 const Dialogs = @This();
 
 // Plugin-owned dialogs (New File, Grid Layout, Export, Flat-raster save warning) are no longer
-// re-exported here. The shell triggers them through plugin vtable hooks / `Host.requestNewDocument`
-// so it never names a plugin's dialog implementation. This hub owns only shell-level dialogs.
+// re-exported here. The fizzy triggers them through plugin vtable hooks / `Host.requestNewDocument`
+// so it never names a plugin's dialog implementation. This hub owns only fizzy-level dialogs.
 pub const UnsavedClose = @import("UnsavedClose.zig");
 pub const FileChangedOnDisk = @import("FileChangedOnDisk.zig");
 pub const AppQuitUnsaved = @import("AppQuitUnsaved.zig");

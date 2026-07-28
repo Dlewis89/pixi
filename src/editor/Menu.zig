@@ -9,6 +9,12 @@ const model = @import("menu_model.zig");
 
 pub var mouse_distance: f32 = std.math.floatMax(f32);
 
+/// TEMPORARY debug knob: draw the in-app dvui menu bar on macOS too, alongside the native
+/// `NSMenu`, so the two can be compared side by side (e.g. Edit menu contents). Not persisted —
+/// resets to off every launch. Toggled from View > "Show DVUI Menu (macOS)"; remove once the
+/// native/dvui menu comparison this exists for is done.
+pub var debug_force_on_macos: bool = false;
+
 pub fn draw() !dvui.App.Result {
     const bg_box = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .background = false, .color_fill = dvui.themeGet().color(.control, .fill) });
     defer bg_box.deinit();
@@ -25,8 +31,8 @@ pub fn draw() !dvui.App.Result {
         dvui.themeSet(theme);
     }
 
-    // The shell owns only the menu bar container + theme; the top-level menus are
-    // plugin (and shell built-in) contributions, drawn in registration order.
+    // Fizzy owns only the menu bar container + theme; the top-level menus are
+    // plugin (and fizzy built-in) contributions, drawn in registration order.
     for (fizzy.editor.host.menus.items) |*menu| {
         if (menu.hidden) continue;
         menu.draw(menu.ctx) catch |err| {
@@ -56,8 +62,20 @@ pub fn drawModelMenu(ctx: ?*anyopaque) anyerror!void {
     const sub: *const model.Submenu = @ptrCast(@alignCast(ctx orelse return));
     const editor = fizzy.editor;
 
+    // Every top-level menu (File/Edit/View/Help) is drawn through this same function at this
+    // same `@src()`s, so without a differentiator dvui sees sibling widgets — the button, the
+    // open-animation, and the floating menu itself — all asking for the identical id (hit on
+    // Windows, where this bar actually draws; macOS uses the native menu instead — see
+    // `Editor.zig`'s "menu is handled natively" check). It surfaces specifically while the mouse
+    // transitions from one open top-level menu to the next, because that's the one moment two of
+    // these subtrees are both live in the same frame (the old menu closing/fading, the new one
+    // opening). `sub`'s address is stable and distinct per entry in `menu_model.menu_bar`, so
+    // it's a cheap unique id_extra for all three without threading an index through the fixed
+    // `MenuContribution.draw` ABI.
+    const extra = @intFromPtr(sub);
     if (menuItem(@src(), sub.title, .{ .submenu = true }, .{
         .expand = .horizontal,
+        .id_extra = extra,
         .color_text = dvui.themeGet().color(.control, .text),
     })) |r| {
         var animator = dvui.animate(@src(), .{
@@ -65,10 +83,11 @@ pub fn drawModelMenu(ctx: ?*anyopaque) anyerror!void {
             .duration = 250_000,
         }, .{
             .expand = .both,
+            .id_extra = extra,
         });
         defer animator.deinit();
 
-        var fw = dvui.floatingMenu(@src(), .{ .from = r }, .{});
+        var fw = dvui.floatingMenu(@src(), .{ .from = r }, .{ .id_extra = extra });
         defer fw.deinit();
 
         for (sub.items, 0..) |item, i| {
@@ -112,8 +131,13 @@ fn drawModelItem(
             }
             const enabled = if (c.enabled) |f| f(editor) else true;
             const hotkey = hotkeyFor(editor, c.id);
+            // The icon lives once, on the registered `Command` (`sdk.Command.icon`) — every
+            // fizzy command is registered there too (`Keybinds.registerCommands`), so this and
+            // `Editor.fizzyDrawMenuItem` (the plugin-section row equivalent) resolve it the same
+            // way instead of each menu item duplicating an icon assignment of its own.
+            const icon: ?[]const u8 = if (editor.host.command(c.id)) |cmd| cmd.icon else null;
 
-            if (menuItemWithHotkey(@src(), c.title.resolve(editor), hotkey, enabled, .{}, .{
+            if (menuItemWithHotkey(@src(), c.title.resolve(editor), icon, hotkey, enabled, .{}, .{
                 .expand = .horizontal,
                 .id_extra = id_extra,
                 .color_text = dvui.themeGet().color(.window, .text),
@@ -176,7 +200,12 @@ fn drawRecentFolders(editor: *Editor, id_extra: usize) !void {
 /// `labelWithKeybind`) *and* swallows the click here — dvui's `MenuItemWidget` has no built-in
 /// disabled state, so without this a "greyed out" item was still fully clickable and silently
 /// ran its action.
-pub fn menuItemWithHotkey(src: std.builtin.SourceLocation, label_str: []const u8, hotkey: dvui.enums.Keybind, enabled: bool, init_opts: dvui.MenuItemWidget.InitOptions, opts: dvui.Options) ?dvui.Rect.Natural {
+///
+/// `icon` is optional TVG bytes (`menu_model.CommandItem.icon`) drawn in a fixed
+/// `treeRowGlyph`-sized slot ahead of the label — reserved even when a particular row has no
+/// icon, so rows with and without one still line up in the same column rather than the label
+/// shifting left to fill the gap.
+pub fn menuItemWithHotkey(src: std.builtin.SourceLocation, label_str: []const u8, icon: ?[]const u8, hotkey: dvui.enums.Keybind, enabled: bool, init_opts: dvui.MenuItemWidget.InitOptions, opts: dvui.Options) ?dvui.Rect.Natural {
     var mi = dvui.menuItem(src, init_opts, opts);
 
     var ret: ?dvui.Rect.Natural = null;
@@ -186,7 +215,14 @@ pub fn menuItemWithHotkey(src: std.builtin.SourceLocation, label_str: []const u8
         }
     }
 
+    // Deinit order matters to dvui's widget stack (strictly LIFO, parent last): `row` is a child
+    // of `mi`, so it must close before `mi.deinit()` below, not after — a `defer row.deinit()`
+    // here would fire at function exit, *after* the explicit `mi.deinit()` call, closing the
+    // parent before its child and panicking ("widget is not closed within its parent").
+    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .id_extra = opts.id_extra orelse 0 });
+    fizzy.dvui.menuRowIcon(icon, opts.color_text orelse dvui.themeGet().color(.window, .text), enabled, opts.id_extra orelse 0);
     fizzy.dvui.labelWithKeybind(label_str, hotkey, enabled, opts, opts);
+    row.deinit();
 
     mi.deinit();
 
@@ -260,10 +296,32 @@ pub fn menuItemWithChevron(src: std.builtin.SourceLocation, label_str: []const u
 }
 
 /// Draw registered menu sections for an open parent menu.
+///
+/// Matches through `menu_model.menuMatches` rather than a plain `eql`, so a plugin section
+/// registered under one of a menu's legacy alias ids (e.g. `"workbench.menu.file"`, still a
+/// published contract per `Submenu.aliases`'s doc comment) is found here too. The native macOS
+/// builder (`backend_native.zig`'s `resolveBuiltinNativeMenu`) already resolved aliases for its
+/// own leaf items; this used to be the one place in the menu that didn't, so a plugin section
+/// registered under a pre-rename id (pixi's Edit-menu "Grid Layout" section, back when Edit's id
+/// was still `shell.menu.edit`) appeared in the native bar but silently never drew in this
+/// in-app one.
+///
+/// Draws a single separator ahead of the whole group, not one per section (or per row within a
+/// section — `Editor.fizzyDrawMenuItem`, the widget every section's `draw` goes through, no
+/// longer draws its own): now that a section draws its row(s) unconditionally rather than
+/// hiding them for the wrong document (see `Editor.fizzyDrawMenuItem`'s doc comment), the Edit
+/// menu can carry three of these at once (pixi's Transform, pixi's Grid Layout, text's Format
+/// Document), and a separator before each made every greyed-out row look like its own group.
 pub fn drawMenuSections(parent_menu_id: []const u8) !void {
+    const sub = model.submenuFor(parent_menu_id) orelse return;
+    var drew_separator = false;
     for (fizzy.editor.host.menu_sections.items) |*section| {
         if (section.hidden) continue;
-        if (!std.mem.eql(u8, section.parent_menu_id, parent_menu_id)) continue;
+        if (!model.menuMatches(sub, section.parent_menu_id)) continue;
+        if (!drew_separator) {
+            _ = dvui.separator(@src(), .{ .expand = .horizontal });
+            drew_separator = true;
+        }
         section.draw(section.ctx) catch |err| {
             dvui.log.err("Menu section '{s}' failed: {any}", .{ section.id, err });
         };

@@ -8,7 +8,7 @@
 //! drifted: the macOS View menu said "Show Explorer" even when the explorer was open, and
 //! Recent Folders existed only in the dvui menu.
 //!
-//! An item names a **command** and nothing else — see `Keybinds.shell_commands`. Titles,
+//! An item names a **command** and nothing else — see `Keybinds.fizzy_commands`. Titles,
 //! enablement and shortcuts are either declared here once or derived from the command, never
 //! restated per platform.
 
@@ -46,7 +46,7 @@ pub const CommandItem = struct {
     /// Registered command id. `Menu.zig` and the menu-bar click path both just run this.
     id: []const u8,
     title: Title,
-    /// SF Symbol name for the macOS item. dvui rows don't draw icons today.
+    /// SF Symbol name for the macOS item.
     sf_symbol: ?[:0]const u8 = null,
     /// Hidden entirely when false. The dvui menu is immediate-mode so it simply skips the row;
     /// AppKit menus are retained, so the native side disables the item instead of rebuilding
@@ -65,15 +65,17 @@ pub const CommandItem = struct {
 };
 
 pub const Submenu = struct {
-    /// Host `MenuContribution` id. Namespaced `fizzy.` like every other shell-owned id — the
-    /// commands (`fizzy.copy`), the pseudo-plugin (`.id = "fizzy"`), all of it. These were
-    /// `shell.menu.*` (and, for File, `workbench.menu.file`, a leftover from when the File menu
-    /// really was a workbench contribution), which meant the same owner went by three names.
+    /// Host `MenuContribution` id. Namespaced `fizzy.` like every other fizzy-owned id — the
+    /// commands (`fizzy.copy`), the pseudo-plugin (`.id = "fizzy"`), all of it. Edit/View/Help
+    /// used to be `shell.menu.*` — that spelling has been fully retired (no alias kept; pixi,
+    /// the one plugin that targeted it, was updated to `fizzy.menu.edit`).
     id: []const u8,
-    /// Ids this menu used to have. Plugins target a menu by `parent_menu_id`, and that is a
-    /// published contract — `sdk/regions.zig` documents the old spellings and shipped plugins
-    /// use them — so renaming without accepting the old names would silently drop a
-    /// third-party plugin's menu section with no error anywhere.
+    /// Ids this menu used to have, still accepted alongside the current one. Plugins target a
+    /// menu by `parent_menu_id`, and that is a published contract — `sdk/regions.zig` documents
+    /// the old spellings and shipped plugins use them — so renaming without accepting the old
+    /// names would silently drop a third-party plugin's menu section with no error anywhere.
+    /// (File's `workbench.menu.file` is the one alias still live, from when File really was a
+    /// workbench contribution.)
     aliases: []const []const u8 = &.{},
     title: [:0]const u8,
     items: []const Item,
@@ -121,14 +123,13 @@ fn canRedo(editor: *Editor) bool {
     return doc.owner.canRedo(doc);
 }
 
-fn hasCopy(editor: *Editor) bool {
-    return editor.activeDocHasCommand("copy");
-}
-
-fn hasPaste(editor: *Editor) bool {
-    return editor.activeDocHasCommand("paste");
-}
-
+/// No `visible` predicate alongside these: `native_always_enabled` below means the native side
+/// never even evaluates one for Copy/Paste (`FizzyNativeMenuActionEnabled` returns true before
+/// reaching its own `visible` check), so the native Edit menu always shows both rows, greyed or
+/// not. A `visible` here that could hide the row — like the `activeDocHasCommand` check this
+/// used to be — has no native counterpart and previously made the two menus disagree (no active
+/// document, e.g. at launch, hid them from this bar while the native one kept showing them).
+///
 /// Mirrors `Keybinds.cmdCopyEnabled`/`cmdPasteEnabled`: the document owner reports its verb
 /// enabled only while its own editor holds focus, so a focused non-document text input is the
 /// other case where Edit > Copy/Paste still does something (`Keybinds.clipboardVerb`).
@@ -142,6 +143,16 @@ fn pasteEnabled(editor: *Editor) bool {
 
 fn explorerTitle(editor: *Editor) [:0]const u8 {
     return if (editor.explorer.closed) "Show Explorer" else "Hide Explorer";
+}
+
+/// TEMPORARY: only meaningful on macOS, where the in-app dvui menu bar is normally suppressed
+/// in favor of the native one — see `Menu.debug_force_on_macos`.
+fn isMacOSOnly(_: *Editor) bool {
+    return fizzy.platform.isMacOS();
+}
+
+fn dvuiMenuDebugTitle(_: *Editor) [:0]const u8 {
+    return if (Editor.Menu.debug_force_on_macos) "Hide DVUI Menu (macOS)" else "Show DVUI Menu (macOS)";
 }
 
 // ---- the menu bar -----------------------------------------------------------------------------
@@ -166,7 +177,6 @@ const edit_items = [_]Item{
         .id = "fizzy.copy",
         .title = .{ .static = "Copy" },
         .sf_symbol = "doc.on.doc",
-        .visible = hasCopy,
         .enabled = copyEnabled,
         .native_always_enabled = true,
     } },
@@ -174,15 +184,14 @@ const edit_items = [_]Item{
         .id = "fizzy.paste",
         .title = .{ .static = "Paste" },
         .sf_symbol = "doc.on.clipboard",
-        .visible = hasPaste,
         .enabled = pasteEnabled,
         .native_always_enabled = true,
     } },
     .separator,
     .{ .command = .{ .id = "fizzy.undo", .title = .{ .static = "Undo" }, .sf_symbol = "arrow.uturn.backward", .enabled = canUndo } },
     .{ .command = .{ .id = "fizzy.redo", .title = .{ .static = "Redo" }, .sf_symbol = "arrow.uturn.forward", .enabled = canRedo } },
-    // Transform / Grid Layout are pixel-art concepts, not shell ones — pixi parents its own
-    // section here rather than the shell knowing about them.
+    // Transform / Grid Layout are pixel-art concepts, not fizzy's own — pixi parents its own
+    // section here rather than fizzy knowing about them.
     .{ .plugin_section = "fizzy.menu.edit" },
 };
 
@@ -191,6 +200,10 @@ const view_items = [_]Item{
     .{ .plugin_section = "fizzy.menu.view" },
     .separator,
     .{ .command = .{ .id = "fizzy.showDvuiDemo", .title = .{ .static = "Show DVUI Demo" } } },
+    // TEMPORARY: comparison toggle for the native-vs-dvui macOS menu bar — see
+    // `Menu.debug_force_on_macos`. `visible` keeps it out of the Windows/Linux View menu, where
+    // the dvui bar already always draws and the toggle would do nothing.
+    .{ .command = .{ .id = "fizzy.debugToggleDvuiMenuOnMacOS", .title = .{ .dynamic = dvuiMenuDebugTitle }, .visible = isMacOSOnly } },
 };
 
 const help_items = [_]Item{
@@ -203,9 +216,9 @@ const help_items = [_]Item{
 
 pub const menu_bar = [_]Submenu{
     .{ .id = "fizzy.menu.file", .aliases = &.{"workbench.menu.file"}, .title = "File", .items = &file_items },
-    .{ .id = "fizzy.menu.edit", .aliases = &.{"shell.menu.edit"}, .title = "Edit", .items = &edit_items },
-    .{ .id = "fizzy.menu.view", .aliases = &.{"shell.menu.view"}, .title = "View", .items = &view_items },
-    .{ .id = "fizzy.menu.help", .aliases = &.{"shell.menu.help"}, .title = "Help", .items = &help_items },
+    .{ .id = "fizzy.menu.edit", .title = "Edit", .items = &edit_items },
+    .{ .id = "fizzy.menu.view", .title = "View", .items = &view_items },
+    .{ .id = "fizzy.menu.help", .title = "Help", .items = &help_items },
 };
 
 /// Whether a plugin's `parent_menu_id` refers to `sub`, under its current id or a legacy one.

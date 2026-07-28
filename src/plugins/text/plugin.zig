@@ -4,6 +4,7 @@
 const std = @import("std");
 const sdk = @import("fizzy_sdk");
 const dvui = @import("dvui");
+const icons = @import("icons");
 const State = @import("src/State.zig");
 const Document = @import("src/Document.zig");
 const TextEditor = @import("src/TextEditor.zig");
@@ -14,7 +15,7 @@ const DocHandle = sdk.DocHandle;
 /// identity, not duplicated as string literals here.
 pub const plugin_options = @import("fizzy_plugin_options");
 
-/// This plugin's stable id — the single source of truth other modules (e.g. the shell's
+/// This plugin's stable id — the single source of truth other modules (e.g. fizzy's
 /// `Editor.isBundledPluginId`) read instead of retyping the string.
 pub const plugin_id = plugin_options.id;
 
@@ -34,7 +35,7 @@ var plugin: sdk.Plugin = .{
 const vtable: sdk.Plugin.VTable = .{
     .deinit = deinit,
     .fileTypePriority = fileTypePriority,
-    // document staging buffer (shell allocates, plugin fills, then registers)
+    // document staging buffer (fizzy allocates, plugin fills, then registers)
     .documentStackSize = documentStackSize,
     .documentStackAlign = documentStackAlign,
     .loadDocument = loadDocument,
@@ -48,7 +49,7 @@ const vtable: sdk.Plugin.VTable = .{
     .documentPtr = documentPtr,
     .documentByPath = documentByPath,
     .unregisterDocument = unregisterDocument,
-    // document metadata (shell/workbench routing)
+    // document metadata (fizzy/workbench routing)
     .documentGrouping = documentGrouping,
     .setDocumentGrouping = setDocumentGrouping,
     .documentPath = documentPath,
@@ -89,7 +90,7 @@ pub fn register(host: *sdk.Host) !void {
     try host.registerPlugin(&plugin);
     // Loaded-only settings UI (see `docs/PLUGIN_MANIFEST_PLAN.md`): the schema lives in the
     // Host's registry only while this plugin stays registered. Registered directly against
-    // `&st.settings`, so the shell's pane edits land straight on the live struct — no
+    // `&st.settings`, so fizzy's pane edits land straight on the live struct — no
     // `settingsChanged` sync hook needed.
     try st.registerSettings(host, &plugin);
     try host.registerFileIcon(.{ .owner = &plugin, .draw = drawFileIcon });
@@ -113,10 +114,11 @@ pub fn register(host: *sdk.Host) !void {
         .title = "Format Document",
         .run = cmdFormat,
         .isEnabled = cmdFormatEnabled,
+        .icon = icons.tvg.lucide.@"align-left",
     });
 
     // "Format Document" is only meaningful when a language plugin claims the active
-    // document's extension (today, `zig` via zls) — inject it into the shell's existing
+    // document's extension (today, `zig` via zls) — inject it into fizzy's existing
     // "Edit" menu (in-app + native) rather than showing a permanently-greyed generic verb.
     try host.registerMenuSection(.{
         .id = "text.menu.edit_section",
@@ -338,10 +340,10 @@ fn canRedoDocument(_: *anyopaque, handle: DocHandle) bool {
 
 // ---- copy / paste commands -----------------------------------------------------
 //
-// Both report enabled only while this editor holds keyboard focus. That is the shell's
+// Both report enabled only while this editor holds keyboard focus. That is fizzy's
 // discriminator for routing a clipboard verb here versus to another focused text input — a
 // search box, the Output Panel — which it otherwise has no way to tell apart (see
-// `Keybinds.clipboardVerb` in the shell, and `Document.editor_focused`). Reporting enabled
+// `Keybinds.clipboardVerb` in fizzy, and `Document.editor_focused`). Reporting enabled
 // while focus is elsewhere would make Copy in that search box copy this document instead.
 
 fn cmdCopyEnabled(state: *anyopaque) bool {
@@ -398,17 +400,18 @@ fn formatDocument(doc: *Document) void {
     doc.pending_sel = .collapsed(restore_cursor);
 }
 
-/// In-app "Edit" menu section (see `Host.registerMenuSection`) — only draws while the active
-/// document belongs to this plugin and a language provider can format its extension, so the
-/// item disappears entirely rather than sitting there disabled.
+/// In-app "Edit" menu section (see `Host.registerMenuSection`) — always drawn; `Host.drawMenuItem`
+/// greys the row itself by reading the command's registered `isEnabled` (`cmdFormatEnabled`
+/// below), so this no longer has to early-return to keep the row from being a permanently-live
+/// no-op for a non-formattable document. That early return used to make the row disappear
+/// entirely here while the *native* macOS menu — a static bar with no per-row enabled hook —
+/// kept showing it regardless, so the two disagreed on every document that couldn't format.
 ///
 /// Draws via `Host.drawMenuItem` rather than calling `dvui.menuItem()`/`dvui.separator()`
 /// directly — see that function's doc comment for why a menu section contribution can't safely
 /// touch dvui's menu widgets itself.
 fn drawEditMenuSection(ctx: ?*anyopaque) anyerror!void {
     _ = ctx;
-    if (!cmdFormatEnabled(plugin.state)) return;
-
     if (sdk.host().drawMenuItem("Format Document", sdk.Plugin.commandId("text", "format"))) {
         sdk.host().runCommand(sdk.Plugin.commandId("text", "format")) catch |err| {
             dvui.log.err("text: format command failed: {any}", .{err});
@@ -417,9 +420,9 @@ fn drawEditMenuSection(ctx: ?*anyopaque) anyerror!void {
 }
 
 /// The native macOS Edit menu is a static bar rebuilt only on plugin load/unload, so this item
-/// is always present — this guard is what actually keeps it inert for a non-formattable
-/// document, matching the in-app menu's behavior (mirrors `pixi`'s native Transform/Grid
-/// Layout items).
+/// is always present; the native menu has no per-row enabled hook to grey it, so this guard is
+/// what actually keeps it inert for a non-formattable document (mirrors `pixi`'s native
+/// Transform/Grid Layout items).
 fn nativeFormat(_: ?*anyopaque) anyerror!void {
     if (!cmdFormatEnabled(plugin.state)) return;
     try sdk.host().runCommand(sdk.Plugin.commandId("text", "format"));
@@ -427,7 +430,7 @@ fn nativeFormat(_: ?*anyopaque) anyerror!void {
 
 /// Resolves the currently-focused document, but only when it belongs to this plugin — a
 /// `Command`'s `run`/`isEnabled` only receive the plugin's own opaque `state`, not a doc, so
-/// they always need to ask the shell which document is active.
+/// they always need to ask fizzy which document is active.
 fn activeTextDoc(state: *anyopaque) ?*Document {
     const handle = sdk.host().activeDoc() orelse return null;
     if (handle.owner != &plugin) return null;

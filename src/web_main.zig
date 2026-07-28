@@ -38,9 +38,7 @@ comptime {
 
     // The big ones: Editor + App. Type-level reference only — passes because Zig
     // doesn't fully analyze function bodies until they're actually wired into a
-    // reachable call (e.g. assigned to a runtime fn-pointer field). A probe
-    // wiring these as `dvui_app.initFn/frameFn/deinitFn` surfaced 10 concrete
-    // errors — see WEB_PORT_PLAN.md "next session inventory".
+    // reachable call (e.g. assigned to a runtime fn-pointer field)\
     _ = fizzy.Editor;
     _ = fizzy.App;
 }

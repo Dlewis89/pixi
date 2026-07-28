@@ -1,6 +1,6 @@
 # Workbench
 
-Built-in Fizzy plugin. Workbench is the shell around every other plugin: it owns the **Files**
+Built-in Fizzy plugin. Workbench is the frame every other plugin's content sits inside: it owns the **Files**
 sidebar (browsing and opening files from the current folder) and the **workspace** center — the
 tabbed/paned area where open documents (from Workbench itself or from any other plugin, like
 Pixi) are laid out and switched between.

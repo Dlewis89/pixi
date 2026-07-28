@@ -5,7 +5,7 @@
 //! - **Files** (default, `mod+p`): fuzzy search every file under the project folder, with the
 //!   same file-type icons the explorer uses. Selecting one opens it.
 //! - **Commands** (`>` prefix, or `mod+shift+p` which just seeds the entry with `>`): fuzzy
-//!   search registered commands. Document verbs (Copy/Paste/…) are flattened to the shell
+//!   search registered commands. Document verbs (Copy/Paste/…) are flattened to fizzy
 //!   forwarder that would actually run — see `document_verbs` / `shouldShowCommand`.
 //!
 //! Mode is derived from the text rather than held as state, so backspacing over the `>` slides
@@ -250,7 +250,19 @@ pub fn invalidate(self: *CommandPalette) void {
 
 const Row = union(Mode) {
     files: []const u8, // absolute path
-    commands: struct { id: []const u8, title: []const u8, enabled: bool },
+    commands: struct {
+        id: []const u8,
+        title: []const u8,
+        /// Owning plugin's `display_name` — "Pixi" for `pixi.packProject`, "Fizzy" for the
+        /// fizzy's own. Drawn dimmed and mono *beneath* the title so a command's provenance is
+        /// visible without decoding its id, and without varying-width sources knocking the
+        /// titles out of alignment.
+        source: ?[]const u8,
+        enabled: bool,
+        /// TVG icon bytes off the registered `Command` (`sdk.Command.icon`) — the same one the
+        /// menu bar draws for this command, so a row looks the same wherever it's reachable from.
+        icon: ?[]const u8,
+    },
 };
 
 fn collectFileRows(self: *CommandPalette, editor: *Editor, query: *const fuzzy.Query) []Row {
@@ -306,11 +318,16 @@ fn collectCommandRows(editor: *Editor, query: *const fuzzy.Query) []Row {
     var hits: std.ArrayListUnmanaged(fuzzy.Ranked(usize)) = .empty;
     for (editor.host.commands.items, 0..) |c, i| {
         if (!shouldShowCommand(editor, c.id)) continue;
-        // Match against the title *and* the id, so both "Save All" and "fizzy.saveAll" find it.
+        // Match against the title, the id, *and* the owning plugin's name, so "Save All",
+        // "fizzy.saveAll" and "pixi" (to list everything pixi contributes) all find rows.
         const score = if (query.isEmpty())
             @as(f64, 0)
         else
-            (fuzzy.scoreBest(&.{ c.title, c.id }, query, .{ .plain = true }) orelse continue);
+            (fuzzy.scoreBest(
+                if (c.owner) |o| &.{ c.title, c.id, o.display_name } else &.{ c.title, c.id },
+                query,
+                .{ .plain = true },
+            ) orelse continue);
         hits.append(arena, .{ .item = i, .score = score, .tie = c.title.len }) catch break;
     }
     fuzzy.sort(usize, hits.items);
@@ -322,7 +339,9 @@ fn collectCommandRows(editor: *Editor, query: *const fuzzy.Query) []Row {
         rows.append(arena, .{ .commands = .{
             .id = c.id,
             .title = c.title,
+            .source = if (c.owner) |o| o.display_name else null,
             .enabled = editor.host.commandEnabled(c.id),
+            .icon = c.icon,
         } }) catch break;
     }
     return rows.items;
@@ -413,7 +432,7 @@ pub fn draw(self: *CommandPalette, editor: *Editor) void {
     self.fw_rect.w = w;
     if (self.fw_rect.h == 0) self.fw_rect.h = 1;
 
-    // Same shell as Grid Layout / other dialogs: modal floating window focuses its subwindow
+    // Same fizzy as Grid Layout / other dialogs: modal floating window focuses its subwindow
     // (so the text entry can receive keys) and paints a black scrim via `color_text = .black`.
     fizzy.dvui.modal_dim_titlebar = true;
     // Scrim tracks the reveal, so the dim arrives and leaves with the panel instead of snapping
@@ -439,7 +458,7 @@ pub fn draw(self: *CommandPalette, editor: *Editor) void {
         // Drives the modal dim fill (`options.color(.text)` + alpha) — must be black like dialogs,
         // not theme text (which is light on dark themes and looked wrong).
         .color_text = .black,
-        .color_fill = theme.color(.content, .fill).opacity(0.85),
+        .color_fill = theme.color(.content, .fill).opacity(0.95),
         .corners = dvui.CornerRect.all(8),
         .padding = dvui.Rect.all(6),
         .border = .all(0),
@@ -692,16 +711,49 @@ fn drawRow(
         },
         .commands => |c| {
             const color = if (c.enabled) text_color else text_color.opacity(0.4);
-            wdvui.labelHighlighted(@src(), c.title, query, true, .{
-                .gravity_y = 0.5,
-                .padding = .{ .x = 4, .y = 0, .w = 6, .h = 0 },
-                .color_text = color,
-                .expand = .none,
-            });
-            if (shortcutFor(editor, c.id)) |keys| {
-                dvui.label(@src(), "{s}", .{keys}, .{
+            // Same fixed glyph slot the menu bar uses for this command's icon (`Menu.zig`'s
+            // `menuRowIcon`) — reserved even when `c.icon` is null, so rows with and without an
+            // icon still line up in the same column.
+            wdvui.menuRowIcon(c.icon, text_color, c.enabled, i);
+            // Title over source, stacked — the same shape a settings row uses for its name and
+            // the key beneath it (`SettingRow.header`). Sitting side by side, a source of varying
+            // width pushed every title's neighbour out of line; stacked, the titles all start on
+            // the same left edge and the row still reads as one item.
+            {
+                var stack = dvui.box(@src(), .{ .dir = .vertical }, .{
                     .gravity_y = 0.5,
-                    .gravity_x = 1.0,
+                    .background = false,
+                    .padding = .{ .x = 4, .w = 6 },
+                    .expand = .none,
+                });
+                defer stack.deinit();
+
+                wdvui.labelHighlighted(@src(), c.title, query, true, .{
+                    .margin = dvui.Rect.all(0),
+                    .padding = dvui.Rect.all(0),
+                    .color_text = color,
+                    .expand = .none,
+                });
+                // Dimmed provenance in the mono face — highlighted too, so querying "pixi"
+                // lights up the source rather than looking like a miss on the title.
+                if (c.source) |src| {
+                    wdvui.labelHighlighted(@src(), src, query, true, .{
+                        .margin = dvui.Rect.all(0),
+                        .padding = dvui.Rect.all(0),
+                        .font = dvui.Font.theme(.mono).larger(-1),
+                        .color_text = color.opacity(0.5),
+                        .expand = .none,
+                    });
+                }
+            }
+            if (shortcutFor(editor, c.id)) |keys| {
+                // `expand = .horizontal` hands the label every pixel left in the row, so the
+                // *widget* already ends at the right edge — but the glyphs inside it are laid
+                // out from its left, which left-justified the keys right after the title. Text
+                // alignment is `LabelWidget.InitOptions.align_x`, not `opts.gravity_x` (that
+                // places the widget in its parent), so this needs `labelEx` to flush them right.
+                dvui.labelEx(@src(), "{s}", .{keys}, .{ .align_x = 1.0 }, .{
+                    .gravity_y = 0.5,
                     .expand = .horizontal,
                     .color_text = text_color.opacity(0.55),
                 });

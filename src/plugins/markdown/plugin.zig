@@ -4,7 +4,7 @@ const dvui = @import("dvui");
 const State = @import("src/State.zig").State;
 const md = @import("src/markdown.zig");
 
-/// Re-exported for the shell's own use of the preview renderer outside this plugin's own
+/// Re-exported for fizzy's own use of the preview renderer outside this plugin's own
 /// vtable/service surface (e.g. `src/editor/readme.zig` rendering a fetched plugin README) —
 /// see `docs/PLUGIN_MANIFEST_PLAN.md`'s "static module root" decision.
 pub const Preview = md.Preview;
@@ -16,7 +16,7 @@ pub const drawPreviewForDocument = md.drawPreviewForDocument;
 /// identity, not duplicated as string literals here.
 pub const plugin_options = @import("fizzy_plugin_options");
 
-/// This plugin's stable id — the single source of truth other modules (e.g. the shell's
+/// This plugin's stable id — the single source of truth other modules (e.g. fizzy's
 /// `Editor.isBundledPluginId`) read instead of retyping the string. Distinct from
 /// `language_support.id` below, which happens to share the string but names the *language*
 /// this plugin's `LanguageSupport` provider handles, not the plugin itself.

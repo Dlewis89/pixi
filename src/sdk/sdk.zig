@@ -22,7 +22,7 @@ pub const LanguageSupport = language.LanguageSupport;
 pub const TreeSitterHighlight = language.TreeSitterHighlight;
 pub const HighlightStyle = language.HighlightStyle;
 
-/// Shell region contribution types (sidebar / bottom / center / menu / settings).
+/// Fizzy region contribution types (sidebar / bottom / center / menu / settings).
 pub const regions = @import("regions.zig");
 pub const SidebarView = regions.SidebarView;
 pub const BottomView = regions.BottomView;
@@ -32,7 +32,7 @@ pub const MenuSectionContribution = regions.MenuSectionContribution;
 pub const Command = regions.Command;
 pub const menu = @import("menu.zig");
 
-/// Shell-provided read/utility surface plugins reach through the `Host`
+/// Fizzy-provided read/utility surface plugins reach through the `Host`
 /// (arena, folder, shared settings, dirty-marking).
 pub const EditorAPI = @import("EditorAPI.zig");
 pub const SaveDialogFilter = EditorAPI.SaveDialogFilter;
@@ -43,7 +43,7 @@ pub const WorkbenchPaneView = WorkbenchPane.WorkbenchPaneView;
 pub const pane_layout = @import("pane_layout.zig");
 
 /// Host-injected runtime: `sdk.allocator()` (the persistent host allocator) and
-/// `sdk.host()` (the shell `*Host`). The dylib entry injects these before `register`;
+/// `sdk.host()` (fizzy `*Host`). The dylib entry injects these before `register`;
 /// plugin code reads them directly, with no per-plugin storage file.
 pub const allocator = @import("runtime.zig").allocator;
 pub const host = @import("runtime.zig").host;
@@ -77,5 +77,5 @@ pub const dylib = @import("dylib.zig");
 pub const fingerprint = @import("fingerprint.zig");
 /// Dvui global injection for loaded plugin images.
 pub const dvui_context = @import("dvui_context.zig");
-/// Host thunks that forward plugin proxy draws to the shell backend.
+/// Host thunks that forward plugin proxy draws to fizzy backend.
 pub const render_bridge = @import("render_bridge.zig");

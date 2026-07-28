@@ -138,7 +138,10 @@ pub fn draw() void {
         }),
         .ready => {
             const bytes = c.bytes orelse return;
-            markdown.drawPreview(&c.preview, bytes, repo_asset.gpa(), .{ .io = c.io });
+            // Transparent — the store's detail page draws its own background behind this
+            // (matching every other pane in the app); without this the preview's own scroll
+            // area painted a visibly different `.content`-styled fill on top of it.
+            markdown.drawPreview(&c.preview, bytes, repo_asset.gpa(), .{ .io = c.io, .background = false });
         },
     }
 }

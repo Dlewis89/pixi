@@ -39,7 +39,7 @@ font_mono_size: f32 = 8,
 window_opacity_dark: f32 = 0.7,
 window_opacity_light: f32 = 0.3,
 
-/// Opacity of the content area (also drives plugin panes that match the shell chrome).
+/// Opacity of the content area (also drives plugin panes that match fizzy chrome).
 content_opacity: f32 = 0.7,
 
 /// Canvas zoom/pan control scheme shared by the image viewer, pixi, and any other
@@ -119,7 +119,7 @@ pub fn freeParsed(allocator: std.mem.Allocator, parsed: Settings) void {
 /// Unlike `load`, this returns the raw parse error on failure instead of falling back to
 /// defaults — defaulting is only correct when there's no existing live state to fall back *to*
 /// (startup); `Editor.reconcileExternalSettingsChange` (external hand-edit reconciliation, R11)
-/// has existing state and must not let a transient torn-write read reset every shell field and
+/// has existing state and must not let a transient torn-write read reset every fizzy field and
 /// every plugin's settings. Caller frees the result with `freeParsed` (not `Settings.deinit`,
 /// which owns the live value's long-lived `theme`).
 pub fn parseOnly(allocator: std.mem.Allocator, data: [:0]const u8) !Settings {
@@ -138,10 +138,10 @@ fn fieldEqual(comptime FT: type, a: FT, b: FT) bool {
     };
 }
 
-/// Serialize the shell's own fields as `.{ ...shell fields... }`, emitting **only the fields that
+/// Serialize fizzy's own fields as `.{ ...fizzy fields... }`, emitting **only the fields that
 /// differ from the declared defaults above** — the same non-default-only rule plugin settings
 /// follow (`sdk.settings.Schema(T).diffSerialize`, R12 in docs/PLUGIN_MANIFEST_PLAN.md), so both
-/// halves of `settings.zon` record just what the user actually changed. An untouched shell
+/// halves of `settings.zon` record just what the user actually changed. An untouched fizzy
 /// serializes to `.{}`; a field hand-written back at its default drops out on the next write.
 /// Reading back is unaffected: `load`/`parseOnly` fill every missing field from these same
 /// defaults (see `freeParsed` for the one ownership wrinkle that creates).
@@ -150,7 +150,7 @@ fn fieldEqual(comptime FT: type, a: FT, b: FT) bool {
 /// `.plugins = .{ .<id> = .{...}, ... }` field spliced on afterward by
 /// `Editor.composeSettingsText`/`SettingsPluginsZon.composeMergedText` (R10).
 /// `Editor.writeMergedSettings` is the only writer of `settings.zon` — there is no standalone
-/// shell-only save path anymore, since writing this half alone would silently drop the
+/// fizzy-only save path anymore, since writing this half alone would silently drop the
 /// `.plugins` half.
 pub fn serialize(settings: *const Settings, allocator: std.mem.Allocator) ![]u8 {
     @setEvalBranchQuota(10_000);

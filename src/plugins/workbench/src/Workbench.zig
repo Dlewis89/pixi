@@ -24,7 +24,7 @@ pub const Workbench = @This();
 allocator: std.mem.Allocator,
 decorators: std.ArrayListUnmanaged(BranchDecorator) = .empty,
 
-/// Workspaces keyed by tab-grouping id (owned here, not on the shell Editor).
+/// Workspaces keyed by tab-grouping id (owned here, not on fizzy Editor).
 workspaces: std.AutoArrayHashMapUnmanaged(u64, Workspace) = .empty,
 open_workspace_grouping: u64 = 0,
 grouping_id_counter: u64 = 0,
@@ -164,12 +164,12 @@ pub fn activeWorkspaceCanvasRectPhysical(self: *Workbench) ?dvui.Rect.Physical {
     return workspace.canvas_rect_physical;
 }
 
-/// Build the `workbench-api` service. `host_ctx` is the shell `*Host`.
+/// Build the `workbench-api` service. `host_ctx` is fizzy `*Host`.
 pub fn initService(self: *Workbench, host_ctx: *sdk.Host) void {
     self.api = .{ .ctx = host_ctx, .vtable = &service_vtable };
 }
 
-/// Register the decorations the shell ships with. Called once after the editor is
+/// Register the decorations fizzy ships with. Called once after the editor is
 /// constructed. (Plugins register their own via `registerBranchDecorator`.)
 pub fn registerBuiltins(self: *Workbench) !void {
     try self.registerBranchDecorator(.{ .draw = &drawUnsavedDot });

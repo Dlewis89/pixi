@@ -1,10 +1,10 @@
 //! The text plugin's user settings. Each field is a self-describing `sdk.settings.Value` cell:
-//! payload type, default, and the description the shell shows under the setting's name. Read a
+//! payload type, default, and the description fizzy shows under the setting's name. Read a
 //! value with `.get()`.
 const sdk = @import("fizzy_sdk");
 const settings = sdk.settings;
 
-/// Discrete tab widths shown as a dropdown in the shell settings pane.
+/// Discrete tab widths shown as a dropdown in fizzy settings pane.
 pub const TabSize = enum(u8) {
     @"2" = 2,
     @"4" = 4,
@@ -26,6 +26,14 @@ tab_size: settings.Value(TabSize, .{
 auto_close_brackets: settings.Value(bool, .{
     .description = "Typing an opening bracket or quote also inserts its closer. Typing the " ++
         "closer steps over it, and backspace between an empty pair removes both.",
+}) = .init(true),
+
+/// Purely visual: tints each `{`/`(`/`[` and its closer by nesting depth from
+/// `core.palette.bracket_colors` — VSCode's `editor.bracketPairColorization.enabled`. Exposed
+/// for the same reason it is there: depth-tinted brackets are either the thing that makes
+/// nesting readable or a distraction from syntax colours, depending on who's looking.
+rainbow_brackets: settings.Value(bool, .{
+    .description = "Tint matching brackets by nesting depth so each pair takes its own colour.",
 }) = .init(true),
 
 /// When true, `saveDocument` reformats the document (via the active `LanguageSupport.format`

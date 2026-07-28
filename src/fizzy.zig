@@ -1,7 +1,7 @@
 const std = @import("std");
 
 /// Shared infrastructure module (gfx, math, fs, platform, paths, the generic
-/// dvui hub + widgets). Consumed by the shell and plugins.
+/// dvui hub + widgets). Consumed by fizzy and plugins.
 pub const core = @import("core");
 
 pub const version: std.SemanticVersion = .{

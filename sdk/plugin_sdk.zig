@@ -253,7 +253,7 @@ pub fn install(b: *std.Build, lib: *std.Build.Step.Compile, opts: InstallOptions
     dev.* = .{
         .step = std.Build.Step.init(.{
             .id = .custom,
-            .name = b.fmt("install plugin '{s}' into the fizzy plugins dir", .{name}),
+            .name = b.fmt("install plugin '{s}' into fizzy plugins dir", .{name}),
             .owner = b,
             .makeFn = DevInstall.make,
         }),
@@ -423,7 +423,7 @@ pub const CModuleOptions = struct {
 /// Build a Zig module backed by vendored C sources (an image/codec/archive lib, etc.) and
 /// return it for `mod.addImport(...)`. The C compiles into whatever artifact imports the
 /// returned module. All inputs are caller-supplied `LazyPath`s, so this works unchanged whether
-/// invoked from the fizzy build root (static embed / bundled dylib) or a standalone plugin
+/// invoked from fizzy build root (static embed / bundled dylib) or a standalone plugin
 /// build — there is no shared, location-bound build file to collide between the two graphs.
 pub fn addCModule(b: *std.Build, opts: CModuleOptions) *std.Build.Module {
     const mod = b.createModule(.{
@@ -459,7 +459,7 @@ pub const PluginArtifact = struct {
 };
 
 /// Generate the hidden dylib root module: `std_options` (routes this dylib's `std.log`/`dvui.log`
-/// into the shell's Output panel) + the `exportEntry` comptime block (C-ABI entry symbols
+/// into fizzy's Output panel) + the `exportEntry` comptime block (C-ABI entry symbols
 /// wired to `plugin_impl.register` + the identity/manifest carried by `plugin_options`). This
 /// exists so the author's `plugin.zig` never carries C-ABI export boilerplate, and so every
 /// built-in can compile into one static binary without colliding on duplicate `fizzy_plugin_*`

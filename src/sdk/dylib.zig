@@ -94,7 +94,7 @@ const sdk_boundary_types = .{
     // Reached only through `Host.native_menu_items`' backing slice — a *data* pointer
     // `hashType` deliberately never follows (see the `HoverResult` note below) — so without
     // this entry a field added here would change the real cross-plugin layout of that list
-    // without moving the fingerprint, and the shell would read a plugin's differently-shaped
+    // without moving the fingerprint, and fizzy would read a plugin's differently-shaped
     // struct. Same lesson as `CompletionItem` / `Setting`.
     regions.NativeMenuItem,
     regions.Command,
@@ -235,7 +235,7 @@ pub fn semverFromTriplet(t: VersionTriplet) std.SemanticVersion {
 
 /// `std.Options` that routes every `std.log`/`dvui.log` call in this dylib's whole compilation
 /// unit — the plugin's own code *and* anything statically compiled into it, dvui's own internal
-/// logging included — to the shell's Output panel, tagged with the plugin's own id. Still calls
+/// logging included — to fizzy's Output panel, tagged with the plugin's own id. Still calls
 /// dvui's default sink too, so `zig build run` terminal output is unaffected.
 ///
 /// A dylib has its own private `std.log` binding (see `Client.Config.log`'s doc comment for why

@@ -151,21 +151,21 @@ pub fn migrateToPerPluginEnabled(allocator: std.mem.Allocator, settings_zon_path
 
     if (!needs_write) return;
 
-    // Regenerate shell fields from a Settings parse (unknown fields — including the legacy
+    // Regenerate fizzy's own fields from a Settings parse (unknown fields — including the legacy
     // `disabled_plugins` list — are ignored), so the rewritten file drops that list for free.
     const parsed = Settings.parseOnly(allocator, data) catch |err| {
-        dvui.log.warn("settings: could not re-serialize shell fields for R12 migration ({s}); skipping", .{@errorName(err)});
+        dvui.log.warn("settings: could not re-serialize fizzy's own fields for R12 migration ({s}); skipping", .{@errorName(err)});
         return;
     };
     defer Settings.freeParsed(allocator, parsed);
 
-    const shell_text = Settings.serialize(&parsed, allocator) catch |err| {
-        dvui.log.warn("settings: could not serialize shell fields for R12 migration ({s}); skipping", .{@errorName(err)});
+    const fizzy_text = Settings.serialize(&parsed, allocator) catch |err| {
+        dvui.log.warn("settings: could not serialize fizzy's own fields for R12 migration ({s}); skipping", .{@errorName(err)});
         return;
     };
-    defer allocator.free(shell_text);
+    defer allocator.free(fizzy_text);
 
-    const composed = SettingsPluginsZon.composeMergedText(allocator, shell_text, data, overlay.items) catch |err| {
+    const composed = SettingsPluginsZon.composeMergedText(allocator, fizzy_text, data, overlay.items) catch |err| {
         dvui.log.warn("settings: failed to compose R12-migrated settings.zon ({s}); skipping", .{@errorName(err)});
         return;
     };

@@ -3,4 +3,6 @@
     .name = "Workbench",
     .version = "0.1.1",
     .min_sdk_version = "",
+    .description = "File explorer, tabs, and workspace layout for every other plugin's documents.",
+    .tags = .{ "explorer", "workbench" },
 }

@@ -4,17 +4,17 @@ Cross-platform, open-source general editor written in Zig, UI via [DVUI](https:/
 
 **Read this file first, then go deeper via the links below — don't re-derive the architecture from scratch.**
 
-## The core idea: shell + plugins
+## The core idea: fizzy + plugins
 
-Fizzy the app is a near-empty **shell** (window, frame loop, menu/sidebar/panel layout, document model) that owns **no editing features**. Everything the user sees — pixel-art editing, the file explorer/tabs/splits, text editing — is contributed by **plugins** that register against a stable SDK. Plugins never import each other; they meet only at the SDK.
+Fizzy the app is itself a near-empty host (window, frame loop, menu/sidebar/panel layout, document model) that owns **no editing features**. Everything the user sees — pixel-art editing, the file explorer/tabs/splits, text editing — is contributed by **plugins** that register against a stable SDK. Plugins never import each other; they meet only at the SDK.
 
 ```
-Shell (Editor) ←── Host registries + EditorAPI ──→ Plugin (register(host) + vtable)
+Fizzy (Editor) ←── Host registries + EditorAPI ──→ Plugin (register(host) + vtable)
 ```
 
-- **`src/sdk/`** — the entire contract. `Host` (registries + service locator), `Plugin` (identity + vtable of hooks the shell calls), `DocHandle` (opaque `{ptr, id, owner}` — shell routes every doc op to `owner`, never inspects `ptr`), `EditorAPI` (shell read/util surface plugins reach back through), `regions.zig` (sidebar/bottom/center/menu/settings/command contribution structs), `dylib.zig`/`dvui_context.zig` (runtime-library C-ABI + dvui injection).
-- **`src/editor/`** — the shell itself: `Editor.zig` (frame loop, plugin registration/loading), `PluginLoader.zig` (dlopen), `Menu.zig`, `Sidebar.zig`, `Settings.zig`, etc.
-- **`src/core/`** — shared infra (Atlas/Sprite, math, gfx, fs, paths, platform detection) used by shell *and* plugins. Not plugin-owned; don't move it. `core.fuzzy` is the one matcher behind every filter box in the app (settings tree, file tree, plugin store, LSP completions) — wrap zf through it rather than matching by hand, and remember **lower scores are better**.
+- **`src/sdk/`** — the entire contract. `Host` (registries + service locator), `Plugin` (identity + vtable of hooks Fizzy calls), `DocHandle` (opaque `{ptr, id, owner}` — Fizzy routes every doc op to `owner`, never inspects `ptr`), `EditorAPI` (Fizzy's own read/util surface plugins reach back through), `regions.zig` (sidebar/bottom/center/menu/settings/command contribution structs), `dylib.zig`/`dvui_context.zig` (runtime-library C-ABI + dvui injection).
+- **`src/editor/`** — Fizzy itself: `Editor.zig` (frame loop, plugin registration/loading), `PluginLoader.zig` (dlopen), `Menu.zig`, `Sidebar.zig`, `Settings.zig`, etc.
+- **`src/core/`** — shared infra (Atlas/Sprite, math, gfx, fs, paths, platform detection) used by Fizzy *and* plugins. Not plugin-owned; don't move it. `core.fuzzy` is the one matcher behind every filter box in the app (settings tree, file tree, plugin store, LSP completions) — wrap zf through it rather than matching by hand, and remember **lower scores are better**.
 - **`src/plugins/`** — bundled built-in plugins. Each is file-for-file the **same shape a third-party plugin would use**: root `plugin.zig` + identity-only `plugin.zig.zon` + `build.zig` + `build.zig.zon` (optional `src/**`), plus fizzy-internal glue in `static/`. No author `root.zig` or `<name>.zig` hub — the build helper generates the dylib entry; files use named imports (`fizzy_sdk`/`dvui`/…). Builds standalone with `cd src/plugins/<name> && zig build`.
 
 **Two link modes, one source:** built-in plugins compile **static** (linked directly, all targets incl. web) or **dynamic** (`.dylib`/`.so`/`.dll`, desktop-only, `dlopen`'d — this is how third-party plugins ship too). `FIZZY_STATIC_<NAME>=1` env var forces static for a given built-in (useful when debugging dylib loading).
@@ -27,14 +27,14 @@ Shell (Editor) ←── Host registries + EditorAPI ──→ Plugin (register(
 - **`markdown`** — `.md` preview utility plugin.
 - `shared` — build helpers used across plugins' `static/integration.zig` (not a plugin itself).
 
-**Pixi (pixel-art editor) has been extracted out of this repo** into an external, third-party-style plugin ([`fizzyedit/pixi`](https://github.com/fizzyedit/pixi), `~/dev/fizzyedit/pixi`) — it ships and updates purely through the plugin store (`docs/PLUGINS.md` §6), with no special treatment in the shell. Older docs/handoffs (`HANDOFF.md`) still describe pixi as in-tree — that's historical, not current. **Trust `ls src/plugins/` and `git log` over any doc's plugin list.**
+**Pixi (pixel-art editor) has been extracted out of this repo** into an external, third-party-style plugin ([`fizzyedit/pixi`](https://github.com/fizzyedit/pixi), `~/dev/fizzyedit/pixi`) — it ships and updates purely through the plugin store (`docs/PLUGINS.md` §6), with no special treatment in Fizzy itself. Older docs/handoffs (`HANDOFF.md`) still describe pixi as in-tree — that's historical, not current. **Trust `ls src/plugins/` and `git log` over any doc's plugin list.**
 
 ## Writing a plugin
 
 1. Copy `src/plugins/text/` as your template (or `src/plugins/image/` for a document-owning viewer).
 2. Add identity-only `plugin.zig.zon` (`id`/`name`/`version`/`min_sdk_version`). Implement root `plugin.zig`: `Plugin` + `register(host)` + vtable; call `host.register{SidebarView,BottomView,CenterProvider,Menu,Command,Service,…}` as needed.
-3. Plugin prefs: `sdk.settings.Schema(struct { … })` then `.register(host, &plugin, …)` — shell draws them only while the plugin is loaded (no SettingsSection). User config on disk is ZON (`settings.zon` / `recents.zon`).
-4. Editor plugins implement the document vtable cluster; shell plugins (workbench-style) register a center provider + sidebar views instead.
+3. Plugin prefs: `sdk.settings.Schema(struct { … })` then `.register(host, &plugin, …)` — Fizzy draws them only while the plugin is loaded (no SettingsSection). User config on disk is ZON (`settings.zon` / `recents.zon`).
+4. Editor plugins implement the document vtable cluster; workbench-style plugins register a center provider + sidebar views instead.
 5. User-invoked actions are **`Command`s** — `"<active_owner_id>.<action>"`.
 6. `zig build install` drops `{id}/{id}.dylib` (its own directory) into the fizzy plugins dir (no sidecar `.zon`).
 7. Memory: `host.allocator` vs `host.arena()`; never touch `dvui.currentWindow().gpa` directly.

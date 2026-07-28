@@ -90,9 +90,10 @@ pub fn request(id: []const u8, repo: []const u8, subpath: []const u8) void {
     };
 }
 
-/// Draw the cached icon for `id` into the current dvui parent. Returns true when an icon image
-/// was drawn; false means the caller should fall back (loaded-plugin hook or generic glyph).
-pub fn draw(id: []const u8) bool {
+/// Draw the cached icon for `id` into the current dvui parent, at `size` square. Returns true
+/// when an icon image was drawn; false means the caller should fall back (loaded-plugin hook or
+/// generic glyph).
+pub fn draw(id: []const u8, size: f32) bool {
     const entry = icons.get(id) orelse return false;
     if (entry.statusValue() != .ready) return false;
 
@@ -105,8 +106,8 @@ pub fn draw(id: []const u8) bool {
     _ = dvui.image(@src(), .{ .source = source, .shrink = .ratio }, .{
         .gravity_x = 0.5,
         .gravity_y = 0.5,
-        .min_size_content = .{ .w = 32, .h = 32 },
-        .max_size_content = .{ .w = 32, .h = 32 },
+        .min_size_content = .{ .w = size, .h = size },
+        .max_size_content = .{ .w = size, .h = size },
     });
     return true;
 }

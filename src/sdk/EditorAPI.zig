@@ -1,9 +1,9 @@
-//! The shell-provided read/utility surface a plugin reaches through the `Host`.
+//! Fizzy's own read/utility surface, reached by a plugin through the `Host`.
 //!
-//! The shell installs one of these on the `Host` during startup (`Host.installShell`);
+//! Fizzy installs one of these on the `Host` during startup (`Host.installFizzyApi`);
 //! plugins call the convenience forwarders on `Host` (e.g. `host.arena()`), which
-//! dispatch through this vtable. It exposes only the genuinely shared shell state a
-//! plugin still needs — the per-frame arena, the open project folder, the few shell-
+//! dispatch through this vtable. It exposes only the genuinely shared state a
+//! plugin still needs — the per-frame arena, the open project folder, the few fizzy-
 //! owned settings plugins read, and the dirty-mark hook — without leaking the concrete
 //! `Editor` type across the SDK boundary.
 const std = @import("std");
@@ -13,7 +13,7 @@ const DocHandle = @import("DocHandle.zig");
 const EditorAPI = @This();
 
 /// A name/extension-pattern pair for a native save dialog. Layout matches the backend's
-/// `DialogFileFilter` (which mirrors `SDL_DialogFileFilter`), so the shell forwards a slice
+/// `DialogFileFilter` (which mirrors `SDL_DialogFileFilter`), so fizzy forwards a slice
 /// of these straight to the backend without a copy. `pattern` is a `;`-separated extension
 /// list, e.g. `"png;jpg;jpeg"`.
 pub const SaveDialogFilter = extern struct {
@@ -46,16 +46,16 @@ ctx: *anyopaque,
 vtable: *const VTable,
 
 pub const VTable = struct {
-    /// The shell's per-frame arena allocator (reset every frame; do not free).
+    /// Fizzy's per-frame arena allocator (reset every frame; do not free).
     arena: *const fn (ctx: *anyopaque) std.mem.Allocator,
     /// The open project root folder, or null when none is open.
     folder: *const fn (ctx: *anyopaque) ?[]const u8,
     /// The user palettes folder (config), or null on platforms without one (web).
     paletteFolder: *const fn (ctx: *anyopaque) ?[]const u8,
-    /// Mark shell settings dirty so the debounced autosave persists them.
+    /// Mark fizzy's settings dirty so the debounced autosave persists them.
     markSettingsDirty: *const fn (ctx: *anyopaque) void,
-    /// Shell-owned content-area opacity (also drives the shell's own panes); plugins
-    /// read it to match the shell chrome.
+    /// Fizzy-owned content-area opacity (also drives fizzy's own panes); plugins
+    /// read it to match fizzy's own chrome.
     contentOpacity: *const fn (ctx: *anyopaque) f32,
     /// Whether the OS window is currently maximized (always false on web).
     isMaximized: *const fn (ctx: *anyopaque) bool,
@@ -63,16 +63,16 @@ pub const VTable = struct {
     isMacOS: *const fn (ctx: *anyopaque) bool,
     /// True on native macOS/Windows where unfocused window chrome dims content opacity.
     appliesNativeWindowOpacity: *const fn (ctx: *anyopaque) bool,
-    /// Shell-resolved canvas zoom/pan scheme (mouse vs trackpad wheel mapping).
+    /// Fizzy-resolved canvas zoom/pan scheme (mouse vs trackpad wheel mapping).
     panZoomScheme: *const fn (ctx: *anyopaque) PanZoomScheme,
-    /// The explorer pane's content rect (shell layout); plugins drawn inside the explorer
-    /// read it to size their content. Zero rect when no shell is installed.
+    /// The explorer pane's content rect (fizzy's own layout); plugins drawn inside the explorer
+    /// read it to size their content. Zero rect when fizzy's API isn't installed.
     explorerRect: *const fn (ctx: *anyopaque) dvui.Rect,
-    /// The explorer scroll area's virtual content size (shell layout). Zero size when no
-    /// shell is installed.
+    /// The explorer scroll area's virtual content size (fizzy's own layout). Zero size when
+    /// fizzy's API isn't installed.
     explorerVirtualSize: *const fn (ctx: *anyopaque) dvui.Size,
     /// Run the platform's native "save file" dialog (native: OS dialog; web: download
-    /// picker). `cb` is invoked when it resolves. No-op when no shell is installed.
+    /// picker). `cb` is invoked when it resolves. No-op when fizzy's API isn't installed.
     showSaveDialog: *const fn (
         ctx: *anyopaque,
         cb: SaveDialogCallback,
@@ -92,10 +92,10 @@ pub const VTable = struct {
     openDocCount: *const fn (ctx: *anyopaque) usize,
     /// Focus the document at `index` (updates workspace tab selection).
     setActiveDocIndex: *const fn (ctx: *anyopaque, index: usize) void,
-    /// Swap the open documents at indices `a` and `b` (used by tab drag-reorder). The shell
+    /// Swap the open documents at indices `a` and `b` (used by tab drag-reorder). Fizzy
     /// owns the open-document collection; this is the only mutation of its order plugins do.
     swapDocs: *const fn (ctx: *anyopaque, a: usize, b: usize) void,
-    /// Allocate the next shell document id (monotonic).
+    /// Allocate the next fizzy document id (monotonic).
     allocDocId: *const fn (ctx: *anyopaque) u64,
 
     /// Explorer scroll viewport width (0 when unavailable).
@@ -149,7 +149,7 @@ pub const VTable = struct {
     // ---- new document ----
     /// Heap-owned unique basename like `untitled-1`; caller frees with the app allocator.
     allocUntitledPath: *const fn (ctx: *anyopaque) anyerror![]u8,
-    /// Create and open a new document at `path` (path ownership transfers to the shell).
+    /// Create and open a new document at `path` (path ownership transfers to fizzy).
     createDocument: *const fn (ctx: *anyopaque, path: []const u8, grid: NewDocGrid) anyerror!DocHandle,
     /// Hint the files tree to scroll/highlight a path just created (e.g. New File dialog).
     setExplorerNewFilePath: *const fn (ctx: *anyopaque, path: []const u8) anyerror!void,
@@ -164,9 +164,9 @@ pub const VTable = struct {
     resumeSaveAllQuit: *const fn (ctx: *anyopaque) void,
     abortSaveAllQuit: *const fn (ctx: *anyopaque) void,
 
-    /// Append a line to the shell's "Output" bottom panel. `scope` and `message` are plain
+    /// Append a line to fizzy's "Output" bottom panel. `scope` and `message` are plain
     /// runtime strings (not `comptime`, unlike `std.log`) — a plugin builds `.dylib`/`.so`
-    /// separately from the shell, so it can't share the shell's `std.log` sink; this is the
+    /// separately from fizzy, so it can't share fizzy's `std.log` sink; this is the
     /// cross-ABI equivalent for anything a plugin wants visible there (e.g. a child
     /// process's stderr).
     logLine: *const fn (ctx: *anyopaque, level: std.log.Level, scope: []const u8, message: []const u8) void,
@@ -174,7 +174,7 @@ pub const VTable = struct {
     /// Draws a standard menu-item row (separator above, label + keybind hint, click-detect)
     /// inside whatever menu is currently open, and returns whether it was clicked this frame.
     /// `command_id` is the registered `Command` this row runs (e.g. `"text.format"`), or null
-    /// for a row that is not a command; the shell resolves its current chord from the keymap
+    /// for a row that is not a command; fizzy resolves its current chord from the keymap
     /// and draws it as the accelerator, so a user rebinding it in the Keyboard Shortcuts pane
     /// updates the row with no further work from the plugin. `title` also seeds the widget's
     /// id — use a distinct title per call site.
@@ -187,25 +187,25 @@ pub const VTable = struct {
     /// rather than calling `dvui.menuItem()`/`dvui.separator()` directly: dvui tracks "the
     /// currently open menu" via a private module-level variable in `MenuWidget.zig`, and each
     /// plugin dylib compiles its own separate copy of that variable. A plugin calling dvui's
-    /// menu widgets directly sees its own copy's default (never set, since only the shell opens
+    /// menu widgets directly sees its own copy's default (never set, since only fizzy opens
     /// menus), and `MenuItemWidget` unwrapping that stale `null` is a use-after-free-shaped
     /// crash waiting to happen (safety-panics in Debug, silently corrupts memory in
     /// ReleaseFast). Routing through this function keeps the actual widget construction in the
-    /// shell's own compiled code, where that state is always valid — the plugin just gets a
-    /// plain bool back, the same shape as every other shell-owned-context call on this vtable.
+    /// fizzy's own compiled code, where that state is always valid — the plugin just gets a
+    /// plain bool back, the same shape as every other fizzy-owned-context call on this vtable.
     drawMenuItem: *const fn (ctx: *anyopaque, title: []const u8, command_id: ?[]const u8) bool,
 
     /// Reads `<plugins_dir>/<id>.settings.zon`, or null if absent/unavailable. Caller-owned
     /// (free with the same allocator `Host` uses).
     ///
     /// `Host.loadPluginSettings` routes through this instead of reading the file itself for the
-    /// same reason `drawMenuItem` above routes through the shell: it can be called from a
+    /// same reason `drawMenuItem` above routes through fizzy: it can be called from a
     /// dynamically-loaded plugin's own `register()`, before the host has synced that dylib's
     /// per-compilation-unit `dvui` globals (`dvui.io` et al., each a `pub var` duplicated per
     /// dylib). A direct file read at that point would run against the calling dylib's own
     /// still-`undefined` `dvui.io` and segfault. This function pointer, like every other one on
-    /// this vtable, always executes as the shell's own compiled code regardless of which dylib
-    /// holds the call site, so it always sees the shell's real, initialized `dvui.io`.
+    /// this vtable, always executes as fizzy's own compiled code regardless of which dylib
+    /// holds the call site, so it always sees fizzy's real, initialized `dvui.io`.
     loadPluginSettingsFile: *const fn (ctx: *anyopaque, id: []const u8) ?[]u8,
 };
 

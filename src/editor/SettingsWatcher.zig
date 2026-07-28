@@ -109,7 +109,7 @@ pub fn start(self: *SettingsWatcher) !void {
 }
 
 fn wake() void {
-    // Safe from any thread — see `Editor.zig`'s `shellRefresh` doc comment for how this was
+    // Safe from any thread — see `Editor.zig`'s `fizzyRefresh` doc comment for how this was
     // verified (a single call reliably wakes the blocked event loop for exactly one frame).
     fizzy.app.window.backend.refresh();
 }

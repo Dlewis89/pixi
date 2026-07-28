@@ -1,5 +1,5 @@
 //! A single open text document: its path, contents, and grouping. The contents are kept
-//! in an `ArrayList(u8)` so the editing widget can grow/shrink it in place; the shell stores
+//! in an `ArrayList(u8)` so the editing widget can grow/shrink it in place; fizzy stores
 //! only an opaque `DocHandle` whose `id` maps back to the registered `Document`.
 const std = @import("std");
 const builtin = @import("builtin");
@@ -15,7 +15,7 @@ const Document = @This();
 /// Which side is shown while the raw|preview split is collapsed.
 pub const PreviewSide = enum { raw, preview };
 
-/// Shell document id (monotonic, allocated from the host).
+/// Fizzy document id (monotonic, allocated from the host).
 id: u64,
 /// Absolute path on disk, heap-owned.
 path: []u8,
@@ -38,7 +38,7 @@ unsaved: bool = false,
 sel_start: usize = 0,
 sel_end: usize = 0,
 /// Whether this document's `TextEntryWidget` held dvui keyboard focus as of the last draw,
-/// mirrored alongside the selection above. The shell routes a clipboard verb to the active
+/// mirrored alongside the selection above. Fizzy routes a clipboard verb to the active
 /// document only while the document's owner reports that verb enabled, which is how it tells
 /// "focus is in the editor" from "focus is in some other text input" (a search box, the Output
 /// Panel) without knowing anything about widget ownership — see `Keybinds.clipboardVerb`. A
@@ -186,7 +186,7 @@ pub fn scrollTargetLine(self: *const Document, target_line: u32) ?u32 {
     return null;
 }
 
-/// Build a document by reading `path` from disk. Runs on the shell's load worker thread.
+/// Build a document by reading `path` from disk. Runs on fizzy's load worker thread.
 /// Web has no filesystem; documents there are opened from bytes (`fromBytes`) instead.
 pub fn fromPath(path: []const u8) !Document {
     if (comptime is_wasm) return error.Unsupported;

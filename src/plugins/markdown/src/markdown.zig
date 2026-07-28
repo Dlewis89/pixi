@@ -46,6 +46,13 @@ pub const PreviewOptions = struct {
     image_base_dir: []const u8 = ".",
     /// Seed for widget ids so multiple previews don't collide.
     id_extra: u64 = 0,
+    /// Whether the preview's own scroll area paints a fill at all. `false` for a caller (the
+    /// store's plugin detail page) that already draws its own background behind this and wants
+    /// the preview to read as part of that pane rather than a visibly different panel.
+    background: bool = true,
+    /// Overrides the default `.content`-styled fill when `background` is true. Null keeps the
+    /// existing look (a real `.md` file's own preview tab).
+    color_fill: ?dvui.Color = null,
 };
 
 /// Render `bytes` as a read-only markdown preview (own scroll area) into the current dvui parent.
@@ -73,8 +80,8 @@ pub fn drawPreview(
         .vertical_bar = .auto_overlay,
     }, .{
         .expand = .both,
-        .background = true,
-        .color_fill = dvui.themeGet().fill,
+        .background = opts.background,
+        .color_fill = opts.color_fill orelse dvui.themeGet().fill,
         .style = .content,
         .id_extra = opts.id_extra,
     });

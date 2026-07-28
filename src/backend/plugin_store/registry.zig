@@ -32,7 +32,18 @@ pub const SummaryEntry = struct {
     id: []const u8 = "",
     name: []const u8 = "",
     description: []const u8 = "",
+    /// Cosmetic, self-asserted display credit — the author's own claim about themselves, which
+    /// the aggregator will fall back to reading out of their `manifest.json`. Never a trust
+    /// signal; pair it with `publisher` when showing attribution.
     author: []const u8 = "",
+    /// Optional link for `author`. Carried through the catalog so the credit is clickable for a
+    /// store-listed plugin the user hasn't installed (there is no local dylib to probe yet).
+    author_url: []const u8 = "",
+    /// Attestable counterpart to `author`: the account the plugin's binaries are actually
+    /// published from, derived server-side at ingest from the release `manifest_url` rather than
+    /// from anything the author writes about themselves. Empty on catalogs generated before this
+    /// field existed.
+    publisher: []const u8 = "",
     homepage: []const u8 = "",
     tags: []const []const u8 = &.{},
     date_added: []const u8 = "",

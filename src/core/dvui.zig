@@ -11,8 +11,8 @@ pub const FloatingWindowWidget = @import("widgets/FloatingWindowWidget.zig");
 pub const TreeWidget = @import("widgets/TreeWidget.zig");
 pub const TreeSelection = @import("widgets/TreeSelection.zig");
 
-/// Core-owned dialog chrome state, set by the dialog framework and read by the
-/// shell so core stays decoupled from the editor. When a modal is open the shell
+/// Core-owned dialog chrome state, set by the dialog framework and read by
+/// fizzy so core stays decoupled from the editor. When a modal is open fizzy
 /// dims the titlebar; the optional close-rect overrides the dialog's close
 /// animation origin (e.g. the New File flow animating from the tree row).
 pub var modal_dim_titlebar: bool = false;
@@ -30,7 +30,7 @@ pub fn treeRowGlyphSize() dvui.Size {
     return .{ .w = h, .h = h };
 }
 
-/// Options for the shell's own icons/images drawn inside a `treeRowGlyph` slot — the same
+/// Options for fizzy's own icons/images drawn inside a `treeRowGlyph` slot — the same
 /// `expand = .ratio` fit asked of plugin icons, centred in the slot.
 pub fn treeRowIconOptions(over: dvui.Options) dvui.Options {
     const defaults: dvui.Options = .{
@@ -133,7 +133,7 @@ pub fn addHighlightedText(
 /// draws a caret, an icon, an image, or a letter.
 ///
 /// **This is the contract for plugin-drawn icons** (`Host.registerFileIcon` /
-/// `registerPluginIcon`). The shell reserves the rect; the plugin draws into it with
+/// `registerPluginIcon`). Fizzy reserves the rect; the plugin draws into it with
 /// `expand = .ratio`, which fits its artwork to whatever the row can spare while preserving the
 /// aspect ratio. Both halves are needed: a plugin that draws at a hard-coded size ignores the
 /// slot and knocks the row out of line, and a slot with no fixed size lets each icon dictate its
@@ -1111,6 +1111,23 @@ pub fn saveCompleteToastDisplay(id: dvui.Id) !void {
     }
     if (animator.end()) {
         dvui.toastRemove(id);
+    }
+}
+
+/// Draw a menu row's optional leading icon in a fixed `treeRowGlyph` slot. The slot is reserved
+/// even when `bytes` is null, so a row with an icon and a row without one in the same menu still
+/// line up in the same column instead of the label shifting left to fill the gap. Dimmed to half
+/// opacity when `enabled` is false, matching `labelWithKeybind`'s greying of the label beside it.
+///
+/// Shared by fizzy's own menu rows (`Menu.menuItemWithHotkey`, from `menu_model.CommandItem`)
+/// and plugin-contributed ones (`Editor.fizzyDrawMenuItem`, from `sdk.Command`) so both draw the
+/// same slot the same way.
+pub fn menuRowIcon(bytes: ?[]const u8, base_color: dvui.Color, enabled: bool, id_extra: usize) void {
+    var glyph = treeRowGlyph(@src(), .{ .id_extra = id_extra, .margin = .{ .w = 6 } });
+    defer glyph.deinit();
+    if (bytes) |b| {
+        const color = if (enabled) base_color else base_color.opacity(0.5);
+        dvui.icon(@src(), "menu_icon", b, .{ .stroke_color = color, .fill_color = color }, treeRowIconOptions(.{ .id_extra = id_extra }));
     }
 }
 

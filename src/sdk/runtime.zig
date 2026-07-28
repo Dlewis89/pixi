@@ -1,4 +1,4 @@
-//! Host-injected plugin runtime: the allocator and `*Host` the shell pushes into a plugin
+//! Host-injected plugin runtime: the allocator and `*Host` fizzy pushes into a plugin
 //! dylib at load (`fizzy_plugin_set_globals`). Plugin code reads them through
 //! `sdk.allocator()` and `sdk.host()` — there is no per-plugin file to store them.
 //!
@@ -12,7 +12,7 @@ const Host = @import("Host.zig");
 
 var gpa: std.mem.Allocator = undefined;
 var host_ptr: *Host = undefined;
-/// Shell-owned plugin state injected before `register` (built-in static/dylib path).
+/// Fizzy-owned plugin state injected before `register` (built-in static/dylib path).
 var injected_state: ?*anyopaque = null;
 
 /// The persistent host allocator. Use for anything that outlives a frame; you own every
@@ -21,13 +21,13 @@ pub fn allocator() std.mem.Allocator {
     return gpa;
 }
 
-/// The shell `*Host` — registries, services, and the `EditorAPI` read surface.
+/// Fizzy `*Host` — registries, services, and the `EditorAPI` read surface.
 pub fn host() *Host {
     return host_ptr;
 }
 
 /// Called by `dylib.exportEntry`'s `fizzy_plugin_set_globals` export. Third-party plugins
-/// own their state in `register`; built-ins may inject a shell-owned pointer here.
+/// own their state in `register`; built-ins may inject a fizzy-owned pointer here.
 pub fn installRuntime(
     gpa_in: ?*const std.mem.Allocator,
     host_in: ?*Host,

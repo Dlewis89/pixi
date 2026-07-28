@@ -1,6 +1,6 @@
 //! Host-side thunks for the dvui proxy render bridge.
 //!
-//! Loaded plugin dylibs draw through `proxy_bridge.RenderBridge` into the shell's real
+//! Loaded plugin dylibs draw through `proxy_bridge.RenderBridge` into fizzy's real
 //! SDL backend. `ctx` is the host `dvui.Window` pointer (stable for the session).
 const std = @import("std");
 const dvui = @import("dvui");

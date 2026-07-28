@@ -1,6 +1,6 @@
-//! The services the shell exposes to plugins, and the registries it owns. Plugins
+//! The services fizzy exposes to plugins, and the registries it owns. Plugins
 //! receive a `*Host` instead of reaching into editor globals; it holds the plugin
-//! registry, the shell region registries, and a service locator. The Host is
+//! registry, fizzy region registries, and a service locator. The Host is
 //! embedded in `Editor`.
 const std = @import("std");
 const builtin = @import("builtin");
@@ -36,7 +36,7 @@ pub const Command = regions.Command;
 /// see `sdk/settings.zig`'s `Schema(T).diffSerialize`: a value that's back to all-defaults has
 /// nothing worth writing). The Host owns the key + (when present) value strings. This is a write
 /// buffer only, not the source of truth — `Editor.writeMergedSettings` (via
-/// `takePendingPluginSettings`) composes each entry into the shell's own `<config>/settings.zon`
+/// `takePendingPluginSettings`) composes each entry into fizzy's own `<config>/settings.zon`
 /// under `.plugins.<id>.settings` (a real, human-editable nested ZON struct literal, not an
 /// escaped-string blob — see `src/editor/SettingsPluginsZon.zig` and
 /// `docs/PLUGIN_MANIFEST_PLAN.md` R10/R12) and never interprets the contents.
@@ -46,7 +46,7 @@ pub const PluginSettings = std.StringArrayHashMapUnmanaged(?[]const u8);
 /// stable index during the current tree draw (workbench increments per file). Return
 /// null to defer to the next resolver or the theme default.
 pub const FileRowFillColor = struct {
-    /// Contributing plugin (null = shell built-in). Used to scope teardown in
+    /// Contributing plugin (null = fizzy built-in). Used to scope teardown in
     /// `unregisterPlugin` when a plugin is unloaded at runtime.
     owner: ?*Plugin = null,
     ctx: ?*anyopaque = null,
@@ -54,7 +54,7 @@ pub const FileRowFillColor = struct {
 };
 
 /// A registered inter-plugin service plus the plugin that owns it, so a runtime
-/// unload can remove the owner's services. `owner` is null for shell-registered
+/// unload can remove the owner's services. `owner` is null for fizzy-registered
 /// services with no single plugin owner.
 pub const ServiceEntry = struct {
     ptr: *anyopaque,
@@ -64,7 +64,7 @@ pub const ServiceEntry = struct {
 /// A file-type icon drawer. The workbench calls registered drawers in order from each reserved
 /// icon slot (file-tree rows and open-file tabs); the first that returns `true` wins, otherwise
 /// the workbench draws a generic filesystem default. This lets the plugin that owns a file type
-/// draw its own icon (a glyph, a thumbnail, anything) instead of the shell hardcoding
+/// draw its own icon (a glyph, a thumbnail, anything) instead of fizzy hardcoding
 /// per-extension icons. `ext` is the extension including the dot, as on disk (compare
 /// case-insensitively); `path` is absolute; `color` is the themed icon color.
 ///
@@ -112,9 +112,9 @@ pending_new_document_owner: ?*Plugin = null,
 /// draw per-branch explorer decorations without a compile-time dependency on it.
 services: std.StringHashMapUnmanaged(ServiceEntry) = .empty,
 
-/// The shell's read/utility surface (arena, folder, shared settings, dirty mark),
-/// installed by the shell during startup. Null until installed (headless/test).
-shell_api: ?EditorAPI = null,
+/// Fizzy's read/utility surface (arena, folder, shared settings, dirty mark),
+/// installed by fizzy during startup. Null until installed (headless/test).
+fizzy_api: ?EditorAPI = null,
 
 /// Not-yet-flushed per-plugin settings writes (see `PluginSettings`); drained by
 /// `takePendingPluginSettings`. Whether the composed merge write actually touches disk is
@@ -125,8 +125,8 @@ plugin_settings_pending: PluginSettings = .empty,
 
 /// `<config_folder>/plugins` — where every plugin's own `<id>/<id>.{dylib,so,dll}` directory
 /// lives (see `pluginInstallDir`; built-ins that compile static have no dylib there). No longer
-/// where settings live — those are a `.plugins.<id>` field inside the shell's own
-/// `<config_folder>/settings.zon` (see R10). Set once by the shell during startup
+/// where settings live — those are a `.plugins.<id>` field inside fizzy's own
+/// `<config_folder>/settings.zon` (see R10). Set once by fizzy during startup
 /// (`Editor.init`); null on wasm (no filesystem) or in headless/tests, in which case settings
 /// load/store are no-ops.
 plugins_dir: ?[]const u8 = null,
@@ -140,14 +140,14 @@ file_icons: std.ArrayListUnmanaged(FileIcon) = .empty,
 /// Plugin-store card logo drawers (Plugins tab asks the Host; each plugin registers one for itself).
 plugin_icons: std.ArrayListUnmanaged(PluginIcon) = .empty,
 
-/// Loaded plugins' settings schemas (`sdk.settings.Schema(...)`), drawn by the shell's settings
+/// Loaded plugins' settings schemas (`sdk.settings.Schema(...)`), drawn by fizzy's settings
 /// pane while each owner stays registered — see `settings.zig`'s "loaded-only" module doc note.
 /// Cleared for `plugin`'s entries in `unregisterPlugin`; there is no on-disk/embedded fallback
 /// for a disabled or failed-to-load plugin.
 settings_schemas: std.ArrayListUnmanaged(SettingsSchema) = .empty,
 
-// ---- shell region registries -----------------------------------------------
-// The shell iterates these instead of hardcoded enums/switches. Items keep their
+// ---- fizzy region registries -----------------------------------------------
+// Fizzy iterates these instead of hardcoded enums/switches. Items keep their
 // registration order, which is the order they appear in the UI.
 
 /// Left-region (explorer) views, one per sidebar icon.
@@ -202,66 +202,66 @@ pub fn deinit(self: *Host) void {
     }
 }
 
-// ---- shell services (installed by the shell during startup) ----------------
+// ---- fizzy services (installed by fizzy itself during startup) -------------
 
-/// Install the shell's read/utility surface. Called once during startup.
-pub fn installShell(self: *Host, api: EditorAPI) void {
-    self.shell_api = api;
+/// Install fizzy's own read/utility surface. Called once during startup.
+pub fn installFizzyApi(self: *Host, api: EditorAPI) void {
+    self.fizzy_api = api;
 }
 
-/// Per-frame arena allocator (reset every frame; do not free). Asserts the shell is installed.
+/// Per-frame arena allocator (reset every frame; do not free). Asserts fizzy's API is installed.
 pub fn arena(self: *Host) std.mem.Allocator {
-    return self.shell_api.?.arena();
+    return self.fizzy_api.?.arena();
 }
 
 /// Open project root folder, or null when none is open.
 pub fn folder(self: *Host) ?[]const u8 {
-    return if (self.shell_api) |a| a.folder() else null;
+    return if (self.fizzy_api) |a| a.folder() else null;
 }
 
 /// User palettes folder (config), or null on platforms without one.
 pub fn paletteFolder(self: *Host) ?[]const u8 {
-    return if (self.shell_api) |a| a.paletteFolder() else null;
+    return if (self.fizzy_api) |a| a.paletteFolder() else null;
 }
 
-/// Mark shell settings dirty so the debounced autosave persists them.
+/// Mark fizzy settings dirty so the debounced autosave persists them.
 pub fn markSettingsDirty(self: *Host) void {
-    if (self.shell_api) |a| a.markSettingsDirty();
+    if (self.fizzy_api) |a| a.markSettingsDirty();
 }
 
-/// Shell-owned content-area opacity (matches the shell chrome). 1.0 if no shell installed.
+/// Fizzy-owned content-area opacity (matches fizzy's own chrome). 1.0 if fizzy isn't installed.
 pub fn contentOpacity(self: *Host) f32 {
-    return if (self.shell_api) |a| a.contentOpacity() else 1.0;
+    return if (self.fizzy_api) |a| a.contentOpacity() else 1.0;
 }
 
-/// Whether the OS window is currently maximized. False if no shell installed (headless/web).
+/// Whether the OS window is currently maximized. False if fizzy isn't installed (headless/web).
 pub fn isMaximized(self: *Host) bool {
-    return if (self.shell_api) |a| a.isMaximized() else false;
+    return if (self.fizzy_api) |a| a.isMaximized() else false;
 }
 
 pub fn isMacOS(self: *Host) bool {
-    return if (self.shell_api) |a| a.isMacOS() else false;
+    return if (self.fizzy_api) |a| a.isMacOS() else false;
 }
 
 pub fn appliesNativeWindowOpacity(self: *Host) bool {
-    return if (self.shell_api) |a| a.appliesNativeWindowOpacity() else false;
+    return if (self.fizzy_api) |a| a.appliesNativeWindowOpacity() else false;
 }
 
 pub fn panZoomScheme(self: *Host) EditorAPI.PanZoomScheme {
-    return if (self.shell_api) |a| a.panZoomScheme() else .mouse;
+    return if (self.fizzy_api) |a| a.panZoomScheme() else .mouse;
 }
 
-/// The explorer pane's content rect (shell layout). Zero rect if no shell installed.
+/// The explorer pane's content rect (fizzy layout). Zero rect if fizzy isn't installed.
 pub fn explorerRect(self: *Host) dvui.Rect {
-    return if (self.shell_api) |a| a.explorerRect() else .{};
+    return if (self.fizzy_api) |a| a.explorerRect() else .{};
 }
 
-/// The explorer scroll area's virtual content size (shell layout). Zero size if no shell installed.
+/// The explorer scroll area's virtual content size (fizzy layout). Zero size if fizzy isn't installed.
 pub fn explorerVirtualSize(self: *Host) dvui.Size {
-    return if (self.shell_api) |a| a.explorerVirtualSize() else .{};
+    return if (self.fizzy_api) |a| a.explorerVirtualSize() else .{};
 }
 
-/// Run the platform's native "save file" dialog. No-op if no shell installed (headless/test).
+/// Run the platform's native "save file" dialog. No-op if fizzy isn't installed (headless/test).
 pub fn showSaveDialog(
     self: *Host,
     cb: EditorAPI.SaveDialogCallback,
@@ -269,80 +269,80 @@ pub fn showSaveDialog(
     default_filename: []const u8,
     default_folder: ?[]const u8,
 ) void {
-    if (self.shell_api) |a| a.showSaveDialog(cb, filters, default_filename, default_folder);
+    if (self.fizzy_api) |a| a.showSaveDialog(cb, filters, default_filename, default_folder);
 }
 
 /// The actively focused open document, or null when none.
 pub fn activeDoc(self: *Host) ?DocHandle {
-    return if (self.shell_api) |a| a.activeDoc() else null;
+    return if (self.fizzy_api) |a| a.activeDoc() else null;
 }
 
 pub fn docByIndex(self: *Host, index: usize) ?DocHandle {
-    return if (self.shell_api) |a| a.docByIndex(index) else null;
+    return if (self.fizzy_api) |a| a.docByIndex(index) else null;
 }
 
 pub fn docById(self: *Host, id: u64) ?DocHandle {
-    return if (self.shell_api) |a| a.docById(id) else null;
+    return if (self.fizzy_api) |a| a.docById(id) else null;
 }
 
 pub fn docIndex(self: *Host, id: u64) ?usize {
-    return if (self.shell_api) |a| a.docIndex(id) else null;
+    return if (self.fizzy_api) |a| a.docIndex(id) else null;
 }
 
 pub fn openDocCount(self: *Host) usize {
-    return if (self.shell_api) |a| a.openDocCount() else 0;
+    return if (self.fizzy_api) |a| a.openDocCount() else 0;
 }
 
 pub fn setActiveDocIndex(self: *Host, index: usize) void {
-    if (self.shell_api) |a| a.setActiveDocIndex(index);
+    if (self.fizzy_api) |a| a.setActiveDocIndex(index);
 }
 
 pub fn swapDocs(self: *Host, a_index: usize, b_index: usize) void {
-    if (self.shell_api) |a| a.swapDocs(a_index, b_index);
+    if (self.fizzy_api) |a| a.swapDocs(a_index, b_index);
 }
 
 pub fn allocDocId(self: *Host) u64 {
-    return if (self.shell_api) |a| a.allocDocId() else 0;
+    return if (self.fizzy_api) |a| a.allocDocId() else 0;
 }
 
 pub fn explorerViewportWidth(self: *Host) f32 {
-    return if (self.shell_api) |a| a.explorerViewportWidth() else 0;
+    return if (self.fizzy_api) |a| a.explorerViewportWidth() else 0;
 }
 
 pub fn docFromPath(self: *Host, path: []const u8) ?DocHandle {
-    return if (self.shell_api) |a| a.docFromPath(path) else null;
+    return if (self.fizzy_api) |a| a.docFromPath(path) else null;
 }
 
 pub fn openFilePath(self: *Host, path: []const u8, grouping: u64) !bool {
-    return if (self.shell_api) |a| try a.openFilePath(path, grouping) else false;
+    return if (self.fizzy_api) |a| try a.openFilePath(path, grouping) else false;
 }
 
 pub fn openOrFocusFileAtGrouping(self: *Host, path: []const u8, grouping: u64) !?usize {
-    return if (self.shell_api) |a| try a.openOrFocusFileAtGrouping(path, grouping) else null;
+    return if (self.fizzy_api) |a| try a.openOrFocusFileAtGrouping(path, grouping) else null;
 }
 
 pub fn closeDocById(self: *Host, id: u64) !void {
-    if (self.shell_api) |a| return a.closeDocById(id);
+    if (self.fizzy_api) |a| return a.closeDocById(id);
 }
 
 pub fn setProjectFolder(self: *Host, path: []const u8) !void {
-    return if (self.shell_api) |a| try a.setProjectFolder(path) else error.ShellNotInstalled;
+    return if (self.fizzy_api) |a| try a.setProjectFolder(path) else error.FizzyApiNotInstalled;
 }
 
 pub fn closeProjectFolder(self: *Host) void {
-    if (self.shell_api) |a| a.closeProjectFolder();
+    if (self.fizzy_api) |a| a.closeProjectFolder();
 }
 
 pub fn recentFolderCount(self: *Host) usize {
-    return if (self.shell_api) |a| a.recentFolderCount() else 0;
+    return if (self.fizzy_api) |a| a.recentFolderCount() else 0;
 }
 
 pub fn recentFolderAt(self: *Host, index: usize) ?[]const u8 {
-    return if (self.shell_api) |a| a.recentFolderAt(index) else null;
+    return if (self.fizzy_api) |a| a.recentFolderAt(index) else null;
 }
 
 pub fn openInFileBrowser(self: *Host, path: []const u8) !void {
-    return if (self.shell_api) |a| try a.openInFileBrowser(path) else error.ShellNotInstalled;
+    return if (self.fizzy_api) |a| try a.openInFileBrowser(path) else error.FizzyApiNotInstalled;
 }
 
 pub fn isPathIgnored(
@@ -352,23 +352,23 @@ pub fn isPathIgnored(
     name: []const u8,
     kind: std.Io.File.Kind,
 ) bool {
-    return if (self.shell_api) |a| a.isPathIgnored(project_root, abs_path, name, kind) else false;
+    return if (self.fizzy_api) |a| a.isPathIgnored(project_root, abs_path, name, kind) else false;
 }
 
 pub fn explorerBranchIsOpen(self: *Host, branch_id: dvui.Id) bool {
-    return if (self.shell_api) |a| a.explorerBranchIsOpen(branch_id) else false;
+    return if (self.fizzy_api) |a| a.explorerBranchIsOpen(branch_id) else false;
 }
 
 pub fn setExplorerBranchOpen(self: *Host, branch_id: dvui.Id, open: bool) void {
-    if (self.shell_api) |a| a.setExplorerBranchOpen(branch_id, open);
+    if (self.fizzy_api) |a| a.setExplorerBranchOpen(branch_id, open);
 }
 
 pub fn drawWorkspaces(self: *Host, index: usize) !dvui.App.Result {
-    return if (self.shell_api) |a| try a.drawWorkspaces(index) else .ok;
+    return if (self.fizzy_api) |a| try a.drawWorkspaces(index) else .ok;
 }
 
 pub fn showOpenFolderDialog(self: *Host, cb: EditorAPI.OpenPathsCallback, default_folder: ?[]const u8) void {
-    if (self.shell_api) |a| a.showOpenFolderDialog(cb, default_folder);
+    if (self.fizzy_api) |a| a.showOpenFolderDialog(cb, default_folder);
 }
 
 pub fn showOpenFileDialog(
@@ -378,111 +378,111 @@ pub fn showOpenFileDialog(
     default_filename: []const u8,
     default_folder: ?[]const u8,
 ) void {
-    if (self.shell_api) |a| a.showOpenFileDialog(cb, filters, default_filename, default_folder);
+    if (self.fizzy_api) |a| a.showOpenFileDialog(cb, filters, default_filename, default_folder);
 }
 
 pub fn save(self: *Host) !void {
-    if (self.shell_api) |a| return a.save();
+    if (self.fizzy_api) |a| return a.save();
 }
 
 pub fn requestPrepareFrame(self: *Host) void {
-    if (self.shell_api) |a| a.requestPrepareFrame();
+    if (self.fizzy_api) |a| a.requestPrepareFrame();
 }
 
 pub fn refresh(self: *Host) void {
-    if (self.shell_api) |a| a.refresh();
+    if (self.fizzy_api) |a| a.refresh();
 }
 
 pub fn allocUntitledPath(self: *Host) ![]u8 {
-    return if (self.shell_api) |a| try a.allocUntitledPath() else error.ShellNotInstalled;
+    return if (self.fizzy_api) |a| try a.allocUntitledPath() else error.FizzyApiNotInstalled;
 }
 
 pub fn createDocument(self: *Host, path: []const u8, grid: EditorAPI.NewDocGrid) !DocHandle {
-    return if (self.shell_api) |a| try a.createDocument(path, grid) else error.ShellNotInstalled;
+    return if (self.fizzy_api) |a| try a.createDocument(path, grid) else error.FizzyApiNotInstalled;
 }
 
 pub fn setExplorerNewFilePath(self: *Host, path: []const u8) !void {
-    return if (self.shell_api) |a| try a.setExplorerNewFilePath(path) else error.ShellNotInstalled;
+    return if (self.fizzy_api) |a| try a.setExplorerNewFilePath(path) else error.FizzyApiNotInstalled;
 }
 
 pub fn requestSaveAs(self: *Host) void {
-    if (self.shell_api) |a| a.requestSaveAs();
+    if (self.fizzy_api) |a| a.requestSaveAs();
 }
 
 pub fn requestWebSave(self: *Host, kind: EditorAPI.WebSaveKind) void {
-    if (self.shell_api) |a| a.requestWebSave(kind);
+    if (self.fizzy_api) |a| a.requestWebSave(kind);
 }
 
 pub fn cancelPendingSaveDialog(self: *Host) void {
-    if (self.shell_api) |a| a.cancelPendingSaveDialog();
+    if (self.fizzy_api) |a| a.cancelPendingSaveDialog();
 }
 
 pub fn setPendingCloseDocId(self: *Host, id: u64) void {
-    if (self.shell_api) |a| a.setPendingCloseDocId(id);
+    if (self.fizzy_api) |a| a.setPendingCloseDocId(id);
 }
 
 pub fn queueCloseAfterSave(self: *Host, id: u64) !void {
-    if (self.shell_api) |a| return a.queueCloseAfterSave(id);
+    if (self.fizzy_api) |a| return a.queueCloseAfterSave(id);
 }
 
 pub fn trackQuitSaveInFlight(self: *Host, id: u64) !void {
-    if (self.shell_api) |a| return a.trackQuitSaveInFlight(id);
+    if (self.fizzy_api) |a| return a.trackQuitSaveInFlight(id);
 }
 
 pub fn resumeSaveAllQuit(self: *Host) void {
-    if (self.shell_api) |a| a.resumeSaveAllQuit();
+    if (self.fizzy_api) |a| a.resumeSaveAllQuit();
 }
 
 pub fn abortSaveAllQuit(self: *Host) void {
-    if (self.shell_api) |a| a.abortSaveAllQuit();
+    if (self.fizzy_api) |a| a.abortSaveAllQuit();
 }
 
-/// Append a line to the shell's "Output" bottom panel. No-op if no shell is installed
+/// Append a line to fizzy's "Output" bottom panel. No-op if fizzy isn't installed
 /// (headless/tests). `scope` is a short plugin-chosen tag (e.g. "zig"); `message` is a
 /// plain, already-formatted string — see `EditorAPI.logLine` for why this can't be a
-/// `comptime`-generic `std.log`-style call like the shell's own logging.
+/// `comptime`-generic `std.log`-style call like fizzy's own logging.
 pub fn logLine(self: *Host, level: std.log.Level, scope: []const u8, message: []const u8) void {
-    if (self.shell_api) |a| a.logLine(level, scope, message);
+    if (self.fizzy_api) |a| a.logLine(level, scope, message);
 }
 
 /// Draw a standard menu-item row inside the currently open menu; returns whether it was
-/// clicked. `command_id` names the `Command` the row runs, and the shell draws that command's
-/// current chord beside it. False (never drawn/clicked) when no shell is installed. See
+/// clicked. `command_id` names the `Command` the row runs, and fizzy draws that command's
+/// current chord beside it. False (never drawn/clicked) when fizzy isn't installed. See
 /// `EditorAPI.VTable.drawMenuItem`'s doc comment — `Host.registerMenuSection` draw callbacks
 /// must go through this instead of calling dvui's menu widgets directly.
 pub fn drawMenuItem(self: *Host, title: []const u8, command_id: ?[]const u8) bool {
-    return if (self.shell_api) |a| a.drawMenuItem(title, command_id) else false;
+    return if (self.fizzy_api) |a| a.drawMenuItem(title, command_id) else false;
 }
 
 // ---- per-plugin settings store ---------------------------------------------
 //
 // Every plugin's settings live as a real, hand-editable ZON struct literal keyed by plugin id,
-// nested inside the shell's own `<config>/settings.zon` under a
+// nested inside fizzy's own `<config>/settings.zon` under a
 // `.plugins = .{ .<id> = .{...}, ... }` field — not an escaped-string blob, and not one file per
 // plugin (see `docs/PLUGIN_MANIFEST_PLAN.md` R10, superseding R8's one-file-per-plugin design).
 // `SettingsPluginsZon` (in `src/editor/`) does the actual ZON text surgery; the Host only buffers
-// pending writes and routes reads through `shell_api` — see `loadPluginSettings`'s doc comment
+// pending writes and routes reads through `fizzy_api` — see `loadPluginSettings`'s doc comment
 // for why that indirection is required. This is deliberately not cached across calls:
 // `loadPluginSettings` is only ever called once per plugin, at `register()` time, so a fresh read
 // costs nothing and keeps the Host from having to reason about staleness.
 
 /// Reads `id`'s settings out of `<config>/settings.zon`'s `.plugins.<id>` field fresh off disk,
-/// or null when unavailable (no shell installed, wasm/headless, or the field doesn't exist yet).
+/// or null when unavailable (fizzy isn't installed, wasm/headless, or the field doesn't exist yet).
 /// Caller-owned; free with `self.allocator`.
 ///
-/// Routed through `shell_api` rather than reading the file directly here: `register()` — the
+/// Routed through `fizzy_api` rather than reading the file directly here: `register()` — the
 /// only caller of this, via `sdk.settings.Schema(T).load` — can run for a *dynamically-loaded*
 /// plugin before the host has synced its per-dylib `dvui` globals (`dvui.io` et al. are
 /// `pub var`s, duplicated per compiled dylib — see `dvui_context.zig`) into that dylib's own
 /// copy. A direct file read here would run against that dylib's still-`undefined` `dvui.io` and
-/// segfault. `shell_api`'s function pointers, by contrast, always execute as the host's own
+/// segfault. `fizzy_api`'s function pointers, by contrast, always execute as the host's own
 /// compiled code no matter which dylib holds the call site, so they see the host's real `dvui.io`.
 pub fn loadPluginSettings(self: *Host, id: []const u8) ?[]u8 {
     if (comptime builtin.target.cpu.arch == .wasm32) return null;
-    return if (self.shell_api) |a| a.loadPluginSettingsFile(id) else null;
+    return if (self.fizzy_api) |a| a.loadPluginSettingsFile(id) else null;
 }
 
-/// Buffers `blob` (serialized zon text) as `id`'s pending `.settings` write and marks the shell
+/// Buffers `blob` (serialized zon text) as `id`'s pending `.settings` write and marks fizzy
 /// dirty; the debounced autosave composes it into the merged `settings.zon` (see
 /// `Editor.writeMergedSettings`, which calls `takePendingPluginSettings` then
 /// `SettingsPluginsZon.composeMergedText`). The Host copies both `id` and `blob`.
@@ -618,7 +618,7 @@ fn removeOwned(comptime T: type, list: *std.ArrayListUnmanaged(T), plugin: *Plug
 }
 
 /// `removeOwned`'s counterpart for `SettingsSchema`, whose `owner` is a required (non-optional)
-/// `*Plugin` — every schema belongs to exactly one plugin, unlike the shell-ownable
+/// `*Plugin` — every schema belongs to exactly one plugin, unlike fizzy-ownable
 /// contribution structs `removeOwned` handles.
 fn removeOwnedSettingsSchemas(list: *std.ArrayListUnmanaged(SettingsSchema), plugin: *Plugin) void {
     var w: usize = 0;
@@ -654,7 +654,7 @@ pub fn pluginById(self: *Host, id: []const u8) ?*Plugin {
     return null;
 }
 
-/// First registered plugin that implements `createDocument` (for shell New File flows).
+/// First registered plugin that implements `createDocument` (for fizzy New File flows).
 pub fn pluginWithCreateDocument(self: *Host) ?*Plugin {
     for (self.plugins.items) |plugin| {
         if (plugin.vtable.createDocument != null) return plugin;
@@ -745,7 +745,7 @@ pub fn drawPluginIcon(self: *Host, plugin_id: []const u8) bool {
 }
 
 /// Register an inter-plugin service. `owner` is the contributing plugin (null for a
-/// shell-registered service); it lets `unregisterPlugin` drop the service on unload.
+/// fizzy-registered service); it lets `unregisterPlugin` drop the service on unload.
 pub fn registerService(self: *Host, name: []const u8, service: *anyopaque, owner: ?*Plugin) !void {
     try self.services.put(self.allocator, name, .{ .ptr = service, .owner = owner });
 }
@@ -1166,7 +1166,7 @@ fn newDocumentChooserActive(win: *dvui.Window) bool {
 
 /// Modal picker shown when more than one plugin can create a new document: a rounded-square,
 /// drop-shadowed button per candidate (its registered plugin-store icon, falling back to its
-/// name) via `core.dvui.dialog` — the same chrome every other shell dialog uses. Picking one
+/// name) via `core.dvui.dialog` — the same chrome every other fizzy dialog uses. Picking one
 /// dispatches exactly as `requestNewDocument` would with a single candidate.
 fn showNewDocumentChooser(parent_path: ?[]const u8, id_extra: usize) void {
     if (newDocumentChooserActive(dvui.currentWindow())) return;
@@ -1325,8 +1325,8 @@ test "unregisterPlugin removes a plugin's contributions, service, and resets act
     try host.registerBottomView(.{ .id = "victim.bottom", .owner = &plugin, .title = "V", .draw = noopDraw });
     try host.registerCenterProvider(.{ .id = "victim.center", .owner = &plugin, .draw = noopCenter });
     try host.registerMenu(.{ .id = "victim.menu", .owner = &plugin, .draw = noopDraw });
-    try host.registerMenuSection(.{ .id = "victim.section", .parent_menu_id = "shell.menu.view", .owner = &plugin, .draw = noopDraw });
-    try host.registerNativeMenuItem(.{ .id = "victim.native", .parent_menu_id = "shell.menu.view", .owner = &plugin, .title = "V", .run = noopDraw });
+    try host.registerMenuSection(.{ .id = "victim.section", .parent_menu_id = "fizzy.menu.view", .owner = &plugin, .draw = noopDraw });
+    try host.registerNativeMenuItem(.{ .id = "victim.native", .parent_menu_id = "fizzy.menu.view", .owner = &plugin, .title = "V", .run = noopDraw });
     try host.registerCommand(.{ .id = "victim.cmd", .owner = &plugin, .title = "V", .run = noopRun });
     try host.registerFileRowFillColor(.{ .owner = &plugin, .color = noColor });
     try host.registerFileIcon(.{ .owner = &plugin, .draw = noIcon });

@@ -1,6 +1,6 @@
 //! A loaded spritesheet: GPU `source` texture + indexed sprite metadata.
 //!
-//! The shell's `editor.atlas` uses this minimal type for UI icons. The pixel-art
+//! The fizzy's `editor.atlas` uses this minimal type for UI icons. The pixel-art
 //! plugin's packed output uses the richer `Internal.Atlas` instead.
 const std = @import("std");
 const dvui = @import("dvui");

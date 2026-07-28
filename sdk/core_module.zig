@@ -33,7 +33,7 @@ pub fn addImports(
     return null;
 }
 
-/// The fuzzy matcher behind `core.fuzzy` — shared by the shell and, through `core`, by every
+/// The fuzzy matcher behind `core.fuzzy` — shared by fizzy and, through `core`, by every
 /// plugin. `with_tui = false` matters: zf's default build wires up its standalone terminal
 /// binary, whose `libvaxis` dependency would otherwise be fetched into every plugin build for a
 /// binary nobody here builds.

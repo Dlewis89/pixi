@@ -10,7 +10,7 @@ const std = @import("std");
 
 pub const Line = struct {
     level: std.log.Level,
-    /// Owned copy of the source scope/plugin id ("shell", "zig", "text", …) — kept separate
+    /// Owned copy of the source scope/plugin id ("fizzy", "zig", "text", …) — kept separate
     /// from `text` (rather than parsed back out of it) so the Output panel can filter by
     /// plugin without re-parsing every line's formatted prefix each frame.
     scope: []const u8,
@@ -29,9 +29,9 @@ var spin: std.atomic.Mutex = .unlocked;
 var lines: std.ArrayListUnmanaged(Line) = .empty;
 
 /// Matches `std.Options.logFn`'s signature so it can be assigned directly as (or called
-/// from) a `logFn` wrapper. Used for the shell's own (comptime-scoped) `std.log` calls —
+/// from) a `logFn` wrapper. Used for fizzy's own (comptime-scoped) `std.log` calls —
 /// this covers every statically-linked scope (`.default`, dvui's own `.dvui`, the SDL
-/// backend's `SDLBACKEND`/`SDL_SYSTEM`/`SDL_RENDER`, …), not just the shell's literal code.
+/// backend's `SDLBACKEND`/`SDL_SYSTEM`/`SDL_RENDER`, …), not just fizzy's literal code.
 /// All of it is grouped under one `"fizzy"` tab rather than one tab per internal scope —
 /// only genuine plugin dylibs (via `appendLine`/`Host.logLine`) get their own tab, since
 /// those are the only scopes a user would actually want to filter on independently.

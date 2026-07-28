@@ -43,7 +43,7 @@ pub fn loadSettings(self: *State, host: *sdk.Host) void {
     Schema.load(host, "text", &self.settings);
 }
 
-/// Register schema with the Host — shell draws shared controls from `Schema.settings`.
+/// Register schema with the Host — fizzy draws shared controls from `Schema.settings`.
 pub fn registerSettings(self: *State, host: *sdk.Host, plugin: *sdk.Plugin) !void {
     try Schema.register(host, plugin, .{
         .title = "Text",

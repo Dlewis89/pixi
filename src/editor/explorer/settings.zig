@@ -1,4 +1,4 @@
-//! The shell's own settings, as data.
+//! The fizzy's own settings, as data.
 //!
 //! These used to be drawn inline inside nested `dvui.groupBox`es. They're now a flat declarative
 //! table: `SettingsTree` renders them as branches/leaves of the settings tree and matches the
@@ -37,7 +37,7 @@ pub const Search = struct {
 /// One row in the settings tree: a named, described control the user can search for.
 ///
 /// `label`/`key`/`description` are the same three things a plugin's settings cell carries
-/// (`sdk.settings.Setting`), and `SettingRow` draws them identically — a shell setting and a
+/// (`sdk.settings.Setting`), and `SettingRow` draws them identically — a fizzy setting and a
 /// plugin setting must be indistinguishable in the pane.
 pub const Item = struct {
     /// One of the two names the search matches on. Not drawn for a `search` item — those label

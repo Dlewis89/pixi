@@ -15,6 +15,13 @@ extern void FizzyNativeMenuGenericAction(int tag);
  * selection, …). Backed by the same predicate the dvui menu greys its row with. */
 extern bool FizzyNativeMenuActionEnabled(int tag);
 
+/* Same idea as `FizzyNativeMenuActionEnabled`, but for a plugin-contributed native item (tag is
+ * an index into `host.native_menu_items`, like `FizzyNativeMenuGenericAction`'s). Reads the
+ * item's named `Command`'s `isEnabled`, same source `Host.drawMenuItem` greys the in-app row
+ * from — Transform/Grid Layout/Format Document used to be always-enabled here (no per-row hook
+ * existed) even while their dvui counterparts greyed correctly. */
+extern bool FizzyNativeMenuGenericActionEnabled(int tag);
+
 /* Current title for the model item with this tag, or NULL to leave it alone. AppKit menus are
  * retained state, so a label that depends on app state ("Show Explorer" / "Hide Explorer") has
  * to be refreshed; validation runs just before a menu displays, which is exactly the moment. */
@@ -63,8 +70,10 @@ extern void FizzyNativeMenuAboutAction(void);
     if (FizzyNativeMenuInputBlocked()) {
         return NO;
     }
-    if ([menuItem action] == @selector(genericMenuAction:) ||
-        [menuItem action] == @selector(recentFolderAction:) ||
+    if ([menuItem action] == @selector(genericMenuAction:)) {
+        return FizzyNativeMenuGenericActionEnabled((int)[menuItem tag]) ? YES : NO;
+    }
+    if ([menuItem action] == @selector(recentFolderAction:) ||
         [menuItem action] == @selector(about:)) {
         return YES;
     }

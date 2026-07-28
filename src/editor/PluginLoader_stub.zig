@@ -1,5 +1,5 @@
 //! Wasm stub — dynamic plugin loading is native-only (no `dlopen` in the browser; web plugins
-//! are statically linked). The shell still references these types in cross-platform code
+//! are statically linked). The fizzy still references these types in cross-platform code
 //! (e.g. the Settings → Plugins list), so `LoadedLib` mirrors the read-shape of the real
 //! `PluginLoader.LoadedLib`. On wasm `loaded_plugin_libs` is always empty, so the values are
 //! never produced — only the type has to satisfy those field accesses.

@@ -3,4 +3,6 @@
     .name = "Markdown",
     .version = "0.1.0",
     .min_sdk_version = "",
+    .description = "Live preview for .md files.",
+    .tags = .{ "viewer", "markdown" },
 }

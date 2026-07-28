@@ -3,7 +3,7 @@
 //! Shape:
 //!
 //!     [search] Search settings…
-//!     ▾ Fizzy            ← the shell's own settings (`explorer/settings.zig`'s `groups`)
+//!     ▾ Fizzy            ← fizzy's own settings (`explorer/settings.zig`'s `groups`)
 //!       ▾ Appearance
 //!       ▾ Input
 //!       ▾ Keyboard Shortcuts
@@ -12,7 +12,7 @@
 //!     ▾ Pixi
 //!
 //! Everything a plugin contributes is still drawn by `PluginSettingsPane.drawField`, so plugin
-//! controls and shell controls look identical. This file owns *what* is shown, *where*, and the
+//! controls and fizzy's own controls look identical. This file owns *what* is shown, *where*, and the
 //! per-leaf setting name (with search-match highlighting); control drawers only draw the widget.
 //!
 //! **Search is a data pass, not a draw pass.** `collect` scores every leaf with `core.fuzzy`
@@ -28,15 +28,15 @@ const fizzy = @import("../fizzy.zig");
 const PluginSettingsPane = @import("PluginSettingsPane.zig");
 const SettingRow = @import("SettingRow.zig");
 const PluginStore = @import("PluginStore.zig");
-const shell_settings = @import("explorer/settings.zig");
+const fizzy_settings = @import("explorer/settings.zig");
 
 const fuzzy = core.fuzzy;
 const wdvui = core.dvui;
 const settings = fizzy.sdk.settings;
 
-/// The shell's own branch. Named for the app so it reads as a peer of the plugin branches
+/// Fizzy's own branch. Named for the app so it reads as a peer of the plugin branches
 /// rather than as a special case.
-const shell_branch_title = "Fizzy";
+const fizzy_branch_title = "Fizzy";
 
 /// Expand/collapse state, keyed by a hash of the branch's path through the tree
 /// ("Fizzy/Appearance", a plugin id, …) rather than by its widget id.
@@ -99,12 +99,12 @@ const Branch = struct {
     children: std.ArrayListUnmanaged(Branch) = .empty,
     /// Set for plugin branches; drives which `drawField` source the leaves index into.
     schema: ?*const settings.SettingsSchema = null,
-    /// Set for the shell's group branches.
-    group: ?*const shell_settings.Group = null,
+    /// Set for fizzy's own group branches.
+    group: ?*const fizzy_settings.Group = null,
     /// Set for a failed-plugin branch, whose single "leaf" is an error message.
     failed: ?fizzy.Editor.FailedPlugin = null,
-    /// True only for the shell's own root branch — the one that gets the fox.
-    is_shell: bool = false,
+    /// True only for fizzy's own root branch — the one that gets the fox.
+    is_fizzy: bool = false,
     /// Stable identity for expand/collapse state — see `open_branches`.
     key: u64 = 0,
 };
@@ -155,27 +155,27 @@ fn collect(arena: std.mem.Allocator, query: *const fuzzy.Query) std.ArrayListUnm
     var roots: std.ArrayListUnmanaged(Branch) = .empty;
     const editor = fizzy.editor;
 
-    // --- the shell's own settings, one child branch per category
-    var shell: Branch = .{
-        .title = shell_branch_title,
+    // --- fizzy's own settings, one child branch per category
+    var fizzy_branch: Branch = .{
+        .title = fizzy_branch_title,
         .score = std.math.floatMax(f64),
         .tie = 0,
-        .is_shell = true,
-        .key = branchKey(shell_branch_title),
+        .is_fizzy = true,
+        .key = branchKey(fizzy_branch_title),
     };
-    for (&shell_settings.groups, 0..) |*group, gi| {
+    for (&fizzy_settings.groups, 0..) |*group, gi| {
         var child: Branch = .{
             .title = group.title,
             .score = std.math.floatMax(f64),
             .tie = gi,
             .group = group,
-            .key = branchKey(std.fmt.allocPrint(arena, "{s}/{s}", .{ shell_branch_title, group.title }) catch group.title),
+            .key = branchKey(std.fmt.allocPrint(arena, "{s}/{s}", .{ fizzy_branch_title, group.title }) catch group.title),
         };
         for (group.items, 0..) |item, ii| {
             // An item that owns a searchable list scores itself: its rows, not its label, are
             // what the query is really matching against (`settings.Search`).
             const s = if (item.search) |sr| sr.score(query) orelse continue else blk: {
-                const path = std.fmt.allocPrint(arena, "{s}/{s}/{s}", .{ shell_branch_title, group.title, item.label }) catch item.label;
+                const path = std.fmt.allocPrint(arena, "{s}/{s}/{s}", .{ fizzy_branch_title, group.title, item.label }) catch item.label;
                 break :blk scoreLeaf(query, path, item.label, item.key, item.keywords) orelse continue;
             };
             child.leaves.append(arena, .{
@@ -190,12 +190,12 @@ fn collect(arena: std.mem.Allocator, query: *const fuzzy.Query) std.ArrayListUnm
         }
         if (child.leaves.items.len == 0) continue;
         std.sort.block(Leaf, child.leaves.items, {}, lowerLeaf);
-        if (child.score < shell.score) shell.score = child.score;
-        shell.children.append(arena, child) catch {};
+        if (child.score < fizzy_branch.score) fizzy_branch.score = child.score;
+        fizzy_branch.children.append(arena, child) catch {};
     }
-    if (shell.children.items.len > 0) {
-        std.sort.block(Branch, shell.children.items, {}, lowerBranch);
-        roots.append(arena, shell) catch {};
+    if (fizzy_branch.children.items.len > 0) {
+        std.sort.block(Branch, fizzy_branch.children.items, {}, lowerBranch);
+        roots.append(arena, fizzy_branch) catch {};
     }
 
     // --- one branch per plugin that registered a schema
@@ -254,7 +254,7 @@ fn collect(arena: std.mem.Allocator, query: *const fuzzy.Query) std.ArrayListUnm
     }
 
     // Only reorder when there's a query — with an empty one every score is 0 and the declaration
-    // order (shell first, then plugins in registration order) is the intended reading order.
+    // order (fizzy first, then plugins in registration order) is the intended reading order.
     if (!query.isEmpty()) std.sort.block(Branch, roots.items, {}, lowerBranch);
     return roots;
 }
@@ -403,7 +403,7 @@ fn drawBranch(
 }
 
 /// One setting row: the setting name (match-highlighted while searching), then the control body.
-/// Labels live here so shell and plugin rows share the same chrome; drawers only draw widgets.
+/// Labels live here so fizzy's own and plugin rows share the same chrome; drawers only draw widgets.
 fn drawLeaves(branch: *const Branch, query: *const fuzzy.Query) !void {
     if (branch.failed) |f| {
         drawFailure(f);
@@ -427,7 +427,7 @@ fn drawLeaves(branch: *const Branch, query: *const fuzzy.Query) !void {
         // A `settings.Search` item draws its own rows (each with its own name), so the leaf's own
         // name/key header above them would just be a second, redundant heading — but its
         // description still belongs at the top, explaining the table that follows.
-        const search_item: ?shell_settings.Search =
+        const search_item: ?fizzy_settings.Search =
             if (branch.group) |group| group.items[leaf.index].search else null;
 
         if (search_item == null) SettingRow.header(leaf.label, leaf.key, query);
@@ -535,7 +535,7 @@ fn drawRow(b: *wdvui.TreeWidget.Branch, branch: *const Branch, query: *const fuz
 /// Always drawn inside a `treeRowGlyph` slot, so nothing here manages its own size.
 fn drawIdentityIcon(branch: *const Branch, style: RowStyle, color: dvui.Color) void {
     if (style == .category) {
-        // Each shell category names its own glyph (`Group.icon`) — a palette for Appearance, a
+        // Each fizzy category names its own glyph (`Group.icon`) — a palette for Appearance, a
         // bug for Debugging — so the row says what it configures. A folder would only say
         // "there are more rows under here", which the caret already does.
         const glyph = if (branch.group) |g| g.icon else icons.tvg.entypo.folder;
@@ -549,7 +549,7 @@ fn drawIdentityIcon(branch: *const Branch, style: RowStyle, color: dvui.Color) v
         return;
     }
 
-    if (branch.is_shell) {
+    if (branch.is_fizzy) {
         // `icon.png` is the pixel-art F (not `fox.png`). Use `.imageFile` so dvui caches the
         // texture — `fromImageFileBytes` re-decodes and leaks a 1024² buffer every frame.
         const logo: dvui.ImageSource = .{ .imageFile = .{

@@ -178,7 +178,7 @@ pub fn track(self: *DocumentWatcher, editor: *fizzy.Editor, doc: fizzy.sdk.DocHa
         self.unwatchPath(old.value.path);
         self.gpa.free(old.value.path);
     }
-    // Path already tracked under a different id — shouldn't happen (shell dedupes opens), but
+    // Path already tracked under a different id — shouldn't happen (fizzy dedupes opens), but
     // drop the stale mapping so we don't leave a dangling watch key.
     if (self.by_path.fetchRemove(norm)) |old_id| {
         if (self.by_id.fetchRemove(old_id.value)) |stale| {
@@ -284,7 +284,7 @@ pub fn notifyPathChanged(self: *DocumentWatcher, editor: *fizzy.Editor, path: []
         return;
     }
     // Normalization can disagree with the path stored at track time (symlink / cwd); fall
-    // back to comparing against every open doc the shell knows about.
+    // back to comparing against every open doc fizzy knows about.
     for (editor.open_files.values()) |doc| {
         const doc_path = editor.docPath(doc);
         if (doc_path.len == 0) continue;

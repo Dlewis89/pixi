@@ -1,5 +1,5 @@
 //! The image viewer plugin: read-only PNG/JPG/JPEG tabs with zoom/pan. Registration + document
-//! vtable. Module root — the shell resolves `@import("image")` to this file when compiled into
+//! vtable. Module root — fizzy resolves `@import("image")` to this file when compiled into
 //! the app (static embed); the generated dylib root imports it as `plugin_impl`.
 const std = @import("std");
 const sdk = @import("fizzy_sdk");
@@ -14,7 +14,7 @@ const DocHandle = sdk.DocHandle;
 /// identity, not duplicated as string literals here.
 pub const plugin_options = @import("fizzy_plugin_options");
 
-/// This plugin's stable id — the single source of truth other modules (e.g. the shell's
+/// This plugin's stable id — the single source of truth other modules (e.g. fizzy's
 /// `Editor.isBundledPluginId`) read instead of retyping the string.
 pub const plugin_id = plugin_options.id;
 

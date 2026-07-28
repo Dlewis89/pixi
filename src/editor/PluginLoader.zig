@@ -502,6 +502,66 @@ pub fn probeName(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
     return allocator.dupe(u8, name) catch null;
 }
 
+/// The store-facing half of a plugin's embedded manifest, read straight off the dylib. Every
+/// field is owned by the caller — free with `freeProbedManifest`.
+///
+/// One struct (and one `dlopen` + zon parse) rather than a `probeX` per field: these all come out
+/// of the *same* embedded `fizzy_plugin_manifest_zon` blob, and the store needs several of them
+/// for the same card. Per-field probes meant re-opening the dylib once per field and a parallel
+/// cache per field in `PluginStore` — see `manifest_cache` there, which is now the only one.
+pub const ProbedManifest = struct {
+    description: []u8 = &.{},
+    tags: [][]u8 = &.{},
+    author: []u8 = &.{},
+    author_url: []u8 = &.{},
+};
+
+/// Best-effort read of `ProbedManifest` straight from the dylib, **without registering it** —
+/// same shape as `probeName`, but there's no legacy C export to fall back to (these postdate the
+/// fixed C-ABI export list; they only ever lived in the embedded manifest zon). Null when the
+/// dylib or its manifest couldn't be read at all, which callers can distinguish from a
+/// successfully-read manifest whose fields happen to be empty.
+pub fn probeManifestInfo(allocator: std.mem.Allocator, path: []const u8) ?ProbedManifest {
+    _ = markPathOpened(path); // see `probeName`
+    var lib = DynLib.open(path) catch return null;
+    defer lib.close();
+    const get_zon = lib.lookup(dylib_api.GetManifestZonFn, dylib_api.symbol_manifest_zon) orelse return null;
+    const zon = std.mem.span(get_zon());
+    if (zon.len == 0) return null;
+    const parsed = sdk.manifest.parse(allocator, zon) catch return null;
+    defer sdk.manifest.free(allocator, parsed);
+
+    var out: ProbedManifest = .{};
+    errdefer freeProbedManifest(allocator, out);
+    out.description = allocator.dupe(u8, parsed.description) catch return null;
+    out.author = allocator.dupe(u8, parsed.author) catch return null;
+    out.author_url = allocator.dupe(u8, parsed.author_url) catch return null;
+    out.tags = dupeTags(allocator, parsed.tags) catch return null;
+    return out;
+}
+
+pub fn freeProbedManifest(allocator: std.mem.Allocator, m: ProbedManifest) void {
+    allocator.free(m.description);
+    allocator.free(m.author);
+    allocator.free(m.author_url);
+    for (m.tags) |t| allocator.free(t);
+    allocator.free(m.tags);
+}
+
+fn dupeTags(allocator: std.mem.Allocator, tags: []const []const u8) ![][]u8 {
+    const out = try allocator.alloc([]u8, tags.len);
+    var filled: usize = 0;
+    errdefer {
+        for (out[0..filled]) |t| allocator.free(t);
+        allocator.free(out);
+    }
+    for (tags, 0..) |t, i| {
+        out[i] = try allocator.dupe(u8, t);
+        filled += 1;
+    }
+    return out;
+}
+
 /// Best-effort read of version exports from a dylib (for failure diagnostics).
 /// Prefers semver from the embedded manifest zon when present.
 pub fn probeVersionInfo(path: []const u8) ?PluginVersionInfo {

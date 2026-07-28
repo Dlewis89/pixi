@@ -50,7 +50,7 @@ pub fn addSteps(
     // Extra wasm exports beyond dvui's own (`dvui_init`/`dvui_update`/etc.). The wasm
     // linker only emits symbols listed here, so `export fn` in Zig isn't enough on its
     // own — without this line our trackpad pinch entry point would compile cleanly but
-    // be missing from `instance.exports`, and the JS bootstrap in `web/shell.html`
+    // be missing from `instance.exports`, and the JS bootstrap in `web/index.html`
     // would never be able to forward pinch deltas into the canvas widget.
     web_exe.root_module.export_symbol_names = &[_][]const u8{
         "FizzyWebTrackpadMagnification",
@@ -102,6 +102,7 @@ pub fn addSteps(
         .dvui = dvui_web_dep.module("dvui_web"),
         .core = core_module_web,
         .sdk = sdk_module_web,
+        .icons = icons_web,
     }, web_exe.root_module);
     _ = image_plugin.addStaticModule(b, web_target, optimize, .{
         .dvui = dvui_web_dep.module("dvui_web"),
@@ -125,7 +126,7 @@ pub fn addSteps(
         }),
     });
     const cb_run = b.addRunArtifact(cb);
-    cb_run.addFileArg(b.path("web/shell.html"));
+    cb_run.addFileArg(b.path("web/index.html"));
     cb_run.addFileArg(dvui_web_dep.path("src/backends/web.js"));
     cb_run.addFileArg(web_exe.getEmittedBin());
     const index_html_with_hash = cb_run.captureStdOut(.{});

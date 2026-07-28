@@ -1,6 +1,6 @@
 # Fizzy Plugin System
 
-Fizzy is a near-empty **shell** — a window, a frame loop, and a menu/sidebar/panel layout — with
+Fizzy is itself a near-empty host — a window, a frame loop, and a menu/sidebar/panel layout — with
 no editing features of its own. Everything the user sees (the file explorer, tabs/splits, the
 pixel-art editor, the text editor) is contributed by **plugins** that register against a stable
 SDK. The same plugin source compiles two ways: statically into the app, or as a runtime dynamic
@@ -24,13 +24,13 @@ the first time; use it as reference after that.
 
 ```
         ┌─────────────────────────────────────────────────────────┐
-        │                        Shell (Editor)                   │
+        │                        Fizzy (Editor)                   │
         │  window · frame loop · menu/sidebar/panel layout · docs │
         │                                                         │
         │   ┌──────────────┐        ┌──────────────────────────┐  │
         │   │     Host     │◄──────►│        EditorAPI         │  │
-        │   │  registries  │  reach │ (shell read/util surface │  │
-        │   │  + services  │  back  │  arena, folder, docs, …) │  │
+        │   │  registries  │  reach │ (Fizzy's read/util       │  │
+        │   │  + services  │  back  │  surface: arena, folder…) │  │
         │   └──────┬───────┘        └──────────────────────────┘  │
         └──────────┼──────────────────────────────────────────────┘
                    │ register(host) + vtable calls
@@ -43,23 +43,23 @@ the first time; use it as reference after that.
 
 | Type | Role |
 |------|------|
-| `Host` | What the shell hands every plugin. Holds the **registries** (the shell iterates these instead of hardcoding panes) + a **service locator** for inter-plugin APIs. |
-| `Plugin` | A plugin's identity + **vtable** of optional hooks. The shell calls these; a plugin implements only what it needs. |
-| `DocHandle` | Opaque handle to an open document: `{ ptr, id, owner: *Plugin }`. The shell stores these per tab and **routes every document operation to `owner`** — it never inspects `ptr`. |
+| `Host` | What Fizzy hands every plugin. Holds the **registries** (Fizzy iterates these instead of hardcoding panes) + a **service locator** for inter-plugin APIs. |
+| `Plugin` | A plugin's identity + **vtable** of optional hooks. Fizzy calls these; a plugin implements only what it needs. |
+| `DocHandle` | Opaque handle to an open document: `{ ptr, id, owner: *Plugin }`. Fizzy stores these per tab and **routes every document operation to `owner`** — it never inspects `ptr`. |
 | `regions` | The contribution structs a plugin registers: `SidebarView`, `BottomView`, `CenterProvider`, `MenuContribution`, `Command`, `LanguageSupport`, … There is no settings region here — see `sdk.settings` below. |
-| `sdk.settings` (`settings.zig`) | Comptime settings API: `sdk.settings.Schema(struct { … })` over `Value(T, .{ .description = … })` cells derives a persisted-values type + a `SettingsSchema` you register with the Host. The shell's settings pane draws it for you — no hand-rolled dvui settings section. |
+| `sdk.settings` (`settings.zig`) | Comptime settings API: `sdk.settings.Schema(struct { … })` over `Value(T, .{ .description = … })` cells derives a persisted-values type + a `SettingsSchema` you register with the Host. Fizzy's settings pane draws it for you — no hand-rolled dvui settings section. |
 | `dylib` / `dvui_context` | The C-ABI entry contract + dvui-context injection used when a plugin is loaded as a runtime library. |
 
-**The shell owns no features.** Each frame it iterates the Host registries and draws whatever
+**Fizzy owns no features.** Each frame it iterates the Host registries and draws whatever
 plugins contributed. Adding a pane, panel tab, menu, document type, or settings section is a
-`Host.register*` call from inside a plugin's `register` — never a shell edit.
+`Host.register*` call from inside a plugin's `register` — never an edit to Fizzy itself.
 
 ### Two link modes, one source
 
 | Mode | Who | Targets | How it registers |
 |------|-----|---------|------------------|
-| **Static** | Built-in plugins (`text`, `image`, `workbench`, `markdown`) — always shipped with the app | all, incl. web | shell calls `plugin.register(&host)` directly at startup |
-| **Dynamic** | Third-party plugins (e.g. [`pixi`](https://github.com/fizzyedit/pixi)) | desktop only (no `dlopen` on web) | shell `dlopen`s the library and calls its `fizzy_plugin_register` C entry, which calls the same `register(&host)` |
+| **Static** | Built-in plugins (`text`, `image`, `workbench`, `markdown`) — always shipped with the app | all, incl. web | Fizzy calls `plugin.register(&host)` directly at startup |
+| **Dynamic** | Third-party plugins (e.g. [`pixi`](https://github.com/fizzyedit/pixi)) | desktop only (no `dlopen` on web) | Fizzy `dlopen`s the library and calls its `fizzy_plugin_register` C entry, which calls the same `register(&host)` |
 
 Built-in plugins live in this repo and ship inside the signed app bundle; they are never
 distributed or versioned separately. The dynamic path is the one this doc is mostly about: an
@@ -97,13 +97,15 @@ lives in exactly one place: `plugin.zig.zon`.
     .name = "My Plugin",
     .version = "0.1.0",
     .min_sdk_version = "",
+    .description = "What it does, one line.",
+    .tags = .{ "editor" },
 }
 ```
 
-This is **identity only** — `id`/`name`/`version`/`min_sdk_version`. There is no
-`hooks`/`contributes`/`settings` list: capability is unaudited, and
-`plugin.zig`'s `register(host)` + vtable is the sole source of truth for what your plugin
-actually does.
+This is **identity plus store-browse metadata** — `id`/`name`/`version`/`min_sdk_version`/
+`description`/`tags`. There is no `hooks`/`contributes`/`settings` list: capability is
+unaudited, and `plugin.zig`'s `register(host)` + vtable is the sole source of truth for what
+your plugin actually does.
 
 - **`id`** — stable, snake_case, must match the installed dylib's basename (`my_plugin.dylib`/
   `.so`/`.dll`). This is also the `Plugin.id` you set in `plugin.zig` — nothing enforces the two
@@ -114,6 +116,20 @@ actually does.
 - **`min_sdk_version`** — minimum host SDK version required to load. Empty string (`""`) means
   "whatever SDK this build was compiled against, no floor enforced" — the build fills that in
   from the fizzy commit you pinned.
+- **`description`** — one-line summary shown on the store's plugin detail page and card.
+  Optional (`""` by default); a `registry/<id>.json` entry's own `description` (§6.4) wins when
+  both are set, since that one can be edited without a release.
+- **`tags`** — free-form category/keyword strings used for store search/scoring (§3.7's plugin
+  *shape* is a different, undeclared concept — this is just search keywords). Optional (empty by
+  default); same override relationship with `registry/<id>.json`'s `tags` as `description`. You
+  never have to hand-duplicate these into your `registry/<id>.json` PR — the aggregator falls
+  back to whatever your build's `manifest.json` reports when the registry entry leaves them blank
+  (§6.4/§6.5).
+- **`author`** / **`author_url`** — display credit and an optional link for it. Both optional.
+  **Cosmetic and self-asserted**: anyone can write anything here, so the store never treats it as
+  a trust signal. It is shown beside a **`publisher`**, which the registry derives from the
+  `manifest_url` your binaries are actually published from and which no `plugin.zig.zon` can
+  restate — see §6.4. Only `http`/`https` `author_url`s are ever opened.
 
 The build reads this file at configure time (`fizzy.plugin.create`, via `readManifest`) and also
 embeds its raw text verbatim into the dylib (`fizzy_plugin_manifest_zon`), so a disabled/unloaded
@@ -309,7 +325,7 @@ pub fn register(host: *sdk.Host) !void {
 ```
 
 Each contribution struct (defined in [`src/sdk/regions.zig`](../src/sdk/regions.zig)) takes a
-stable, namespaced `id`, the owning `*Plugin`, and a `draw`/resolver fn. The shell renders the
+stable, namespaced `id`, the owning `*Plugin`, and a `draw`/resolver fn. Fizzy renders the
 set — and shows a tab strip automatically when more than one plugin contributes to the same
 region. Everything registered here is torn down automatically on unload (disable/uninstall via
 the plugin store) and re-added on load.
@@ -351,7 +367,7 @@ pub fn register(host: *sdk.Host) !void {
     MySettings.load(host, plugin.id, &settings);           // apply any persisted blob
     try MySettings.register(host, &plugin, .{
         .title = "My Plugin",
-        .value = &settings,                                // shell draws shared controls
+        .value = &settings,                                // Fizzy draws shared controls
     });
 }
 
@@ -362,11 +378,11 @@ if (settings.format_on_save.get()) formatDocument(doc);
 **Every setting describes itself.** A cell's second (comptime) parameter is
 `settings.Options{ description, name, min, max, step }`, and `description` has no default — a
 setting declared without one is a compile error. The pane has a permanent place for it (see the
-row shape below), so there is no shell-side table of strings that can drift from the plugin that
+row shape below), so there is no Fizzy-side table of strings that can drift from the plugin that
 owns the setting. Metadata lives entirely in the *type*: `@sizeOf(Value(T, …)) == @sizeOf(T)`,
 and only the payload is ever stored or persisted.
 
-The shell draws each setting as one group, VSCode-style: the name (derived from the field name —
+Fizzy draws each setting as one group, VSCode-style: the name (derived from the field name —
 `insert_spaces_on_tab` → `Insert spaces on tab`, or `Options.name` to override), the zon key
 underneath in smaller dim mono, the wrapped description, and then the control at full width.
 Booleans are the exception — their checkbox sits before the description on one line. Both the
@@ -390,7 +406,7 @@ commit. The on-disk shape is always the bare payload (`.tab_size = 8`), never th
 `settings.zon` files written before cells existed keep loading unchanged.
 
 Every plugin's block lives as a real, hand-editable nested ZON struct literal keyed by plugin
-id inside the shell's own `{config}/settings.zon`:
+id inside Fizzy's own `{config}/settings.zon`:
 
 ```
 .plugins = .{
@@ -411,7 +427,7 @@ string field, call `MySettings.deinit(&settings)` when you tear that value down*
 scalars/enums. Don't free a string field yourself, and don't assign one directly if you want it
 persisted — go through the settings pane or `applyZon`, or you'll leak the schema's copy.
 
-Author fields live under `.settings` so they can never collide with the shell-reserved
+Author fields live under `.settings` so they can never collide with the Fizzy-reserved
 `.enabled`. Only fields whose payload differs from the cell's declared default is written; an all-default
 value removes that plugin's `.settings` (and if also disabled, the whole `.plugins.<id>` entry).
 `src/editor/SettingsPluginsZon.zig` locates/composes fields by source byte-span via the same
@@ -435,7 +451,7 @@ own settings-pane interaction. This is on by default and not configurable; if th
 start (platform quirk, resource limit) fizzy still launches normally, it just doesn't get live
 reconciliation that session.
 
-**Plugins do not draw settings.** They register a typed value + field metadata only. The shell's
+**Plugins do not draw settings.** They register a typed value + field metadata only. Fizzy's
 `PluginSettingsPane` renders shared controls (checkbox / slider / enum dropdown / …) so every
 plugin's settings look the same. Edits go through `Access` and call `persist`, which stores the
 zon blob and notifies `Plugin.VTable.settingsChanged`.
@@ -451,7 +467,7 @@ plugin gets an Enabled-toggle-only row instead of its fields.
 
 - **Lifecycle** — `deinit`, `initPlugin`.
 - **Document ownership** — `fileTypePriority(ext)` (claim file extensions), `loadDocument` /
-  `loadDocumentFromBytes` / `createDocument`, `saveDocument`, `reloadDocument` (optional — shell
+  `loadDocumentFromBytes` / `createDocument`, `saveDocument`, `reloadDocument` (optional — Fizzy's
   document watcher reloads clean open tabs when the file changes on disk), `closeDocument`,
   `isDirty`, `undo`/`redo`/`canUndo`/`canRedo`, plus opaque document-buffer management for the
   async load path.
@@ -459,7 +475,7 @@ plugin gets an Enabled-toggle-only row instead of its fields.
   `documentPath`, `setDocumentPath`, dirty/save indicators. These keep `DocHandle` opaque so the
   file-management plugin never sees a plugin-specific type.
 - **Rendering** — `drawDocument(doc)` (the document's content in a tab/pane),
-  `drawDocumentInfobar(doc, rect)` (active-doc status in the shell-sized infobar slot).
+  `drawDocumentInfobar(doc, rect)` (active-doc status in the infobar slot Fizzy provides).
 - **Per-frame phases** — `beginFrame`, `prepareFrame`, `tickKeybinds`, `tickOpenDocuments`,
   `tickActiveDocument`, `drawOverlay`, `endFrame`, `needsContinuousRepaint`. A plugin does its own
   domain work *inside* these generic phases (see the lifecycle table below for exactly when each
@@ -498,12 +514,12 @@ paired `host.*` request. Call sites are in `src/editor/Editor.zig` (verify line 
 |---|---|---|
 | `beginFrame` | broadcast | top of the draw, before workspace rebuild (`renderFrame`) |
 | `prepareFrame` | requested | after layout, before draw — only when `pending_composite_warmup` was set by `host.requestPrepareFrame()` |
-| `needsContinuousRepaint` | broadcast | the shell's "should I keep repainting vs idle" decision |
+| `needsContinuousRepaint` | broadcast | Fizzy's "should I keep repainting vs idle" decision |
 | `tickOpenDocuments` | broadcast | early per-frame tick; return true → request a follow-up anim frame |
 | `drawDocument(doc)` | active-doc | center region, when the workbench draws the focused tab |
 | `tickActiveDocument(id)` | broadcast | inside the active document container (has the timer-anchor id) |
 | `endFrame` | broadcast | `defer` at the end of the document-container block |
-| `tickKeybinds` | broadcast | after the center draw, before the shell's global keybinds |
+| `tickKeybinds` | broadcast | after the center draw, before Fizzy's global keybinds |
 | `drawOverlay` | broadcast | right after `tickKeybinds`, on top of the frame |
 
 Outside the frame loop: `onFolderClose` / `onFolderOpen` fire `[broadcast]` from
@@ -511,14 +527,14 @@ Outside the frame loop: `onFolderClose` / `onFolderOpen` fire `[broadcast]` from
 fire `[active-doc]` from the save / close / quit-all paths; `loadDocument` runs on a **background
 load-worker thread** (touch only the host allocator + the given buffer, no dvui).
 
-### 3.3 Reaching the shell: SDK-held injection, no storage file
+### 3.3 Reaching Fizzy: SDK-held injection, no storage file
 
-Plugin code can't import the shell, so the shell **injects pointers** into the plugin once at
+Plugin code can't import Fizzy, so Fizzy **injects pointers** into the plugin once at
 load — the allocator and the `*Host` — via the `fizzy_plugin_set_globals` C export. `exportEntry`
 catches them into the SDK itself, so your code just reads:
 
 - **`sdk.allocator()`** — the persistent host allocator.
-- **`sdk.host()`** — the shell `*Host`: registries, services, and the `EditorAPI` read surface
+- **`sdk.host()`** — Fizzy's `*Host`: registries, services, and the `EditorAPI` read surface
   (open folder, active doc, arena allocator, save dialogs).
 - **`sdk.refresh()`** — wake the app event loop for another frame. **Safe from any thread**
   (LSP workers, load jobs, PTY readers). Call this when background work finishes and the UI
@@ -533,10 +549,10 @@ during `register` and read back via `@ptrCast` in your vtable functions. There i
 
 ### 3.4 Commands — how a plugin contributes its *own* features
 
-Anything a plugin **invokes** rather than implements as a shell callback — plugin-specific
+Anything a plugin **invokes** rather than implements as a Fizzy callback — plugin-specific
 features (pixi's *Pack Project*) and editing actions whose meaning varies per editor (*Copy*,
 *Paste*, *Transform*, *Delete Selection*) — is a `Command`, not a vtable hook. Register it once;
-the shell triggers it by id via `host.runCommand("<id>")` **without knowing what it does**:
+Fizzy triggers it by id via `host.runCommand("<id>")` **without knowing what it does**:
 
 ```zig
 try host.registerCommand(.{
@@ -548,15 +564,15 @@ try host.registerCommand(.{
 });
 ```
 
-**Per-owner action convention.** The shell's built-in Edit menu/keybinds (*Copy* `copy`, *Paste*
+**Per-owner action convention.** Fizzy's built-in Edit menu/keybinds (*Copy* `copy`, *Paste*
 `paste`, *Transform* `transform`, accept `acceptEdit`, cancel `cancelEdit`, delete
 `deleteSelection`) and *Grid Layout* (`gridLayout`) dispatch to `"<active_owner_id>.<action>"`. So
-focusing a pixi doc runs `"pixi.copy"`; a second editor answers the same shell actions by
+focusing a pixi doc runs `"pixi.copy"`; a second editor answers the same actions by
 registering its own `"<its_id>.copy"`, `…transform`, etc. An action the owner didn't register is
 simply a no-op for its documents.
 
 **Menu rows name a command, and get its chord for free.** A menu item is never told what
-shortcut to display — it names the command it runs and the shell resolves the chord from the
+shortcut to display — it names the command it runs and Fizzy resolves the chord from the
 live keymap, so a rebind in the Keyboard Shortcuts pane shows up in both menu bars immediately:
 
 ```zig
@@ -571,7 +587,7 @@ Both fields are optional; omit them for a row with no command behind it, which t
 carries no accelerator. `drawMenuItem`'s second parameter used to be a dvui *bind name* — a
 separate flat namespace plugin commands have no entry in — so it never resolved to anything.
 
-**Command palette flattening.** Document verbs that the shell forwards (`copy`, `paste`, `undo`,
+**Command palette flattening.** Document verbs that Fizzy forwards (`copy`, `paste`, `undo`,
 `redo`, `deleteSelection`, `acceptEdit`, `cancelEdit`) appear **once** in the palette as the
 Fizzy stub (`fizzy.copy`, …) — greyed when no active document offers that action. Plugin
 implementations (`text.copy`, `pixi.copy`, …) stay registered for dispatch/menus/keybinds but are
@@ -587,19 +603,19 @@ hidden from the palette so the same title isn't listed N times. Verbs with no Fi
 - **`host.arena()`** — a per-frame scratch allocator, reset at the end of every frame. Never free
   from it, never hold a pointer into it past the current frame.
 
-**Do not capture `dvui.currentWindow().gpa` as "the allocator."** The shell creates the dvui
+**Do not capture `dvui.currentWindow().gpa` as "the allocator."** Fizzy creates the dvui
 window with `host.allocator` — today they're the same instance, but treat `host.allocator` as the
 contract. Mixing allocators is the one memory bug the type system can't catch.
 
 ### 3.6 Import discipline
 
-Files inside `src/**` must **not** `@import("fizzy")` or reach into the shell. Allowed:
+Files inside `src/**` must **not** `@import("fizzy")` or reach into Fizzy directly. Allowed:
 `@import("fizzy_sdk")`, `@import("core")`, `@import("dvui")` (wired onto your module by
 `fizzy.plugin.create`), and sibling files in your own `src/` tree. This is what lets the same
 sources compile as a standalone dylib whether they ship in-repo or from a third-party project.
 
 Useful things already inside `core`, so you never need to add a dependency for them:
-`core.lsp.Client` (§7), and `core.fuzzy` — the zf-backed matcher every filter box in the shell
+`core.lsp.Client` (§7), and `core.fuzzy` — the zf-backed matcher every filter box in Fizzy
 uses. Build a `fuzzy.Query` once from your filter text, then `fuzzy.score` / `fuzzy.scoreBest`
 each candidate and `fuzzy.sort` the survivors; `fuzzy.highlight` gives you the matched byte
 indices for tinting a label. Scores are **costs — lower is better**, and matching is
@@ -614,7 +630,7 @@ compile time by `Plugin.assertEditorVTable`/`assertUtilityVTable` (§3.6).
 | Shape | Implements | Example |
 |---------|------------|---------|
 | **Editor** | Document vtable cluster + optional panes/commands | `pixi`, `text` |
-| **Shell** | Center provider + file tree, no documents | `workbench` |
+| **Workbench** | Center provider + file tree, no documents | `workbench` |
 | **Utility** | Menus/commands/settings only, no document hooks | `markdown` (preview only) |
 
 ### 3.8 Language support — highlighting and preview without owning documents
@@ -764,7 +780,7 @@ host.pluginForExtension(".fiz")  ──►  pixi  (highest fileTypePriority)
 pixi.loadDocument(path)          ──►  builds its File, returns an opaque buffer
         │
         ▼
-shell inserts DocHandle{ id, ptr=File, owner=pixi } into Editor.open_files
+fizzy inserts DocHandle{ id, ptr=File, owner=pixi } into Editor.open_files
         │
         ▼
 workbench (center provider) draws a tab for it, and to render the body calls
@@ -776,7 +792,7 @@ pixi draws its canvas inside the workbench tab/split
 
 Every later action follows the same rule — save, dirty-dot, undo/redo, grouping, path, and the
 infobar status all route to `doc.owner`; workbench never knows it's a pixel-art file. A new editor
-plugin drops in with **no shell or workbench changes**: register its file types, implement the
+plugin drops in with **no fizzy or workbench changes**: register its file types, implement the
 document + `drawDocument` hooks, and its documents coexist in the same tabs/splits.
 
 ---
@@ -886,13 +902,18 @@ GitHub Release assets:
      manifest.json
 ```
 
-`manifest.json` lists one `releases[]` entry **per `(version, abi_fingerprint)`** — never
-rewritten, only appended to — so users on an older SDK keep matching an older binary instead of
-seeing "incompatible":
+`manifest.json` also carries `name`/`description`/`tags` straight off `plugin.zig.zon` (§2.2) —
+the aggregator (§6.5) uses these as the fallback when `registry/<id>.json` leaves its own copies
+blank, so you never have to hand-duplicate them there. It lists one `releases[]` entry
+**per `(version, abi_fingerprint)`** — never rewritten, only appended to — so users on an older
+SDK keep matching an older binary instead of seeing "incompatible":
 
 ```json
 {
   "id": "my_plugin",
+  "name": "My Plugin",
+  "description": "What it does, one line.",
+  "tags": ["editor"],
   "releases": [
     {
       "version": "0.1.0",
@@ -931,7 +952,19 @@ one-time PR adding `registry/<id>.json`:
 }
 ```
 
-Required: `id` (must equal the filename stem and your `plugin.zig.zon`'s `.id`), `name`, `manifest_url`.
+Required: `id` (must equal the filename stem and your `plugin.zig.zon`'s `.id`), `name`,
+`manifest_url`. `description`, `tags`, and `author` are optional overrides here — leave them out
+and the aggregator (§6.5) fills them in from your `manifest.json`'s own values (sourced from
+`plugin.zig.zon`, §2.2) each ingest; set them here only when you want the store-listed copy to
+differ from your build without cutting a release.
+
+**`publisher` is not a field you write.** The ingest derives it from `manifest_url`'s owner (e.g.
+`https://github.com/you/my-plugin/releases/...` → `you`) and the store shows it beside the
+self-asserted `author` as `publisher · author`. That split is deliberate: `publisher` names the
+account your binaries are actually served from and can't be restated by a plugin describing
+itself, so it's the half a user can rely on. A manifest hosted somewhere the ingest can't
+attribute this way simply has no publisher, and the store shows the author credit alone rather
+than inventing one.
 Also commit `README.md` and `ICON.png` in your plugin repo (repo root for standalone plugins) —
 the store fetches both from `homepage` for the card icon and README viewer; nothing is duplicated
 into this registry.
@@ -983,20 +1016,20 @@ drop straight into the plugins directory, exactly like §2.6.
 | `src/sdk/Host.zig` | Registries + service locator + `register*` methods |
 | `src/sdk/Plugin.zig` | Plugin identity + the vtable of hooks |
 | `src/sdk/DocHandle.zig` | Opaque document handle (`owner`-routed) |
-| `src/sdk/EditorAPI.zig` | Shell read/utility surface plugins reach back through |
+| `src/sdk/EditorAPI.zig` | Fizzy's read/utility surface plugins reach back through |
 | `src/sdk/regions.zig` | Sidebar/bottom/center/menu/settings/command contribution structs |
 | `src/sdk/language.zig` | `LanguageSupport` registry — documentOpened/hover/goto-definition/completion/signature-help/format/highlighting/preview hooks looked up by file extension |
 | `src/core/lsp/Client.zig` | Server-agnostic LSP client (JSON-RPC framing, caching, threading) shared by every language plugin — see §3.9 |
 | `src/sdk/dylib.zig`, `dvui_context.zig` | Runtime-library C entry contract + dvui injection |
 | `src/sdk/version.zig` | SDK version + ABI fingerprint CI lock |
-| `src/sdk/manifest.zig` | `Manifest` — the identity-only `plugin.zig.zon` shape (`id`/`name`/`version`/`min_sdk_version`) + `parse`/`free`, read back out of a loaded dylib at runtime. The typed shape actually baked into a dylib's C-ABI exports is `dylib.Identity` (build-injected, never runtime-parsed) |
+| `src/sdk/manifest.zig` | `Manifest` — the `plugin.zig.zon` shape (`id`/`name`/`version`/`min_sdk_version`/`description`/`tags`) + `parse`/`free`, read back out of a loaded dylib at runtime. The typed shape actually baked into a dylib's C-ABI exports is `dylib.Identity` (build-injected, never runtime-parsed) |
 | `src/sdk/settings.zig` | Comptime settings API (`sdk.settings.Schema(T)`) — see §3.1.1 |
-| `src/editor/SettingsPluginsZon.zig` | ZON-AST byte-span surgery for `settings.zon`'s merged `.plugins.<id>` fields — shell-only, not part of the SDK |
-| `src/editor/SettingsWatcher.zig` | Thin nightwatch adapter for live external `settings.zon` / dropped-in plugin reconciliation (see above) — shell-only, not part of the SDK |
+| `src/editor/SettingsPluginsZon.zig` | ZON-AST byte-span surgery for `settings.zon`'s merged `.plugins.<id>` fields — fizzy-only, not part of the SDK |
+| `src/editor/SettingsWatcher.zig` | Thin nightwatch adapter for live external `settings.zon` / dropped-in plugin reconciliation (see above) — fizzy-only, not part of the SDK |
 | `sdk/plugin_sdk.zig` | `fizzy.plugin.create` / `.install` / `.addCModule` — the build-side API a plugin's `build.zig` calls |
 | `src/plugins/text/` | Canonical document-owning editor plugin — copy to start a new editor plugin |
 | `src/plugins/image/` | Read-only image viewer (PNG/JPG/JPEG) with zoom/pan |
-| `src/plugins/workbench/` | Reference file-management (shell-profile) plugin |
+| `src/plugins/workbench/` | Reference file-management (workbench-shape) plugin |
 | [`fizzyedit/pixi`](https://github.com/fizzyedit/pixi) | Reference third-party editor plugin, incl. vendored C deps + packed assets |
 | [`fizzyedit/zig`](https://github.com/fizzyedit/zig) | Reference LSP-backed language plugin (zls) — see §3.9 |
 | [`fizzyedit/plugins`](https://github.com/fizzyedit/plugins) | The store registry/aggregator |
@@ -1037,7 +1070,7 @@ glue kept out of the plugin contract:
 
 ```
 src/plugins/<name>/
-  plugin.zig         # register + vtable (+ shell re-exports for static @import("<name>"))
+  plugin.zig         # register + vtable (+ fizzy-internal re-exports for static @import("<name>"))
   plugin.zig.zon     # identity only
   build.zig          # fizzy.plugin.create + install
   build.zig.zon

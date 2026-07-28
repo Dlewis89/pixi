@@ -7,7 +7,7 @@
 
 `fizzy` started out with a much smaller scope, providing tools for myself to use to create pixel art for small games for my children and for myself. As the project has continued, I began to ask myself, how can this editor become something beneficial for a *developer*? a *writer*? an *artist*? a *designer*? a *musician*?
 
-I think the answer is to decentralize the editor. To make it a generic shell that anything can fill, and then begin providing filling.
+I think the answer is to decentralize the editor. To make it a generic host that anything can fill, and then begin providing filling.
 
 When I set out to begin redesiging the editor to be based upon plugins, I decided that there would be 3 main requirements:
 

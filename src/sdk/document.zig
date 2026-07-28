@@ -1,12 +1,12 @@
 //! Document staging helpers for plugin authors.
 //!
 //! Use these from `loadDocument` / `loadDocumentFromBytes` vtable hooks when your document
-//! type is constructed from a path or bytes into a shell-owned staging buffer.
+//! type is constructed from a path or bytes into a fizzy-owned staging buffer.
 const std = @import("std");
 
 const Plugin = @import("Plugin.zig");
 
-/// Shell-allocated staging memory for one document load/create.
+/// Fizzy-allocated staging memory for one document load/create.
 pub const StagingBuffer = struct {
     backing: []u8,
     buf: []u8,

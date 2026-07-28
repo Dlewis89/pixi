@@ -1,4 +1,4 @@
-//! Thin menu helpers for plugin contributions. Mirrors shell `Menu.zig` patterns
+//! Thin menu helpers for plugin contributions. Mirrors fizzy `Menu.zig` patterns
 //! without importing the editor.
 const std = @import("std");
 const dvui = @import("dvui");

@@ -1,4 +1,4 @@
-//! A feature module that plugs into the editor shell. Today plugins are compiled
+//! A feature module that plugs into the editor fizzy. Today plugins are compiled
 //! in and registered statically; the same vtable shape is what a prebuilt plugin
 //! dylib will expose at runtime. All hooks are optional function pointers taking
 //! the plugin's own opaque `state`, so a plugin implements only what it needs
@@ -29,7 +29,7 @@ id: []const u8,
 display_name: []const u8,
 
 /// Mode for an owner's pre-save confirmation (`requestSaveConfirmation`). `editor_save` is a
-/// plain in-place save; `save_and_close` is part of a close/quit flow and resumes the shell
+/// plain in-place save; `save_and_close` is part of a close/quit flow and resumes fizzy
 /// close walk once the save settles.
 pub const SaveConfirmMode = enum { editor_save, save_and_close };
 
@@ -38,9 +38,9 @@ pub const SaveConfirmMode = enum { editor_save, save_and_close };
 // cluster — `fileTypePriority`, the load+staging hooks (`documentStackSize`/`documentStackAlign`/
 // `loadDocument`/`documentIdFromBuffer`/`registerOpenDocument`/`deinitDocumentBuffer`),
 // `drawDocument`, `saveDocument`, `isDirty`, and `documentPtr`. Everything else is genuinely
-// optional. Each hook's doc comment tags how the shell invokes it:
-//   [broadcast]  — the shell calls it for every plugin at a fixed point each frame
-//   [active-doc] — the shell calls `doc.owner.hook(doc)` only for the focused document
+// optional. Each hook's doc comment tags how fizzy invokes it:
+//   [broadcast]  — fizzy calls it for every plugin at a fixed point each frame
+//   [active-doc] — fizzy calls `doc.owner.hook(doc)` only for the focused document
 //   [requested]  — only fires after the plugin asks for it via a `host.*` call
 // A plugin that is *not* an editor (the workbench file tree) implements none of the document
 // hooks; it contributes panes + a center provider instead.
@@ -59,8 +59,8 @@ pub const VTable = struct {
 
     // ---- document lifecycle (operates on the plugin's own type via DocHandle) ----
     /// Load the document at `path`, constructing the plugin's own document value in
-    /// place at `out_doc`. The shell owns the typed buffer behind `out_doc` (for pixel
-    /// art a `*Internal.File`); the SDK stays type-agnostic. Runs on the shell's load
+    /// place at `out_doc`. Fizzy owns the typed buffer behind `out_doc` (for pixel
+    /// art a `*Internal.File`); the SDK stays type-agnostic. Runs on fizzy's load
     /// worker thread, so it must only touch the host allocator + the given buffer.
     loadDocument: ?*const fn (state: *anyopaque, path: []const u8, out_doc: *anyopaque) anyerror!void = null,
     /// `loadDocument`, but from in-memory bytes (browser file picker). `path` is used
@@ -76,8 +76,8 @@ pub const VTable = struct {
     saveDocument: ?*const fn (state: *anyopaque, doc: DocHandle) anyerror!void = null,
     closeDocument: ?*const fn (state: *anyopaque, doc: DocHandle) void = null,
     /// Reload `doc` from its on-disk path, replacing in-memory contents and clearing dirty
-    /// state / undo history as appropriate. Called by the shell's document watcher when a
-    /// clean open file changes externally. Absent = the shell skips auto-reload for this
+    /// state / undo history as appropriate. Called by fizzy's document watcher when a
+    /// clean open file changes externally. Absent = fizzy skips auto-reload for this
     /// owner (dirty conflict detection on save still works via content hashing).
     reloadDocument: ?*const fn (state: *anyopaque, doc: DocHandle) anyerror!void = null,
     isDirty: ?*const fn (state: *anyopaque, doc: DocHandle) bool = null,
@@ -131,20 +131,20 @@ pub const VTable = struct {
     // ---- render hooks (the plugin draws its own dvui UI into the host window) ----
     // Sidebar/explorer panes and bottom-panel tabs are NOT vtable hooks — plugins
     // contribute them as named, owned views via `Host.registerSidebarView` /
-    // `Host.registerBottomView`, which the shell renders as tab strips when more than
+    // `Host.registerBottomView`, which fizzy renders as tab strips when more than
     // one is registered. Only per-document rendering routes through the vtable below.
     /// Draw an open document (center/workspace region), dispatched via `DocHandle.owner`.
     drawDocument: ?*const fn (state: *anyopaque, doc: DocHandle) anyerror!void = null,
-    /// Draw active-document status into the shell-owned infobar slot. `rect` is the
-    /// natural-space content rect the shell has already sized/clipped — keep drawing
+    /// Draw active-document status into fizzy-owned infobar slot. `rect` is the
+    /// natural-space content rect fizzy has already sized/clipped — keep drawing
     /// inside it; do not grow the bar.
     drawDocumentInfobar: ?*const fn (state: *anyopaque, doc: DocHandle, rect: dvui.Rect) anyerror!void = null,
 
-    // ---- shell contributions ----
+    // ---- fizzy contributions ----
     contributeMenu: ?*const fn (state: *anyopaque) anyerror!void = null,
     contributeKeybinds: ?*const fn (state: *anyopaque, win: *dvui.Window) anyerror!void = null,
 
-    // ---- per-frame shell phases (the shell calls these for every plugin each frame, in
+    // ---- per-frame fizzy phases (fizzy calls these for every plugin each frame, in
     //      this order). A plugin does its own per-frame work (caches, playback, overlays)
     //      inside these generic phases; none carry domain meaning. ----
     /// [broadcast] Top of frame, before workspace rebuild / any document drawing. Advance the
@@ -156,7 +156,7 @@ pub const VTable = struct {
     /// never calls `requestPrepareFrame` never sees this.
     prepareFrame: ?*const fn (state: *anyopaque) void = null,
     /// [broadcast] Process the plugin's own per-frame keyboard shortcuts (distinct from
-    /// `contributeKeybinds`, which registers them once). Runs before the shell's global keybinds.
+    /// `contributeKeybinds`, which registers them once). Runs before fizzy's global keybinds.
     tickKeybinds: ?*const fn (state: *anyopaque) anyerror!void = null,
     /// [broadcast] Advance the plugin's open documents; return true to request a follow-up
     /// animation frame (e.g. an in-progress save-status fade).
@@ -171,7 +171,7 @@ pub const VTable = struct {
     /// [broadcast] End of the center draw — reset per-frame scratch state held across the draw
     /// (symmetric counterpart to `beginFrame`).
     endFrame: ?*const fn (state: *anyopaque) void = null,
-    /// [broadcast] True while the plugin needs the shell to keep repainting continuously (an
+    /// [broadcast] True while the plugin needs fizzy to keep repainting continuously (an
     /// active stroke, a running animation, a background job) rather than idling until input.
     needsContinuousRepaint: ?*const fn (state: *anyopaque) bool = null,
 
@@ -186,10 +186,10 @@ pub const VTable = struct {
     // ---- save protocol ----
     /// [active-doc] True when the owner wants a confirmation before `saveDocument` (e.g. a save
     /// that would flatten lossy data, change encoding, or overwrite an on-disk change). When
-    /// true the shell calls `requestSaveConfirmation` instead of saving directly.
+    /// true fizzy calls `requestSaveConfirmation` instead of saving directly.
     saveNeedsConfirmation: ?*const fn (state: *anyopaque, doc: DocHandle) bool = null,
     /// [active-doc] Open the owner's pre-save confirmation dialog for `doc` (only called when
-    /// `saveNeedsConfirmation(doc)` is true). The dialog drives the save through the shell
+    /// `saveNeedsConfirmation(doc)` is true). The dialog drives the save through fizzy
     /// save/close API. `from_save_all_quit` marks requests issued during the quit walk.
     requestSaveConfirmation: ?*const fn (state: *anyopaque, doc: DocHandle, mode: SaveConfirmMode, from_save_all_quit: bool) void = null,
 
@@ -197,7 +197,7 @@ pub const VTable = struct {
     /// [requested] This plugin's persisted settings blob changed while the plugin is loaded —
     /// `blob` is the whole, freshly-serialized zon text (same shape `Host.loadPluginSettings`
     /// returns), not a diff. Fires from **two** sources, and a plugin implementing this should
-    /// not assume which one: (1) the shell's settings pane edited it in-app (see
+    /// not assume which one: (1) fizzy's settings pane edited it in-app (see
     /// `Host.storePluginSettings`), or (2) an external edit to `settings.zon` (hand edit, another
     /// tool) was picked up live by the settings watcher and reconciled (see R11 in
     /// docs/PLUGIN_MANIFEST_PLAN.md) — in that case this fires with no settings-pane interaction
@@ -210,7 +210,7 @@ pub const VTable = struct {
     // NOTE: editing actions (copy / paste / transform / accept-edit / cancel-edit /
     // delete-selection) are deliberately NOT hooks here. They are user-invoked and their meaning
     // varies per editor, so a plugin registers them as `Command`s (e.g. `"pixelart.copy"`) and
-    // the shell dispatches its Edit-menu / keybinds to `"<active_owner_id>.<action>"`. See the
+    // fizzy dispatches its Edit-menu / keybinds to `"<active_owner_id>.<action>"`. See the
     // commands section in docs/PLUGINS.md.
 };
 
@@ -343,8 +343,8 @@ pub fn timeSinceSaveCompleteNs(self: Plugin, doc: DocHandle) ?i128 {
 
 // ---- document lifecycle wrappers (operate on a DocHandle this plugin owns) ----
 
-/// Load `path` into the shell-owned buffer at `out_doc`. Returns whether the plugin
-/// handled it; `false` means this plugin exposes no loader (the shell should treat the
+/// Load `path` into fizzy-owned buffer at `out_doc`. Returns whether the plugin
+/// handled it; `false` means this plugin exposes no loader (fizzy should treat the
 /// open as failed). See the `loadDocument` vtable field for the threading contract.
 pub fn loadDocument(self: Plugin, path: []const u8, out_doc: *anyopaque) !bool {
     if (self.vtable.loadDocument) |f| {
@@ -383,7 +383,7 @@ pub fn reloadDocument(self: Plugin, doc: DocHandle) bool {
     return false;
 }
 
-/// Tear down an open document. Returns whether the plugin handled it, so the shell
+/// Tear down an open document. Returns whether the plugin handled it, so fizzy
 /// can fall back to its own teardown when no plugin claims the document.
 pub fn closeDocument(self: Plugin, doc: DocHandle) bool {
     if (self.vtable.closeDocument) |f| {

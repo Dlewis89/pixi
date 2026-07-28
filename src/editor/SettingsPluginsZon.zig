@@ -189,8 +189,8 @@ fn writeNested(writer: *std.Io.Writer, text: []const u8, indent: usize) !void {
     }
 }
 
-/// Composes the final `settings.zon` text: `shell_fields_text` (the shell's own
-/// `Settings.serialize` output, just `.{ ...shell fields... }`) with a `.plugins = .{ ... }`
+/// Composes the final `settings.zon` text: `fizzy_fields_text` (fizzy's own
+/// `Settings.serialize` output, just `.{ ...fizzy's own fields... }`) with a `.plugins = .{ ... }`
 /// field appended, built from every entry already in `existing_full_source` (preserved verbatim,
 /// in their original order — including ids not touched this cycle, per `listPluginBlocks`'s
 /// doc comment) with `overlay`'s entries upserted by id (replacing the text of an existing id in
@@ -200,7 +200,7 @@ fn writeNested(writer: *std.Io.Writer, text: []const u8, indent: usize) !void {
 /// so nested `.enabled`/`.settings` keep standard Zig-style 4-space nesting.
 pub fn composeMergedText(
     gpa: Allocator,
-    shell_fields_text: []const u8,
+    fizzy_fields_text: []const u8,
     existing_full_source: ?[:0]const u8,
     overlay: []const Entry,
 ) ![]u8 {
@@ -238,13 +238,13 @@ pub fn composeMergedText(
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
 
-    const trimmed = std.mem.trimEnd(u8, shell_fields_text, " \t\r\n");
+    const trimmed = std.mem.trimEnd(u8, fizzy_fields_text, " \t\r\n");
     const body = std.mem.trimEnd(u8, if (trimmed.len > 0 and trimmed[trimmed.len - 1] == '}')
         trimmed[0 .. trimmed.len - 1]
     else
         trimmed, " \t\r\n");
     try aw.writer.writeAll(body);
-    // `body` is the shell fields with their closing `}` stripped — its last field has no
+    // `body` is fizzy's own fields with their closing `}` stripped — its last field has no
     // trailing comma unless `Settings.serialize` happens to emit one, so add one here (unless
     // the struct was empty) before appending `.plugins` as another field.
     if (body.len > 0 and body[body.len - 1] != ',' and body[body.len - 1] != '{') {
@@ -264,11 +264,11 @@ pub fn composeMergedText(
 }
 
 /// Upserts a single `id` into `existing_full_source`'s `.plugins` block, touching as little of
-/// the document as possible: every other byte (shell fields, other plugins' entries, formatting,
+/// the document as possible: every other byte (fizzy's own fields, other plugins' entries, formatting,
 /// comments) is left exactly as-is. Used by the one-shot legacy-per-plugin-file migration
-/// (`SettingsMigration.mergeLegacyPerPluginFiles`), which runs before the shell has a parsed
+/// (`SettingsMigration.mergeLegacyPerPluginFiles`), which runs before fizzy has a parsed
 /// `Settings` value to regenerate fields from via `composeMergedText`'s normal
-/// shell-fields-plus-overlay shape. If `id` already has an entry, returns an unchanged copy of
+/// fizzy-fields-plus-overlay shape. If `id` already has an entry, returns an unchanged copy of
 /// `existing_full_source` (never clobbers a live edit made through the new merged system).
 /// `entry.text` must be non-null (a removal is expressible via `composeMergedText`'s overlay).
 pub fn upsertOne(gpa: Allocator, existing_full_source: ?[:0]const u8, entry: Entry) ![]u8 {
@@ -284,7 +284,7 @@ pub fn upsertOne(gpa: Allocator, existing_full_source: ?[:0]const u8, entry: Ent
     }
 
     const plugins_node = findField(parsed.zoir, .root, "plugins") orelse {
-        // No `.plugins` field at all yet: `src` itself is safe to treat as "shell fields text"
+        // No `.plugins` field at all yet: `src` itself is safe to treat as "fizzy fields text"
         // here (it has no `.plugins` to duplicate), so this reduces to the normal compose path
         // with an empty existing-plugins base.
         return composeMergedText(gpa, src, null, &.{entry});
@@ -373,9 +373,9 @@ test "nested extractField reaches .plugins.<id>.settings" {
 
 test "composeMergedText round-trips: overlay replaces one id, others survive untouched" {
     const overlay = [_]Entry{.{ .id = "pixi", .text = ".{ .enabled = true, .settings = .{ .grid_size = 32 } }" }};
-    const shell_text = ".{ .explorer_ratio = 0.35 }";
+    const fizzy_text = ".{ .explorer_ratio = 0.35 }";
 
-    const composed = try composeMergedText(testing.allocator, shell_text, sample_source, &overlay);
+    const composed = try composeMergedText(testing.allocator, fizzy_text, sample_source, &overlay);
     defer testing.allocator.free(composed);
 
     const composed_z = try testing.allocator.dupeZ(u8, composed);
@@ -392,9 +392,9 @@ test "composeMergedText round-trips: overlay replaces one id, others survive unt
 
 test "composeMergedText removes an id when overlay text is null" {
     const overlay = [_]Entry{.{ .id = "pixi", .text = null }};
-    const shell_text = ".{ .explorer_ratio = 0.35 }";
+    const fizzy_text = ".{ .explorer_ratio = 0.35 }";
 
-    const composed = try composeMergedText(testing.allocator, shell_text, sample_source, &overlay);
+    const composed = try composeMergedText(testing.allocator, fizzy_text, sample_source, &overlay);
     defer testing.allocator.free(composed);
 
     const composed_z = try testing.allocator.dupeZ(u8, composed);
@@ -409,9 +409,9 @@ test "composeMergedText removes an id when overlay text is null" {
 
 test "composeMergedText adds a brand-new id when there is no existing .plugins block" {
     const overlay = [_]Entry{.{ .id = "pixi", .text = ".{ .enabled = true, .settings = .{ .grid_size = 8 } }" }};
-    const shell_text = ".{ .explorer_ratio = 0.35 }";
+    const fizzy_text = ".{ .explorer_ratio = 0.35 }";
 
-    const composed = try composeMergedText(testing.allocator, shell_text, null, &overlay);
+    const composed = try composeMergedText(testing.allocator, fizzy_text, null, &overlay);
     defer testing.allocator.free(composed);
 
     const composed_z = try testing.allocator.dupeZ(u8, composed);
@@ -428,9 +428,9 @@ test "listPluginBlocks retains a disabled/unloaded plugin's block untouched" {
     try testing.expectEqual(@as(usize, 2), entries.len);
 }
 
-test "composeMergedText accepts an empty shell struct (every shell field at its default)" {
-    // Since the shell serializes non-default fields only (`Settings.serialize`, R12), an
-    // untouched shell hands this `.{}` — the `.plugins` field must still splice on as valid ZON
+test "composeMergedText accepts an empty fizzy struct (every fizzy field at its default)" {
+    // Since fizzy serializes non-default fields only (`Settings.serialize`, R12), an
+    // untouched fizzy hands this `.{}` — the `.plugins` field must still splice on as valid ZON
     // rather than producing a stray leading comma.
     const overlay = [_]Entry{.{ .id = "pixi", .text = ".{ .enabled = true }" }};
 

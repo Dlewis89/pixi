@@ -17,7 +17,7 @@
 //! `@sizeOf(T)` at runtime; only the payload is ever stored. Reads/writes go through
 //! `.get()`/`.set()`.
 //!
-//! Plugins register a typed value + field metadata only. The **shell** draws a shared settings UI
+//! Plugins register a typed value + field metadata only. The **fizzy** draws a shared settings UI
 //! from `SettingsSchema.fields` (see `PluginSettingsPane`/`SettingRow`) — plugins do not supply a
 //! `draw` callback.
 //!
@@ -34,7 +34,7 @@ const Plugin = @import("Plugin.zig");
 const runtime = @import("runtime.zig");
 
 /// `other` is the escape hatch: any type `std.zon` can round-trip is a legal setting, and the
-/// shell draws whatever it has no dedicated control for as editable zon text.
+/// fizzy draws whatever it has no dedicated control for as editable zon text.
 pub const TypeTag = enum { bool, int, float, string, enumeration, color, other };
 
 pub const IntKind = struct {
@@ -82,7 +82,7 @@ pub const Setting = struct {
 /// Per-setting metadata, supplied as the second (comptime) parameter of `Value`.
 ///
 /// `description` has no default, so leaving it out is a compile error at the declaration site.
-/// That's the whole point: the settings UI has a permanent place for it, and no shell-side table
+/// That's the whole point: the settings UI has a permanent place for it, and no fizzy-side table
 /// can drift from the plugin that owns the setting.
 pub const Options = struct {
     description: []const u8,
@@ -256,7 +256,7 @@ fn Plain(comptime T: type) type {
     return @Struct(.auto, null, &frozen_names, &frozen_types, &frozen_attrs);
 }
 
-/// Type-erased read/write of a `Schema(T).Value` for the shell's generic settings UI.
+/// Type-erased read/write of a `Schema(T).Value` for fizzy's generic settings UI.
 pub const Access = struct {
     getBool: *const fn (value: *anyopaque, field_index: usize) bool,
     setBool: *const fn (value: *anyopaque, field_index: usize, v: bool) void,
@@ -268,7 +268,7 @@ pub const Access = struct {
     setEnumIndex: *const fn (value: *anyopaque, field_index: usize, choice_index: usize) void,
     getString: *const fn (value: *anyopaque, field_index: usize) []const u8,
     setString: *const fn (value: *anyopaque, field_index: usize, v: []const u8) void,
-    /// Zon text of one field's payload, allocated in `arena` — how the shell shows (and edits) a
+    /// Zon text of one field's payload, allocated in `arena` — how fizzy shows (and edits) a
     /// `.other` setting it has no dedicated control for. Returns "" if serialization fails.
     getZonText: *const fn (value: *anyopaque, field_index: usize, arena: std.mem.Allocator) []const u8,
     /// Parse `text` as zon into one field. Returns false (leaving the field untouched) when the
@@ -727,7 +727,7 @@ pub fn Schema(comptime T: type) type {
             owner.settingsChanged(blob);
         }
 
-        /// Register schema + value pointer. The shell draws controls from `fields` via `access`.
+        /// Register schema + value pointer. Fizzy draws controls from `fields` via `access`.
         pub fn register(host: anytype, plugin: *Plugin, opts: struct {
             title: []const u8,
             value: *T,

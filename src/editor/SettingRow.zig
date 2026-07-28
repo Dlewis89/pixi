@@ -1,4 +1,4 @@
-//! One setting's chrome, drawn identically for the shell's own settings and every plugin's.
+//! One setting's chrome, drawn identically for fizzy's own settings and every plugin's.
 //!
 //! A setting reads as a small self-contained group, VSCode-style:
 //!
@@ -16,7 +16,7 @@
 //!
 //! `SettingsTree` owns *which* rows appear and in what order; this file owns what one row looks
 //! like. Control bodies live in `PluginSettingsPane` (plugin settings) and
-//! `explorer/settings.zig` (the shell's own).
+//! `explorer/settings.zig` (fizzy's own).
 const std = @import("std");
 const dvui = @import("dvui");
 const core = @import("core");

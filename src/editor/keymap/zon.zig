@@ -298,8 +298,8 @@ pub fn parse(gpa: Allocator, source: [:0]const u8, platform: Platform) Allocator
     // loading after the command-id rename; writes always use `.fizzy`.
     if (findField(parsed.zoir, .root, "fizzy")) |fizzy_block| {
         try collectBlock(&c, parsed.ast, parsed.zoir, fizzy_block, null, platform);
-    } else if (findField(parsed.zoir, .root, "shell")) |shell_block| {
-        try collectBlock(&c, parsed.ast, parsed.zoir, shell_block, null, platform);
+    } else if (findField(parsed.zoir, .root, "shell")) |legacy_shell_block| {
+        try collectBlock(&c, parsed.ast, parsed.zoir, legacy_shell_block, null, platform);
     }
 
     if (findField(parsed.zoir, .root, "plugins")) |plugins_node| {

@@ -1,13 +1,13 @@
-//! Shell keybindings: the default bind table, the shell's own commands, and key dispatch.
+//! Fizzy keybindings: the default bind table, fizzy's own commands, and key dispatch.
 //!
 //! Keys used to be wired straight to `fizzy.editor.*` calls by a hardcoded if-chain, which meant
-//! nothing was addressable by id and so nothing could be rebound. Now every shell action is a
+//! nothing was addressable by id and so nothing could be rebound. Now every fizzy action is a
 //! registered `Command`, and `tick()` resolves a key event to a command id through
 //! `keymap.Keymap` and runs it via the Host registry — the same registry plugin commands live
 //! in, which is what makes a single rebindable table (and, later, a command palette) possible.
 //!
 //! **Migration shape.** dvui's `Window.keybinds` map is still the source of the *default* key
-//! for each action: dvui seeds its own binds, `register()` below adds the shell's, and plugins
+//! for each action: dvui seeds its own binds, `register()` below adds fizzy's own, and plugins
 //! add theirs via `contributeKeybinds` — see `Editor.rebuildKeybinds`. `buildKeymap` then walks
 //! that finished map and lifts every entry named in `command_binds` into a `Keymap` binding.
 //! Keeping that direction means plugin-contributed binds (workbench's `save`, `open_folder`, …)
@@ -18,6 +18,7 @@ const builtin = @import("builtin");
 
 const fizzy = @import("../fizzy.zig");
 const dvui = @import("dvui");
+const icons = @import("icons");
 const sdk = @import("fizzy_sdk");
 const keymap = @import("keymap/keymap.zig");
 const adapter = @import("keymap/dvui_adapter.zig");
@@ -28,17 +29,17 @@ const Editor = @import("Editor.zig");
 const KeybindSettings = @import("KeybindSettings.zig");
 const menu_model = @import("menu_model.zig");
 
-/// Register the shell's own global / navigation / region binds. File-management
+/// Register fizzy's own global / navigation / region binds. File-management
 /// binds and pixel-art editing binds are contributed by the workbench and
 /// pixel-art plugins (their `contributeKeybinds`), which `Editor.postInit` invokes
 /// after the plugins register. This runs during `Editor.init`, before postInit, so
-/// the shell binds land first; the split is disjoint, so no `putNoClobber` clashes.
+/// fizzy's binds land first; the split is disjoint, so no `putNoClobber` clashes.
 ///
 /// **That disjointness is load-bearing, and plugins claim more names than this repo shows.**
 /// pixi (an out-of-tree plugin) registers `undo`, `redo` and `delete_selection_contents` in its
 /// own `contributeKeybinds`; adding any of them here panics at startup on every install that has
 /// pixi, because `putNoClobber` asserts. A first-come-first-served hash map has no way to express
-/// "shell default unless a plugin wants it" — that needs the layered `Command.default_keys`
+/// "fizzy default unless a plugin wants it" — that needs the layered `Command.default_keys`
 /// resolution in step C, not another entry in this function.
 ///
 /// Runtime mac detection — `builtin.os.tag.isDarwin()` is `false` for
@@ -49,7 +50,7 @@ pub fn register() !void {
     const window = dvui.currentWindow();
 
     // Region toggles (explorer / workspace) and "New File" — Command on macOS, Control
-    // elsewhere. "New File" is a generic shell action (see `Host.requestNewDocument`),
+    // elsewhere. "New File" is a generic fizzy action (see `Host.requestNewDocument`),
     // not owned by whichever editor plugin happens to be installed.
     //
     // "zoom" is the trackpad-scheme canvas modifier (cmd/ctrl + scroll to zoom). Shared
@@ -76,63 +77,70 @@ pub fn register() !void {
     try window.keybinds.putNoClobber(window.gpa, "cancel", .{ .key = .escape });
 }
 
-// ---- shell commands ---------------------------------------------------------------------------
+// ---- fizzy commands ---------------------------------------------------------------------------
 
-/// `Host.runCommand` passes `owner.state` to `run`, so the shell needs *a* `Plugin` to hang its
+/// `Host.runCommand` passes `owner.state` to `run`, so fizzy needs *a* `Plugin` to hang its
 /// commands off. This is that pseudo-plugin: never added to `host.plugins`, so no lifecycle hook
 /// ever fires on it and `removeOwned` never touches its commands. The alternative — adding a
 /// `state` field to `sdk.regions.Command` — would move the ABI fingerprint and force every
 /// third-party plugin to be rebuilt, which isn't worth it for a pointer we can supply this way.
-var shell_plugin: sdk.Plugin = .{
+var fizzy_plugin: sdk.Plugin = .{
     .state = undefined, // set to the Editor in `registerCommands`
-    .vtable = &shell_vtable,
+    .vtable = &fizzy_vtable,
     .id = "fizzy",
     .display_name = "Fizzy",
 };
 
-const shell_vtable: sdk.Plugin.VTable = .{};
+const fizzy_vtable: sdk.Plugin.VTable = .{};
 
 fn editorFromState(state: *anyopaque) *Editor {
     return @ptrCast(@alignCast(state));
 }
 
-/// One shell action.
+/// One fizzy action.
 ///
 /// Whether macOS also fires this through NSMenu — which matters because SDL delivers the same
 /// key event and dispatching it here too would run the action twice — is no longer a field
 /// here. It is read off `native_menu_bindings`, the menu itself, so the two can't disagree.
-const ShellCommand = struct {
+const FizzyCommand = struct {
     id: []const u8,
     title: []const u8,
     /// dvui keybind name this action's default key comes from, or null when it has no default.
     bind: ?[]const u8,
     run: *const fn (state: *anyopaque) anyerror!void,
     isEnabled: ?*const fn (state: *anyopaque) bool = null,
+    /// TVG icon bytes (e.g. `icons.tvg.lucide.save`), the single source both the menu bar
+    /// (`Menu.drawModelItem`, via `Host.command`) and the command palette
+    /// (`CommandPalette.collectCommandRows`) read for this command's row — see
+    /// `sdk.Command.icon`'s doc comment for why this lives on the registered command rather than
+    /// being restated per surface.
+    icon: ?[]const u8 = null,
 };
 
-const shell_commands = [_]ShellCommand{
-    .{ .id = "fizzy.openFolder", .title = "Open Folder…", .bind = "open_folder", .run = cmdOpenFolder },
-    .{ .id = "fizzy.openFiles", .title = "Open Files…", .bind = "open_files", .run = cmdOpenFiles },
-    .{ .id = "fizzy.newFile", .title = "New File…", .bind = "new_file", .run = cmdNewFile },
-    .{ .id = "fizzy.save", .title = "Save", .bind = "save", .run = cmdSave },
-    .{ .id = "fizzy.saveAs", .title = "Save As…", .bind = "save_as", .run = cmdSaveAs },
-    .{ .id = "fizzy.saveAll", .title = "Save All", .bind = "save_all", .run = cmdSaveAll },
-    .{ .id = "fizzy.undo", .title = "Undo", .bind = "undo", .run = cmdUndo, .isEnabled = cmdUndoEnabled },
-    .{ .id = "fizzy.redo", .title = "Redo", .bind = "redo", .run = cmdRedo, .isEnabled = cmdRedoEnabled },
-    .{ .id = "fizzy.copy", .title = "Copy", .bind = "copy", .run = cmdCopy, .isEnabled = cmdCopyEnabled },
-    .{ .id = "fizzy.paste", .title = "Paste", .bind = "paste", .run = cmdPaste, .isEnabled = cmdPasteEnabled },
-    .{ .id = "fizzy.toggleExplorer", .title = "Toggle Explorer", .bind = "explorer", .run = cmdToggleExplorer },
-    .{ .id = "fizzy.deleteSelection", .title = "Delete Selection", .bind = "delete_selection_contents", .run = cmdDeleteSelection, .isEnabled = cmdDeleteSelectionEnabled },
-    .{ .id = "fizzy.accept", .title = "Accept", .bind = "activate", .run = cmdAccept, .isEnabled = cmdAcceptEnabled },
-    .{ .id = "fizzy.cancel", .title = "Cancel", .bind = "cancel", .run = cmdCancel, .isEnabled = cmdCancelEnabled },
+const fizzy_commands = [_]FizzyCommand{
+    .{ .id = "fizzy.openFolder", .title = "Open Folder…", .bind = "open_folder", .run = cmdOpenFolder, .icon = icons.tvg.lucide.@"folder-open" },
+    .{ .id = "fizzy.openFiles", .title = "Open Files…", .bind = "open_files", .run = cmdOpenFiles, .icon = icons.tvg.lucide.files },
+    .{ .id = "fizzy.newFile", .title = "New File…", .bind = "new_file", .run = cmdNewFile, .icon = icons.tvg.lucide.@"file-plus" },
+    .{ .id = "fizzy.save", .title = "Save", .bind = "save", .run = cmdSave, .icon = icons.tvg.lucide.save },
+    .{ .id = "fizzy.saveAs", .title = "Save As…", .bind = "save_as", .run = cmdSaveAs, .icon = icons.tvg.lucide.@"file-down" },
+    .{ .id = "fizzy.saveAll", .title = "Save All", .bind = "save_all", .run = cmdSaveAll, .icon = icons.tvg.lucide.@"save-all" },
+    .{ .id = "fizzy.undo", .title = "Undo", .bind = "undo", .run = cmdUndo, .isEnabled = cmdUndoEnabled, .icon = icons.tvg.lucide.undo },
+    .{ .id = "fizzy.redo", .title = "Redo", .bind = "redo", .run = cmdRedo, .isEnabled = cmdRedoEnabled, .icon = icons.tvg.lucide.redo },
+    .{ .id = "fizzy.copy", .title = "Copy", .bind = "copy", .run = cmdCopy, .isEnabled = cmdCopyEnabled, .icon = icons.tvg.lucide.copy },
+    .{ .id = "fizzy.paste", .title = "Paste", .bind = "paste", .run = cmdPaste, .isEnabled = cmdPasteEnabled, .icon = icons.tvg.lucide.@"clipboard-paste" },
+    .{ .id = "fizzy.toggleExplorer", .title = "Toggle Explorer", .bind = "explorer", .run = cmdToggleExplorer, .icon = icons.tvg.lucide.@"panel-left" },
+    .{ .id = "fizzy.deleteSelection", .title = "Delete Selection", .bind = "delete_selection_contents", .run = cmdDeleteSelection, .isEnabled = cmdDeleteSelectionEnabled, .icon = icons.tvg.lucide.@"trash-2" },
+    .{ .id = "fizzy.accept", .title = "Accept", .bind = "activate", .run = cmdAccept, .isEnabled = cmdAcceptEnabled, .icon = icons.tvg.lucide.check },
+    .{ .id = "fizzy.cancel", .title = "Cancel", .bind = "cancel", .run = cmdCancel, .isEnabled = cmdCancelEnabled, .icon = icons.tvg.lucide.x },
     // No dvui bind name — these are new, so their defaults come purely from the profile table.
-    .{ .id = "fizzy.quickOpen", .title = "Go to File…", .bind = null, .run = cmdQuickOpen },
-    .{ .id = "fizzy.commandPalette", .title = "Show All Commands", .bind = null, .run = cmdCommandPalette },
+    .{ .id = "fizzy.quickOpen", .title = "Go to File…", .bind = null, .run = cmdQuickOpen, .icon = icons.tvg.lucide.search },
+    .{ .id = "fizzy.commandPalette", .title = "Show All Commands", .bind = null, .run = cmdCommandPalette, .icon = icons.tvg.lucide.terminal },
     // Menu-bar-only actions. They had no command at all before Stage 1 — they existed solely as
     // `NativeMenuAction` switch arms — so they were unreachable from the palette and unbindable.
-    .{ .id = "fizzy.showDvuiDemo", .title = "Show DVUI Demo", .bind = null, .run = cmdShowDvuiDemo },
-    .{ .id = "fizzy.about", .title = "About Fizzy", .bind = null, .run = cmdAbout },
-    .{ .id = "fizzy.reportBug", .title = "Report a Bug", .bind = null, .run = cmdReportBug },
+    .{ .id = "fizzy.showDvuiDemo", .title = "Show DVUI Demo", .bind = null, .run = cmdShowDvuiDemo, .icon = icons.tvg.lucide.@"flask-conical" },
+    .{ .id = "fizzy.debugToggleDvuiMenuOnMacOS", .title = "Show DVUI Menu (macOS)", .bind = null, .run = cmdToggleDvuiMenuOnMacOS },
+    .{ .id = "fizzy.about", .title = "About Fizzy", .bind = null, .run = cmdAbout, .icon = icons.tvg.lucide.download },
+    .{ .id = "fizzy.reportBug", .title = "Report a Bug", .bind = null, .run = cmdReportBug, .icon = icons.tvg.lucide.bug },
 };
 
 // Ids and bind names must both be unique: a duplicate id would make `Host.runCommand`
@@ -140,22 +148,22 @@ const shell_commands = [_]ShellCommand{
 // commands the same key. Comptime because the table is comptime — a test would be strictly
 // weaker than just refusing to compile.
 comptime {
-    for (shell_commands, 0..) |a, i| {
-        for (shell_commands[i + 1 ..]) |b| {
+    for (fizzy_commands, 0..) |a, i| {
+        for (fizzy_commands[i + 1 ..]) |b| {
             if (std.mem.eql(u8, a.id, b.id)) {
-                @compileError("duplicate shell command id: " ++ a.id);
+                @compileError("duplicate fizzy command id: " ++ a.id);
             }
             const a_bind = a.bind orelse continue;
             const b_bind = b.bind orelse continue;
             if (std.mem.eql(u8, a_bind, b_bind)) {
-                @compileError("shell commands '" ++ a.id ++ "' and '" ++ b.id ++
+                @compileError("fizzy commands '" ++ a.id ++ "' and '" ++ b.id ++
                     "' both claim keybind '" ++ a_bind ++ "'");
             }
         }
     }
 }
 
-// The canonical body for each shell action. Before Stage 1 of the menu unification these were
+// The canonical body for each fizzy action. Before Stage 1 of the menu unification these were
 // implemented up to three times — here, inline in `Menu.zig`, and again in
 // `Editor.handleNativeMenuAction` — and had already drifted: the menu-bar versions of Open
 // Folder / Open Files went through `fizzy.backend`, which has a wasm implementation, while
@@ -197,7 +205,7 @@ var running_from_key_event: bool = false;
 /// Copy/Paste must reach exactly one target: the active document's editor, or some other
 /// focused widget (Output Panel, a settings filter, a plugin search box) — never both.
 ///
-/// The discriminator is "does keyboard focus belong to the active document", which the shell
+/// The discriminator is "does keyboard focus belong to the active document", which fizzy
 /// cannot answer on its own: `dvui.wantTextInput` (via `Editor.text_input_focused`) reports that
 /// *a* text input has focus, not which document it belongs to. The document's owner does know,
 /// and its command enablement is already the channel for owner-side answers — so the routing is
@@ -302,6 +310,11 @@ fn cmdShowDvuiDemo(_: *anyopaque) anyerror!void {
     dvui.Examples.show_demo_window = !dvui.Examples.show_demo_window;
 }
 
+/// TEMPORARY: see `Menu.debug_force_on_macos`'s doc comment.
+fn cmdToggleDvuiMenuOnMacOS(_: *anyopaque) anyerror!void {
+    Editor.Menu.debug_force_on_macos = !Editor.Menu.debug_force_on_macos;
+}
+
 /// About also carries the update status and the Check-for-Updates / Install button, which is
 /// why Help → "Check for Updates…" is this same command.
 fn cmdAbout(_: *anyopaque) anyerror!void {
@@ -312,16 +325,17 @@ fn cmdReportBug(_: *anyopaque) anyerror!void {
     _ = dvui.openURL(.{ .url = "https://github.com/fizzyedit/fizzy/issues" });
 }
 
-/// Register every shell action in the Host command registry. Called once during `Editor.init`.
+/// Register every fizzy action in the Host command registry. Called once during `Editor.init`.
 pub fn registerCommands(editor: *Editor) !void {
-    shell_plugin.state = editor;
-    inline for (shell_commands) |c| {
+    fizzy_plugin.state = editor;
+    inline for (fizzy_commands) |c| {
         try editor.host.registerCommand(.{
             .id = c.id,
-            .owner = &shell_plugin,
+            .owner = &fizzy_plugin,
             .title = c.title,
             .run = c.run,
             .isEnabled = c.isEnabled,
+            .icon = c.icon,
         });
     }
 }
@@ -341,12 +355,12 @@ const DefaultBind = struct {
     keys_mac: ?[]const u8 = null,
 };
 
-/// VSCode-compatible shell defaults.
+/// VSCode-compatible fizzy defaults.
 ///
 /// These live here rather than in `dvui.Window.keybinds` on purpose. That map is a flat global
-/// namespace claimed with `putNoClobber`, so a default the shell wants and a plugin also wants
+/// namespace claimed with `putNoClobber`, so a default fizzy wants and a plugin also wants
 /// is a startup panic, not a conflict — which is exactly how registering `undo` here crashed
-/// every install with pixi. The keymap is layered instead: a plugin's binding and a shell
+/// every install with pixi. The keymap is layered instead: a plugin's binding and a fizzy
 /// default can both exist, and `Keymap.best` picks by source.
 ///
 /// This also closes a real gap. `fizzy.undo` already routes through `activeDoc().owner.undo`,
@@ -369,7 +383,7 @@ const vscode_defaults = [_]DefaultBind{
 
 /// C2-lite bridge: owner-scoped plugin defaults that still can't live on `Command.default_keys`
 /// (ABI-gated). Added only when the Host command is registered. `owner_id` gates the binding
-/// so shell profile chords (e.g. Quick Open on `mod+p`) win unless that plugin's document is
+/// so fizzy profile chords (e.g. Quick Open on `mod+p`) win unless that plugin's document is
 /// active. Retire these when C2 ships.
 const plugin_owner_defaults = [_]struct {
     command: []const u8,
@@ -411,7 +425,7 @@ pub fn commandActionSuffix(id: []const u8) []const u8 {
 }
 
 /// The Fizzy command whose chord actually reaches `id`, when `id` is a plugin's implementation
-/// of a document verb and has no chord of its own. Null for shell commands and for verbs with
+/// of a document verb and has no chord of its own. Null for fizzy commands and for verbs with
 /// no universal Fizzy entry.
 pub fn inheritedChordSource(id: []const u8) ?[]const u8 {
     // A `fizzy.*` command is the source, never the inheritor.
@@ -432,9 +446,9 @@ fn defaultsFor(profile: Profile) []const DefaultBind {
 
 // ---- keymap assembly --------------------------------------------------------------------------
 
-/// Look up a shell command by the dvui bind name it defaults to.
-fn shellCommandForBind(name: []const u8) ?ShellCommand {
-    inline for (shell_commands) |c| {
+/// Look up a fizzy command by the dvui bind name it defaults to.
+fn fizzyCommandForBind(name: []const u8) ?FizzyCommand {
+    inline for (fizzy_commands) |c| {
         if (c.bind) |b| {
             if (std.mem.eql(u8, b, name)) return c;
         }
@@ -504,7 +518,7 @@ pub fn chordShadowed(editor: *Editor, command_id: []const u8) bool {
 /// AppKit has no such notion: two `NSMenuItem`s holding the same key equivalent are a coin flip
 /// over which one fires, and the loser is whichever the menu happens to list first — not what
 /// the keymap resolves. So the shadowed command's item gives the chord up entirely. Binding
-/// `cmd+f` to Format Document, which the shell's profile hands to Open Folder, has to end with
+/// `cmd+f` to Format Document, which fizzy's own profile hands to Open Folder, has to end with
 /// `cmd+f` formatting: the menu, `Keybinds.tick` and AppKit all agree on the winner, and Open
 /// Folder shows no chord because it no longer has one.
 fn shadowedByHigherLayer(editor: *Editor, binding: keymap.Binding, command_id: []const u8) bool {
@@ -513,7 +527,7 @@ fn shadowedByHigherLayer(editor: *Editor, binding: keymap.Binding, command_id: [
         if (std.mem.eql(u8, other_cmd, command_id)) continue;
         if (!other.stroke.eql(binding.stroke)) continue;
         if (!other.when.eql(binding.when)) continue;
-        // Owner-scoped bindings (pixi's `mod+p` Export vs the shell's Quick Open) fork on the
+        // Owner-scoped bindings (pixi's `mod+p` Export vs fizzy's own Quick Open) fork on the
         // active document rather than shadowing outright — either can be the right answer, so
         // neither gives up its chord here.
         const same_owner = if (binding.owner_id == null and other.owner_id == null)
@@ -635,7 +649,7 @@ pub fn isNativeMenuCommandOnMacOS(id: []const u8) bool {
 }
 
 /// Rebuild `editor.keymap` from the finished `dvui.Window.keybinds` map. Called at the end of
-/// `Editor.rebuildKeybinds`, so it sees dvui's defaults, the shell's binds, and every loaded
+/// `Editor.rebuildKeybinds`, so it sees dvui's defaults, fizzy's own binds, and every loaded
 /// plugin's contributions in one pass.
 pub fn buildKeymap(editor: *Editor) !void {
     const gpa = editor.host.allocator;
@@ -649,11 +663,11 @@ pub fn buildKeymap(editor: *Editor) !void {
         editor.keybind_conflicts = null;
     }
 
-    // Layer 1 (lowest): whatever ended up in dvui's bind map — dvui's own defaults, the shell's
+    // Layer 1 (lowest): whatever ended up in dvui's bind map — dvui's own defaults, fizzy's own
     // `register()`, and every loaded plugin's `contributeKeybinds`.
     var it = window.keybinds.iterator();
     while (it.next()) |kv| {
-        const cmd = shellCommandForBind(kv.key_ptr.*) orelse continue;
+        const cmd = fizzyCommandForBind(kv.key_ptr.*) orelse continue;
         // Modifier-only binds ("shift", "zoom", "ctrl/cmd") have no key and can't be a chord.
         const chord = adapter.fromKeybind(kv.value_ptr.*) orelse continue;
         try editor.keymap.add(gpa, .{
@@ -663,7 +677,7 @@ pub fn buildKeymap(editor: *Editor) !void {
         });
     }
 
-    // Layer 2: the shell's default profile.
+    // Layer 2: fizzy's own default profile.
     const platform: keymap.Platform = if (fizzy.platform.isMacOS()) .mac else .other;
     for (defaultsFor(editor.keybind_profile)) |d| {
         const text = if (platform == .mac) (d.keys_mac orelse d.keys) else d.keys;
@@ -767,12 +781,12 @@ fn loadUserOverrides(editor: *Editor) !void {
 /// rewrites what those names mean.
 pub const bind_override_prefix = "bind.";
 
-/// The dvui bind name a shell command's key is mirrored onto, so a rebind also moves the
+/// The dvui bind name a fizzy command's key is mirrored onto, so a rebind also moves the
 /// built-in bind dvui's own widgets match on. The menus no longer go through this — they ask
 /// the keymap directly (`menuKeybindFor`), which answers for every command rather than only the
 /// ones that happen to have a dvui bind name.
-fn shellBindForCommand(id: []const u8) ?[]const u8 {
-    inline for (shell_commands) |c| {
+fn fizzyBindForCommand(id: []const u8) ?[]const u8 {
+    inline for (fizzy_commands) |c| {
         if (std.mem.eql(u8, c.id, id)) return c.bind;
     }
     return null;
@@ -794,7 +808,7 @@ fn projectUserOverrides(editor: *Editor) void {
         const name = if (std.mem.startsWith(u8, command, bind_override_prefix))
             command[bind_override_prefix.len..]
         else
-            shellBindForCommand(command) orelse continue;
+            fizzyBindForCommand(command) orelse continue;
 
         if (b.stroke.second != null) {
             // `dvui.enums.Keybind` is one key plus modifier flags; there is nowhere to put the
@@ -818,7 +832,7 @@ fn projectUserOverrides(editor: *Editor) void {
 
 // ---- dispatch ---------------------------------------------------------------------------------
 
-/// Context flags for `when` matching. Only what the shell can answer today; grows as bindings
+/// Context flags for `when` matching. Only what fizzy can answer today; grows as bindings
 /// need finer gates.
 fn currentContext(editor: *Editor) keymap.When {
     return .{
@@ -862,7 +876,7 @@ pub fn tick() !void {
                     // `pending` (first half of a chord) and `unbound` both *claim* the key, and
                     // ought to mark the event handled so it doesn't also reach a widget. Neither
                     // can occur yet — every binding built by `buildKeymap` is single-stroke and
-                    // none are unbinds — and `Event.handle` needs a `*WidgetData` the shell has
+                    // none are unbinds — and `Event.handle` needs a `*WidgetData` fizzy has
                     // no sensible value for. Left as a no-op deliberately: this stays behaviour-
                     // identical to the if-chain it replaced, which never marked events handled
                     // either. Revisit when chords or user unbinds actually land (step C/D).

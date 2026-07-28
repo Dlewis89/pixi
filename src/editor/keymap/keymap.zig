@@ -32,7 +32,7 @@ const Allocator = std.mem.Allocator;
 
 /// Context gate — VSCode's `when` clauses, reduced to a fixed set. Deliberately a small closed
 /// set rather than an expression language: a binding either applies in a context or it doesn't,
-/// and every entry here has to be *supplied* by the shell each frame, so an open-ended grammar
+/// and every entry here has to be *supplied* by fizzy each frame, so an open-ended grammar
 /// would just be a way to write conditions nothing ever satisfies.
 ///
 /// Empty (`.{}`) means "applies anywhere", which is the common case.
@@ -180,7 +180,7 @@ pub const Keymap = struct {
 
     /// Best binding for `stroke` in context `ctx`: highest `source`, then most specific `when`.
     /// Bindings with `owner_id` only apply when that id matches `active_owner` (decision 1B:
-    /// active document owner wins on shared chords; otherwise the shell/profile binding fires).
+    /// active document owner wins on shared chords; otherwise fizzy/profile binding fires).
     fn best(self: Keymap, stroke: Stroke, ctx: When, active_owner: ?[]const u8) ?Binding {
         var winner: ?Binding = null;
         for (self.bindings.items) |b| {
@@ -197,7 +197,7 @@ pub const Keymap = struct {
             const b_rank = (@as(u16, @intFromEnum(b.source)) << 8) | b.when.weight();
             const w_rank = (@as(u16, @intFromEnum(w.source)) << 8) | w.when.weight();
             // Owner-scoped bindings beat otherwise equal-rank global ones — that's the whole
-            // point of active-owner conflict resolution (pixi Export vs shell Quick Open).
+            // point of active-owner conflict resolution (pixi Export vs fizzy Quick Open).
             const b_owner_boost: u16 = if (b.owner_id != null) 1 else 0;
             const w_owner_boost: u16 = if (w.owner_id != null) 1 else 0;
             const b_total = (b_rank << 1) | b_owner_boost;
@@ -276,7 +276,7 @@ pub const Keymap = struct {
     }
 
     /// Bindings that share a chord but don't always fire together. Includes classic layer
-    /// shadowing (user beats profile) and active-owner forks (shell Quick Open vs pixi Export
+    /// shadowing (user beats profile) and active-owner forks (fizzy Quick Open vs pixi Export
     /// on `mod+p`) so the settings pane can warn about them.
     ///
     /// Collapses before reporting:
@@ -604,7 +604,7 @@ test "conflicts reports the shadowed binding" {
 
 test "conflicts dedupes when the same command is bound twice on a chord" {
     // Mirrors `fizzy.openFolder`: lifted from dvui's `open_folder` bind *and* listed in the
-    // shell profile. A user rebind of another command onto that chord must yield one row, not
+    // fizzy profile. A user rebind of another command onto that chord must yield one row, not
     // one per duplicate loser entry.
     const a = t.allocator;
     var k = try km(a, &.{

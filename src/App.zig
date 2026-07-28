@@ -126,7 +126,7 @@ pub const std_options: std.Options = .{
 };
 
 // Forwards every log call to dvui's usual sink (stderr on native, the browser console on
-// web) and also into `fizzy.OutputLog`, so the shell's "Output" bottom panel can show it.
+// web) and also into `fizzy.OutputLog`, so fizzy's "Output" bottom panel can show it.
 fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
     fizzy.OutputLog.append(level, scope, format, args);
     dvui.App.logFn(level, scope, format, args);
@@ -182,7 +182,7 @@ pub fn AppInit(win: *dvui.Window) !void {
     fizzy.editor = try allocator.create(Editor);
     fizzy.editor.* = Editor.init(fizzy.app) catch unreachable;
 
-    // Workbench shell-owned state: wire before plugin `register`.
+    // Workbench fizzy-owned state: wire before plugin `register`.
     workbench.runtime.setWorkbench(&fizzy.editor.workbench);
 
     // Second-stage init that needs the editor at its final heap address (e.g. registering the

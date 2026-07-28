@@ -92,13 +92,13 @@ loaded_plugin_libs: std.ArrayListUnmanaged(PluginLoader.LoadedLib) = .empty,
 /// list is only the UI/skip-load set for the current session. Freed in `deinit`.
 disabled_plugin_ids: std.ArrayListUnmanaged([]const u8) = .empty,
 
-/// Shell-only pending `.plugins.<id>.enabled` writes (id → new bool), drained by
+/// Fizzy-only pending `.plugins.<id>.enabled` writes (id → new bool), drained by
 /// `writeMergedSettings` alongside `host.plugin_settings_pending`. Never touched by a
 /// plugin itself — only by `setPluginEnabled` / store install. Keys are app-allocator-owned.
 plugin_enabled_pending: std.StringArrayHashMapUnmanaged(bool) = .empty,
 
 /// Snapshot of dvui's *built-in* keybinds (`char_left`, `copy`, `next_widget`, …), taken in
-/// `init` before the shell adds its own. `Window.init` installs these once and never again,
+/// `init` before fizzy adds its own. `Window.init` installs these once and never again,
 /// so `rebuildKeybinds` — which wipes the map to drop an unloaded plugin's binds — must put
 /// them back or every widget's caret/clipboard handling silently dies after the first plugin
 /// load or unload. Keys are dvui's own static literals; only the map itself is owned here.
@@ -112,7 +112,7 @@ keymap: @import("keymap/keymap.zig").Keymap = .{},
 keybinds_overrides: ?@import("keymap/keymap.zig").zon.File = null,
 /// Cached `Keymap.conflicts()` result from the last rebuild — owned, freed on next rebuild.
 keybind_conflicts: ?[]@import("keymap/keymap.zig").Conflict = null,
-/// Which default keymap the shell starts from.
+/// Which default keymap fizzy starts from.
 keybind_profile: Keybinds.Profile = .vscode,
 /// VSCode-style Quick Open / command palette overlay.
 command_palette: @import("CommandPalette.zig") = .{},
@@ -533,7 +533,7 @@ pub fn init(
     editor.open_files = .empty;
     try editor.workbench.initDefaultWorkspace();
 
-    // Capture dvui's defaults before the shell's own binds land, so `rebuildKeybinds` can
+    // Capture dvui's defaults before fizzy's own binds land, so `rebuildKeybinds` can
     // restore them after clearing the map.
     editor.dvui_default_keybinds = try dvui.currentWindow().keybinds.clone(fizzy.app.allocator);
 
@@ -542,7 +542,7 @@ pub fn init(
     // Collect the initial settings.zon text for autosave dedup — must match exactly what
     // `writeMergedSettings` would produce with no pending plugin writes (same composer, empty
     // overlay), otherwise the very first autosave after startup would spuriously rewrite the
-    // file just because this seed only accounted for the shell's own fields, not `.plugins`.
+    // file just because this seed only accounted for fizzy's own fields, not `.plugins`.
     if (comptime builtin.target.cpu.arch == .wasm32) {
         const serialized = try Settings.serialize(&editor.settings, fizzy.app.allocator);
         defer fizzy.app.allocator.free(serialized);
@@ -564,8 +564,8 @@ pub fn init(
 /// must run here — not in `init`, where it would point at the stack temporary.
 /// Called from `App.AppInit` right after the heap copy. (The built-in branch
 /// decorators registered in `init` are exempt: they store fn pointers, not `&editor`.)
-/// Stable shell-builtin contribution id.
-pub const view_settings = "shell.settings";
+/// Stable fizzy-builtin contribution id.
+pub const view_settings = "fizzy.settings";
 
 fn loadWorkbenchFromDylibEnabled() bool {
     if (comptime builtin.target.cpu.arch == .wasm32) return false;
@@ -819,6 +819,28 @@ fn pluginLoadFailureReason(err: PluginLoader.LoadError) []const u8 {
     };
 }
 
+/// Record a load failure for `id` (probing the on-disk build at `path` for its version/detail),
+/// replacing any earlier record for the same id.
+///
+/// Every path that loads a user plugin routes its failures here — the startup scan *and* the live
+/// ones (`loadUserPluginById`, reached from enable, store install, and update). A live load that
+/// failed silently used to leave the plugin in none of the three lists the store's installed pane
+/// is built from (loaded / disabled / failed), so a wrong-SDK build would simply vanish from the
+/// UI: nothing to reinstall, nothing to uninstall, no way back short of a restart.
+fn recordLoadFailure(editor: *Editor, id: []const u8, path: []const u8, err: PluginLoader.LoadError) void {
+    const reason = pluginLoadFailureReason(err);
+    const probe = PluginLoader.probeVersionInfo(path);
+    const detail: ?[]const u8 = if (probe) |info|
+        formatPluginProbeDetail(fizzy.app.allocator, info) catch null
+    else
+        null;
+    defer if (detail) |d| fizzy.app.allocator.free(d);
+    // `recordPluginFailure` appends unconditionally; drop any prior record so repeated attempts
+    // (enable → fail → enable → fail) leave one row, not a growing pile of duplicate cards.
+    editor.clearFailedUserPlugin(id);
+    editor.recordPluginFailure(id, reason, detail, if (probe) |info| info.plugin_version else null);
+}
+
 /// One-shot: moves any pre-R10 flat `{plugins_dir}/{id}.{ext}` into its own
 /// `{plugins_dir}/{id}/{id}.{ext}` directory (see docs/PLUGIN_MANIFEST_PLAN.md R10). Collects the
 /// list of flat files first, then renames in a second pass, so mutating the directory never races
@@ -908,7 +930,7 @@ pub fn loadUserPlugins(editor: *Editor, config_folder: []const u8) void {
         const path = std.fs.path.join(fizzy.app.allocator, &.{ plugins_dir, plugin_id, file_name }) catch continue;
 
         if (editor.host.pluginById(plugin_id) != null) {
-            // A shell built-in (`text`/`workbench`/`image`/`markdown`) is loaded via its own
+            // A fizzy built-in (`text`/`workbench`/`image`/`markdown`) is loaded via its own
             // static/dylib path (see `postInit` above) and may *also* have its dylib sitting in
             // this same shared plugins directory — built-ins compile "the same third-party
             // shape" a real third-party plugin would, and `zig build install` drops every
@@ -935,14 +957,8 @@ pub fn loadUserPlugins(editor: *Editor, config_folder: []const u8) void {
             .arg_b = @ptrCast(&editor.host),
             .arg_c = null,
         }) catch |err| {
-            const reason = pluginLoadFailureReason(err);
-            const probe = PluginLoader.probeVersionInfo(path);
-            const detail_owned: ?[]const u8 = if (probe) |info|
-                formatPluginProbeDetail(fizzy.app.allocator, info) catch null
-            else
-                null;
-            dvui.log.err("user plugin '{s}' ({s}): load failed: {s} — {s}", .{ plugin_id, path, @errorName(err), reason });
-            editor.recordPluginFailure(plugin_id, reason, detail_owned, if (probe) |info| info.plugin_version else null);
+            dvui.log.err("user plugin '{s}' ({s}): load failed: {s} — {s}", .{ plugin_id, path, @errorName(err), pluginLoadFailureReason(err) });
+            editor.recordLoadFailure(plugin_id, path, err);
             fizzy.app.allocator.free(path);
             continue;
         };
@@ -1024,6 +1040,25 @@ fn isBundledPluginId(id: []const u8) bool {
         if (std.mem.eql(u8, m.plugin_id, id)) return true;
     }
     return false;
+}
+
+/// A bundled built-in's whole parsed manifest, straight off its own compiled-in
+/// `plugin_options.manifest_zon` — no dylib/dlopen involved, since a static built-in has no
+/// separate file to probe (`PluginLoader.probeManifestInfo` is the dylib-path equivalent for
+/// everything else). Null when `id` isn't a built-in or its manifest doesn't parse.
+///
+/// Returned in the editor's per-frame arena, not the persistent allocator — this is a UI display
+/// helper meant to be called fresh every frame (like the store card labels), so the caller never
+/// has to free it, and no `manifest_cache` entry is needed for built-ins.
+pub fn builtinManifest(editor: *Editor, id: []const u8) ?sdk.manifest.Manifest {
+    inline for (bundled_modules) |m| {
+        if (std.mem.eql(u8, m.plugin_id, id)) {
+            const frame_gpa = editor.arena.allocator();
+            const zon = frame_gpa.dupeZ(u8, m.plugin_options.manifest_zon) catch return null;
+            return sdk.manifest.parse(frame_gpa, zon) catch return null;
+        }
+    }
+    return null;
 }
 
 /// True when `id` names a runtime-loaded user plugin that may be unloaded/disabled.
@@ -1156,7 +1191,7 @@ fn setPluginEnabledPersisted(editor: *Editor, id: []const u8, enabled: bool) !vo
     }
 }
 
-/// Rebuild the whole window keybind map from scratch: shell binds + every *currently
+/// Rebuild the whole window keybind map from scratch: fizzy binds + every *currently
 /// registered* plugin's `contributeKeybinds`. Used after a plugin is unregistered so its
 /// binds (whose key strings live in the soon-to-be-`dlclose`d image) are dropped. Also
 /// called after the Keyboard Shortcuts pane writes `keybinds.zon`.
@@ -1169,7 +1204,7 @@ pub fn rebuildKeybinds(editor: *Editor) void {
         window.keybinds.put(window.gpa, kv.key_ptr.*, kv.value_ptr.*) catch |err|
             dvui.log.err("keybind rebuild (dvui default '{s}') failed: {s}", .{ kv.key_ptr.*, @errorName(err) });
     }
-    Keybinds.register() catch |err| dvui.log.err("keybind rebuild (shell) failed: {s}", .{@errorName(err)});
+    Keybinds.register() catch |err| dvui.log.err("keybind rebuild (fizzy) failed: {s}", .{@errorName(err)});
     for (editor.host.plugins.items) |plugin| {
         plugin.contributeKeybinds(window) catch |err|
             dvui.log.err("keybind rebuild ('{s}') failed: {s}", .{ plugin.id, @errorName(err) });
@@ -1199,11 +1234,18 @@ pub fn loadUserPluginById(editor: *Editor, id: []const u8) !void {
     const path = try std.fs.path.join(fizzy.app.allocator, &.{ editor.config_folder, "plugins", id, file_name });
     errdefer fizzy.app.allocator.free(path);
 
-    const loaded = try PluginLoader.loadAndRegister(&editor.host, fizzy.app.allocator, path, id, .{
+    const loaded = PluginLoader.loadAndRegister(&editor.host, fizzy.app.allocator, path, id, .{
         .gpa = &fizzy.app.allocator,
         .arg_b = @ptrCast(&editor.host),
         .arg_c = null,
-    });
+    }) catch |err| {
+        // Leave the same actionable record the startup scan leaves (see `recordLoadFailure`), so
+        // a build that fails a live load stays visible in the store's installed pane with its
+        // Reinstall/Uninstall controls instead of disappearing until the next restart.
+        dvui.log.err("user plugin '{s}' ({s}): load failed: {s} — {s}", .{ id, path, @errorName(err), pluginLoadFailureReason(err) });
+        editor.recordLoadFailure(id, path, err);
+        return err;
+    };
     try editor.appendLoadedPluginLib(loaded);
     syncLoadedPluginDvuiContexts(editor);
     syncLoadedPluginRenderBridge(editor);
@@ -1395,17 +1437,17 @@ pub fn uninstallPlugin(editor: *Editor, id: []const u8, force: bool) !void {
 pub fn postInit(editor: *Editor) !void {
     sdk.installRuntime(&fizzy.app.allocator, &editor.host, null);
 
-    // Shell commands must be registered against the Editor's *final* address — `init` returns
+    // Fizzy commands must be registered against the Editor's *final* address — `init` returns
     // an Editor by value, so a pointer taken there would dangle the moment it's moved.
     try Keybinds.registerCommands(editor);
 
-    // Install the shell's read/utility surface so plugins reach shared shell state
+    // Install fizzy's read/utility surface so plugins reach shared fizzy state
     // (per-frame arena, project folder, content opacity, settings dirty-mark) through
     // the Host instead of importing the concrete Editor.
-    editor.host.installShell(.{ .ctx = editor, .vtable = &shell_api_vtable });
+    editor.host.installFizzyApi(.{ .ctx = editor, .vtable = &fizzy_api_vtable });
 
     // Register plugin contributions (sidebar/bottom/center/menus). These are the
-    // near-empty shell's content: it iterates the Host registries rather than
+    // near-empty fizzy's content: it iterates the Host registries rather than
     // hardcoding panes. Web-safe — the draw fns reach the same inline code the
     // editor tick already runs on wasm. Order = sidebar order.
     // These 4 built-ins default to dylib-first with a static fallback, but none of them
@@ -1452,11 +1494,11 @@ pub fn postInit(editor: *Editor) !void {
 
     for (editor.host.plugins.items) |p| try p.initPlugin();
 
-    // Shell built-in: Plugin store (owner = null; not a plugin). Registered just before
+    // Fizzy built-in: Plugin store (owner = null; not a plugin). Registered just before
     // Settings so its icon sits directly above the cog in the sidebar rail.
     try PluginStore.register(&editor.host);
 
-    // Shell built-in: Settings (owner = null; not a plugin).
+    // Fizzy built-in: Settings (owner = null; not a plugin).
     try editor.host.registerSidebarView(.{
         .id = view_settings,
         .icon = dvui.entypo.cog,
@@ -1464,17 +1506,17 @@ pub fn postInit(editor: *Editor) !void {
         .draw = drawSettingsPane,
     });
 
-    // Shell built-in: Output (owner = null; not a plugin). `persistent` keeps it visible
+    // Fizzy built-in: Output (owner = null; not a plugin). `persistent` keeps it visible
     // even with no document open, since it's a diagnostic view, not a per-file one.
     try editor.host.registerBottomView(.{
-        .id = "shell.output",
+        .id = "fizzy.output",
         .title = "Output",
         .persistent = true,
         .draw = OutputPanel.draw,
     });
 
     // Menu bar contributions (non-macOS in-app bar). The File/Edit draw bodies still live
-    // in the shell's `Menu.zig`; a later step could move them into the workbench / pixel-art
+    // in fizzy's `Menu.zig`; a later step could move them into the workbench / pixel-art
     // plugins so those self-register. Order = bar order.
     // One registration per `menu_model.menu_bar` entry, all pointing at the same generic
     // renderer with the model node as `ctx`. There is no longer a per-menu draw function that
@@ -1489,7 +1531,7 @@ pub fn postInit(editor: *Editor) !void {
     }
 
     // Keybind contributions: each plugin registers its own binds into the window's
-    // keybind map. The shell already registered its global/navigation/region binds
+    // keybind map. Fizzy already registered its global/navigation/region binds
     // in `Keybinds.register` (during `init`, before this runs), so the two halves
     // are disjoint — no `putNoClobber` clash. Runs on all targets (web included).
     syncLoadedPluginDvuiContexts(editor);
@@ -1497,7 +1539,7 @@ pub fn postInit(editor: *Editor) !void {
     for (editor.host.plugins.items) |plugin| try plugin.contributeKeybinds(window);
     // Startup's only pass over the finished bind map. `rebuildKeybinds` covers later plugin
     // load/unload, but it never runs during boot — without this the keymap stays empty and no
-    // shell shortcut works until a plugin happens to be reloaded.
+    // fizzy shortcut works until a plugin happens to be reloaded.
     try Keybinds.buildKeymap(editor);
 
     // The workbench-api is the file explorer's programmatic surface and drives OS
@@ -1546,82 +1588,106 @@ pub fn postInit(editor: *Editor) !void {
 }
 
 /// The Settings sidebar view: a single searchable tree (`SettingsTree`) whose "Fizzy" branch
-/// carries the shell's own categories (`Explorer.settings.groups`) and whose remaining branches
+/// carries fizzy's own categories (`Explorer.settings.groups`) and whose remaining branches
 /// are one per plugin — loaded plugins' schema fields drawn by `PluginSettingsPane.drawField`,
 /// failed plugins' failure reason.
 fn drawSettingsPane(_: ?*anyopaque) anyerror!void {
     try SettingsTree.draw();
 }
 
-// ---- EditorAPI: the shell-provided read/utility surface for plugins ----------
+// ---- EditorAPI: fizzy-provided read/utility surface for plugins ----------
 // Installed on the Host in `postInit`; `ctx` is this `*Editor`.
 
-const shell_api_vtable: sdk.EditorAPI.VTable = .{
-    .arena = shellArena,
-    .folder = shellFolder,
-    .paletteFolder = shellPaletteFolder,
-    .markSettingsDirty = shellMarkSettingsDirty,
-    .contentOpacity = shellContentOpacity,
-    .isMaximized = shellIsMaximized,
-    .isMacOS = shellIsMacOS,
-    .appliesNativeWindowOpacity = shellAppliesNativeWindowOpacity,
-    .panZoomScheme = shellPanZoomScheme,
-    .explorerRect = shellExplorerRect,
-    .explorerVirtualSize = shellExplorerVirtualSize,
-    .showSaveDialog = shellShowSaveDialog,
-    .activeDoc = shellActiveDoc,
-    .docByIndex = shellDocByIndex,
-    .docById = shellDocById,
-    .docIndex = shellDocIndex,
-    .openDocCount = shellOpenDocCount,
-    .setActiveDocIndex = shellSetActiveDocIndex,
-    .swapDocs = shellSwapDocs,
-    .allocDocId = shellAllocDocId,
-    .explorerViewportWidth = shellExplorerViewportWidth,
-    .docFromPath = shellDocFromPath,
-    .openFilePath = shellOpenFilePath,
-    .openOrFocusFileAtGrouping = shellOpenOrFocusFileAtGrouping,
-    .closeDocById = shellCloseDocById,
-    .setProjectFolder = shellSetProjectFolder,
-    .closeProjectFolder = shellCloseProjectFolder,
-    .recentFolderCount = shellRecentFolderCount,
-    .recentFolderAt = shellRecentFolderAt,
-    .openInFileBrowser = shellOpenInFileBrowser,
-    .isPathIgnored = shellIsPathIgnored,
-    .explorerBranchIsOpen = shellExplorerBranchIsOpen,
-    .setExplorerBranchOpen = shellSetExplorerBranchOpen,
-    .drawWorkspaces = shellDrawWorkspaces,
-    .showOpenFolderDialog = shellShowOpenFolderDialog,
-    .showOpenFileDialog = shellShowOpenFileDialog,
-    .save = shellSave,
-    .requestPrepareFrame = shellRequestCompositeWarmup,
-    .refresh = shellRefresh,
-    .allocUntitledPath = shellAllocUntitledPath,
-    .createDocument = shellCreateDocument,
-    .setExplorerNewFilePath = shellSetExplorerNewFilePath,
-    .requestSaveAs = shellRequestSaveAs,
-    .requestWebSave = shellRequestWebSave,
-    .cancelPendingSaveDialog = shellCancelPendingSaveDialog,
-    .setPendingCloseDocId = shellSetPendingCloseDocId,
-    .queueCloseAfterSave = shellQueueCloseAfterSave,
-    .trackQuitSaveInFlight = shellTrackQuitSaveInFlight,
-    .resumeSaveAllQuit = shellResumeSaveAllQuit,
-    .abortSaveAllQuit = shellAbortSaveAllQuit,
-    .logLine = shellLogLine,
-    .drawMenuItem = shellDrawMenuItem,
-    .loadPluginSettingsFile = shellLoadPluginSettingsFile,
+const fizzy_api_vtable: sdk.EditorAPI.VTable = .{
+    .arena = fizzyArena,
+    .folder = fizzyFolder,
+    .paletteFolder = fizzyPaletteFolder,
+    .markSettingsDirty = fizzyMarkSettingsDirty,
+    .contentOpacity = fizzyContentOpacity,
+    .isMaximized = fizzyIsMaximized,
+    .isMacOS = fizzyIsMacOS,
+    .appliesNativeWindowOpacity = fizzyAppliesNativeWindowOpacity,
+    .panZoomScheme = fizzyPanZoomScheme,
+    .explorerRect = fizzyExplorerRect,
+    .explorerVirtualSize = fizzyExplorerVirtualSize,
+    .showSaveDialog = fizzyShowSaveDialog,
+    .activeDoc = fizzyActiveDoc,
+    .docByIndex = fizzyDocByIndex,
+    .docById = fizzyDocById,
+    .docIndex = fizzyDocIndex,
+    .openDocCount = fizzyOpenDocCount,
+    .setActiveDocIndex = fizzySetActiveDocIndex,
+    .swapDocs = fizzySwapDocs,
+    .allocDocId = fizzyAllocDocId,
+    .explorerViewportWidth = fizzyExplorerViewportWidth,
+    .docFromPath = fizzyDocFromPath,
+    .openFilePath = fizzyOpenFilePath,
+    .openOrFocusFileAtGrouping = fizzyOpenOrFocusFileAtGrouping,
+    .closeDocById = fizzyCloseDocById,
+    .setProjectFolder = fizzySetProjectFolder,
+    .closeProjectFolder = fizzyCloseProjectFolder,
+    .recentFolderCount = fizzyRecentFolderCount,
+    .recentFolderAt = fizzyRecentFolderAt,
+    .openInFileBrowser = fizzyOpenInFileBrowser,
+    .isPathIgnored = fizzyIsPathIgnored,
+    .explorerBranchIsOpen = fizzyExplorerBranchIsOpen,
+    .setExplorerBranchOpen = fizzySetExplorerBranchOpen,
+    .drawWorkspaces = fizzyDrawWorkspaces,
+    .showOpenFolderDialog = fizzyShowOpenFolderDialog,
+    .showOpenFileDialog = fizzyShowOpenFileDialog,
+    .save = fizzySave,
+    .requestPrepareFrame = fizzyRequestCompositeWarmup,
+    .refresh = fizzyRefresh,
+    .allocUntitledPath = fizzyAllocUntitledPath,
+    .createDocument = fizzyCreateDocument,
+    .setExplorerNewFilePath = fizzySetExplorerNewFilePath,
+    .requestSaveAs = fizzyRequestSaveAs,
+    .requestWebSave = fizzyRequestWebSave,
+    .cancelPendingSaveDialog = fizzyCancelPendingSaveDialog,
+    .setPendingCloseDocId = fizzySetPendingCloseDocId,
+    .queueCloseAfterSave = fizzyQueueCloseAfterSave,
+    .trackQuitSaveInFlight = fizzyTrackQuitSaveInFlight,
+    .resumeSaveAllQuit = fizzyResumeSaveAllQuit,
+    .abortSaveAllQuit = fizzyAbortSaveAllQuit,
+    .logLine = fizzyLogLine,
+    .drawMenuItem = fizzyDrawMenuItem,
+    .loadPluginSettingsFile = fizzyLoadPluginSettingsFile,
 };
 
-fn shellLogLine(ctx: *anyopaque, level: std.log.Level, scope: []const u8, message: []const u8) void {
+fn fizzyLogLine(ctx: *anyopaque, level: std.log.Level, scope: []const u8, message: []const u8) void {
     _ = ctx;
     fizzy.OutputLog.appendLine(level, scope, message);
 }
 
 /// See `EditorAPI.VTable.drawMenuItem`'s doc comment for why this widget construction has to
-/// happen here (in the shell) rather than in the calling plugin.
-fn shellDrawMenuItem(ctx: *anyopaque, title: []const u8, command_id: ?[]const u8) bool {
-    const editor = shellCtx(ctx);
-    _ = dvui.separator(@src(), .{ .expand = .horizontal });
+/// happen here (in fizzy) rather than in the calling plugin.
+///
+/// `enabled` is read straight off the registered `Command` (absent `isEnabled` = enabled) rather
+/// than threaded through the vtable as its own parameter, so a plugin section's row can be greyed
+/// out — same as fizzy's own menu rows (`Menu.menuItemWithHotkey`) — without an SDK/ABI
+/// change: `Host.commandEnabled` already existed for the command palette. Before this, a
+/// section's `draw` callback had to early-return entirely to avoid a permanently-clickable row
+/// for the wrong document (pixi's Transform/Grid Layout, text's Format Document), which made the
+/// row disappear here while the *native* macOS menu — a static bar with no per-row enabled hook
+/// at all — kept showing it, greyed or not. Reading the command's own `isEnabled` here instead
+/// lets the plugin draw the row unconditionally and get correct greying for free.
+///
+/// Draws no separator of its own — `Menu.drawMenuSections` draws exactly one ahead of the whole
+/// plugin-contributed group for a menu, not one per row. This used to draw its own leading
+/// separator, which was fine while a section's early return meant at most one row ever appeared
+/// per menu; once sections stopped early-returning (same doc comment above), the Edit menu could
+/// carry three rows (pixi's Transform, pixi's Grid Layout, text's Format Document) each drawing
+/// its own separator, so every greyed-out row looked like its own group.
+fn fizzyDrawMenuItem(ctx: *anyopaque, title: []const u8, command_id: ?[]const u8) bool {
+    const editor = fizzyCtx(ctx);
+    const enabled = if (command_id) |id| editor.host.commandEnabled(id) else true;
+    // Same command lookup `commandEnabled` above just did — reused here for the icon rather than
+    // threaded through the vtable as its own parameter, same reasoning as `enabled`: additive on
+    // `sdk.Command` (a plain data struct plugins already construct), not a vtable/ABI change.
+    const icon: ?[]const u8 = if (command_id) |id| blk: {
+        const c = editor.host.command(id) orelse break :blk null;
+        break :blk c.icon;
+    } else null;
     var mi = dvui.menuItem(@src(), .{}, .{
         .expand = .horizontal,
         // `Wyhash.hash` always returns `u64`; `id_extra` is `usize`, which is 32-bit on
@@ -1629,28 +1695,32 @@ fn shellDrawMenuItem(ctx: *anyopaque, title: []const u8, command_id: ?[]const u8
         .id_extra = @truncate(std.hash.Wyhash.hash(0, title)),
     });
     defer mi.deinit();
-    const clicked = mi.activeRect() != null;
-    // Same resolution the shell's own menu rows use (`Menu.hotkeyFor`), so a plugin row and a
-    // shell row bound to the same chord can never disagree about what to display.
+    const clicked = enabled and mi.activeRect() != null;
+    // Same resolution fizzy's own menu rows use (`Menu.hotkeyFor`), so a plugin row and a
+    // fizzy row bound to the same chord can never disagree about what to display.
     const kb: dvui.enums.Keybind = if (command_id) |id|
         Keybinds.menuKeybindFor(editor, id)
     else
         .{};
-    fizzy.dvui.labelWithKeybind(title, kb, true, .{ .expand = .horizontal }, .{ .expand = .horizontal });
+    const id_extra: usize = @truncate(std.hash.Wyhash.hash(0, title));
+    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .id_extra = id_extra });
+    defer row.deinit();
+    fizzy.dvui.menuRowIcon(icon, dvui.themeGet().color(.window, .text), enabled, id_extra);
+    fizzy.dvui.labelWithKeybind(title, kb, enabled, .{ .expand = .horizontal }, .{ .expand = .horizontal });
     return clicked;
 }
 
 /// See `EditorAPI.VTable.loadPluginSettingsFile`'s doc comment for why this must run here
-/// (the shell's own compiled code) rather than inside `Host.loadPluginSettings` directly.
+/// (fizzy's own compiled code) rather than inside `Host.loadPluginSettings` directly.
 /// Reads the whole merged `<config>/settings.zon` and pulls out just `id`'s
 /// `.plugins.<id>.settings` blob (R12 nested shape — author fields live under `.settings` so
-/// they can never collide with the shell-reserved `.enabled`).
-fn shellLoadPluginSettingsFile(ctx: *anyopaque, id: []const u8) ?[]u8 {
+/// they can never collide with fizzy-reserved `.enabled`).
+fn fizzyLoadPluginSettingsFile(ctx: *anyopaque, id: []const u8) ?[]u8 {
     // Wasm: no filesystem; `fizzy.fs.readZ` uses `Io.Dir.cwd()` (posix.AT), which doesn't exist
     // for this target — `Host.loadPluginSettings` already short-circuits before ever calling
     // through to here, but this vtable entry is still type-checked for every target regardless.
     if (comptime builtin.target.cpu.arch == .wasm32) return null;
-    const editor = shellCtx(ctx);
+    const editor = fizzyCtx(ctx);
     const path = std.fs.path.join(fizzy.app.allocator, &.{ editor.config_folder, "settings.zon" }) catch return null;
     defer fizzy.app.allocator.free(path);
     const data = fizzy.fs.readZ(editor.host.allocator, dvui.io, path) catch return null;
@@ -1658,49 +1728,49 @@ fn shellLoadPluginSettingsFile(ctx: *anyopaque, id: []const u8) ?[]u8 {
     return readPluginSettingsText(editor.host.allocator, data, id);
 }
 
-fn shellCtx(ctx: *anyopaque) *Editor {
+fn fizzyCtx(ctx: *anyopaque) *Editor {
     return @ptrCast(@alignCast(ctx));
 }
-fn shellArena(ctx: *anyopaque) std.mem.Allocator {
-    return shellCtx(ctx).arena.allocator();
+fn fizzyArena(ctx: *anyopaque) std.mem.Allocator {
+    return fizzyCtx(ctx).arena.allocator();
 }
-fn shellFolder(ctx: *anyopaque) ?[]const u8 {
-    return shellCtx(ctx).folder;
+fn fizzyFolder(ctx: *anyopaque) ?[]const u8 {
+    return fizzyCtx(ctx).folder;
 }
-fn shellPaletteFolder(ctx: *anyopaque) ?[]const u8 {
-    return shellCtx(ctx).palette_folder;
+fn fizzyPaletteFolder(ctx: *anyopaque) ?[]const u8 {
+    return fizzyCtx(ctx).palette_folder;
 }
-fn shellMarkSettingsDirty(ctx: *anyopaque) void {
-    shellCtx(ctx).markSettingsDirty();
+fn fizzyMarkSettingsDirty(ctx: *anyopaque) void {
+    fizzyCtx(ctx).markSettingsDirty();
 }
-fn shellContentOpacity(ctx: *anyopaque) f32 {
-    return shellCtx(ctx).settings.content_opacity;
+fn fizzyContentOpacity(ctx: *anyopaque) f32 {
+    return fizzyCtx(ctx).settings.content_opacity;
 }
-fn shellIsMaximized(ctx: *anyopaque) bool {
+fn fizzyIsMaximized(ctx: *anyopaque) bool {
     _ = ctx;
     return fizzy.backend.isMaximized(dvui.currentWindow());
 }
-fn shellIsMacOS(_: *anyopaque) bool {
+fn fizzyIsMacOS(_: *anyopaque) bool {
     return fizzy.platform.isMacOS();
 }
-fn shellAppliesNativeWindowOpacity(_: *anyopaque) bool {
+fn fizzyAppliesNativeWindowOpacity(_: *anyopaque) bool {
     if (comptime builtin.target.cpu.arch == .wasm32) return false;
     return builtin.os.tag == .macos or builtin.os.tag == .windows;
 }
-fn shellPanZoomScheme(ctx: *anyopaque) sdk.EditorAPI.PanZoomScheme {
-    const editor = shellCtx(ctx);
+fn fizzyPanZoomScheme(ctx: *anyopaque) sdk.EditorAPI.PanZoomScheme {
+    const editor = fizzyCtx(ctx);
     return switch (Settings.resolvedPanZoomScheme(&editor.settings, fizzy.platform.isMacOS())) {
         .mouse => .mouse,
         .trackpad => .trackpad,
     };
 }
-fn shellExplorerRect(ctx: *anyopaque) dvui.Rect {
-    return shellCtx(ctx).explorer.rect;
+fn fizzyExplorerRect(ctx: *anyopaque) dvui.Rect {
+    return fizzyCtx(ctx).explorer.rect;
 }
-fn shellExplorerVirtualSize(ctx: *anyopaque) dvui.Size {
-    return shellCtx(ctx).explorer.scroll_info.virtual_size;
+fn fizzyExplorerVirtualSize(ctx: *anyopaque) dvui.Size {
+    return fizzyCtx(ctx).explorer.scroll_info.virtual_size;
 }
-fn shellShowSaveDialog(
+fn fizzyShowSaveDialog(
     ctx: *anyopaque,
     cb: sdk.EditorAPI.SaveDialogCallback,
     filters: []const sdk.EditorAPI.SaveDialogFilter,
@@ -1712,92 +1782,92 @@ fn shellShowSaveDialog(
     const native_filters: [*]const fizzy.backend.DialogFileFilter = @ptrCast(filters.ptr);
     fizzy.backend.showSaveFileDialog(cb, native_filters[0..filters.len], default_filename, default_folder);
 }
-fn shellActiveDoc(ctx: *anyopaque) ?sdk.DocHandle {
-    return shellCtx(ctx).activeDoc();
+fn fizzyActiveDoc(ctx: *anyopaque) ?sdk.DocHandle {
+    return fizzyCtx(ctx).activeDoc();
 }
-fn shellDocByIndex(ctx: *anyopaque, index: usize) ?sdk.DocHandle {
-    return shellCtx(ctx).docAt(index);
+fn fizzyDocByIndex(ctx: *anyopaque, index: usize) ?sdk.DocHandle {
+    return fizzyCtx(ctx).docAt(index);
 }
-fn shellDocById(ctx: *anyopaque, id: u64) ?sdk.DocHandle {
-    return shellCtx(ctx).docById(id);
+fn fizzyDocById(ctx: *anyopaque, id: u64) ?sdk.DocHandle {
+    return fizzyCtx(ctx).docById(id);
 }
-fn shellDocIndex(ctx: *anyopaque, id: u64) ?usize {
-    return shellCtx(ctx).open_files.getIndex(id);
+fn fizzyDocIndex(ctx: *anyopaque, id: u64) ?usize {
+    return fizzyCtx(ctx).open_files.getIndex(id);
 }
-fn shellOpenDocCount(ctx: *anyopaque) usize {
-    return shellCtx(ctx).open_files.count();
+fn fizzyOpenDocCount(ctx: *anyopaque) usize {
+    return fizzyCtx(ctx).open_files.count();
 }
-fn shellSetActiveDocIndex(ctx: *anyopaque, index: usize) void {
-    shellCtx(ctx).setActiveFile(index);
+fn fizzySetActiveDocIndex(ctx: *anyopaque, index: usize) void {
+    fizzyCtx(ctx).setActiveFile(index);
 }
-fn shellSwapDocs(ctx: *anyopaque, a: usize, b: usize) void {
-    const editor = shellCtx(ctx);
+fn fizzySwapDocs(ctx: *anyopaque, a: usize, b: usize) void {
+    const editor = fizzyCtx(ctx);
     std.mem.swap(sdk.DocHandle, &editor.open_files.values()[a], &editor.open_files.values()[b]);
     std.mem.swap(u64, &editor.open_files.keys()[a], &editor.open_files.keys()[b]);
 }
-fn shellAllocDocId(ctx: *anyopaque) u64 {
-    return shellCtx(ctx).newFileID();
+fn fizzyAllocDocId(ctx: *anyopaque) u64 {
+    return fizzyCtx(ctx).newFileID();
 }
-fn shellExplorerViewportWidth(ctx: *anyopaque) f32 {
-    return shellCtx(ctx).explorer.scroll_info.viewport.w;
+fn fizzyExplorerViewportWidth(ctx: *anyopaque) f32 {
+    return fizzyCtx(ctx).explorer.scroll_info.viewport.w;
 }
-fn shellDocFromPath(ctx: *anyopaque, path: []const u8) ?sdk.DocHandle {
-    return shellCtx(ctx).docFromPath(path);
+fn fizzyDocFromPath(ctx: *anyopaque, path: []const u8) ?sdk.DocHandle {
+    return fizzyCtx(ctx).docFromPath(path);
 }
-fn shellOpenFilePath(ctx: *anyopaque, path: []const u8, grouping: u64) anyerror!bool {
-    return shellCtx(ctx).openFilePath(path, grouping);
+fn fizzyOpenFilePath(ctx: *anyopaque, path: []const u8, grouping: u64) anyerror!bool {
+    return fizzyCtx(ctx).openFilePath(path, grouping);
 }
-fn shellOpenOrFocusFileAtGrouping(ctx: *anyopaque, path: []const u8, grouping: u64) anyerror!?usize {
-    return shellCtx(ctx).openOrFocusFileAtGrouping(path, grouping);
+fn fizzyOpenOrFocusFileAtGrouping(ctx: *anyopaque, path: []const u8, grouping: u64) anyerror!?usize {
+    return fizzyCtx(ctx).openOrFocusFileAtGrouping(path, grouping);
 }
-fn shellCloseDocById(ctx: *anyopaque, id: u64) anyerror!void {
-    return shellCtx(ctx).closeFileID(id);
+fn fizzyCloseDocById(ctx: *anyopaque, id: u64) anyerror!void {
+    return fizzyCtx(ctx).closeFileID(id);
 }
-fn shellSetProjectFolder(ctx: *anyopaque, path: []const u8) anyerror!void {
-    return shellCtx(ctx).setProjectFolder(path);
+fn fizzySetProjectFolder(ctx: *anyopaque, path: []const u8) anyerror!void {
+    return fizzyCtx(ctx).setProjectFolder(path);
 }
-fn shellCloseProjectFolder(ctx: *anyopaque) void {
-    shellCtx(ctx).closeProjectFolder();
+fn fizzyCloseProjectFolder(ctx: *anyopaque) void {
+    fizzyCtx(ctx).closeProjectFolder();
 }
-fn shellRecentFolderCount(ctx: *anyopaque) usize {
-    return shellCtx(ctx).recents.folders.items.len;
+fn fizzyRecentFolderCount(ctx: *anyopaque) usize {
+    return fizzyCtx(ctx).recents.folders.items.len;
 }
-fn shellRecentFolderAt(ctx: *anyopaque, index: usize) ?[]const u8 {
-    const editor = shellCtx(ctx);
+fn fizzyRecentFolderAt(ctx: *anyopaque, index: usize) ?[]const u8 {
+    const editor = fizzyCtx(ctx);
     if (index >= editor.recents.folders.items.len) return null;
     return editor.recents.folders.items[index];
 }
-fn shellOpenInFileBrowser(ctx: *anyopaque, path: []const u8) anyerror!void {
-    return shellCtx(ctx).openInFileBrowser(path);
+fn fizzyOpenInFileBrowser(ctx: *anyopaque, path: []const u8) anyerror!void {
+    return fizzyCtx(ctx).openInFileBrowser(path);
 }
-fn shellIsPathIgnored(
+fn fizzyIsPathIgnored(
     ctx: *anyopaque,
     project_root: []const u8,
     abs_path: []const u8,
     name: []const u8,
     kind: std.Io.File.Kind,
 ) bool {
-    return shellCtx(ctx).ignore.isIgnored(project_root, abs_path, name, kind);
+    return fizzyCtx(ctx).ignore.isIgnored(project_root, abs_path, name, kind);
 }
-fn shellExplorerBranchIsOpen(ctx: *anyopaque, branch_id: dvui.Id) bool {
-    return shellCtx(ctx).explorer.open_branches.contains(branch_id);
+fn fizzyExplorerBranchIsOpen(ctx: *anyopaque, branch_id: dvui.Id) bool {
+    return fizzyCtx(ctx).explorer.open_branches.contains(branch_id);
 }
-fn shellSetExplorerBranchOpen(ctx: *anyopaque, branch_id: dvui.Id, open: bool) void {
-    const editor = shellCtx(ctx);
+fn fizzySetExplorerBranchOpen(ctx: *anyopaque, branch_id: dvui.Id, open: bool) void {
+    const editor = fizzyCtx(ctx);
     if (open) {
         editor.explorer.open_branches.put(branch_id, {}) catch {};
     } else {
         _ = editor.explorer.open_branches.remove(branch_id);
     }
 }
-fn shellDrawWorkspaces(ctx: *anyopaque, index: usize) anyerror!dvui.App.Result {
-    return drawWorkspaces(shellCtx(ctx), index);
+fn fizzyDrawWorkspaces(ctx: *anyopaque, index: usize) anyerror!dvui.App.Result {
+    return drawWorkspaces(fizzyCtx(ctx), index);
 }
-fn shellShowOpenFolderDialog(ctx: *anyopaque, cb: sdk.EditorAPI.OpenPathsCallback, default_folder: ?[]const u8) void {
+fn fizzyShowOpenFolderDialog(ctx: *anyopaque, cb: sdk.EditorAPI.OpenPathsCallback, default_folder: ?[]const u8) void {
     _ = ctx;
     fizzy.backend.showOpenFolderDialog(cb, default_folder);
 }
-fn shellShowOpenFileDialog(
+fn fizzyShowOpenFileDialog(
     ctx: *anyopaque,
     cb: sdk.EditorAPI.OpenPathsCallback,
     filters: []const sdk.EditorAPI.SaveDialogFilter,
@@ -1808,26 +1878,26 @@ fn shellShowOpenFileDialog(
     const native_filters: [*]const fizzy.backend.DialogFileFilter = @ptrCast(filters.ptr);
     fizzy.backend.showOpenFileDialog(cb, native_filters[0..filters.len], default_filename, default_folder);
 }
-fn shellSave(ctx: *anyopaque) anyerror!void {
-    return shellCtx(ctx).save();
+fn fizzySave(ctx: *anyopaque) anyerror!void {
+    return fizzyCtx(ctx).save();
 }
-fn shellRequestCompositeWarmup(ctx: *anyopaque) void {
-    shellCtx(ctx).requestPrepareFrame();
+fn fizzyRequestCompositeWarmup(ctx: *anyopaque) void {
+    fizzyCtx(ctx).requestPrepareFrame();
 }
-fn shellRefresh(ctx: *anyopaque) void {
+fn fizzyRefresh(ctx: *anyopaque) void {
     _ = ctx;
     // Safe from any thread (see `SDLBackend.refresh`'s doc comment) — a single call reliably
     // wakes the blocked event loop and produces exactly one composited frame; see
     // `render_bridge.refresh`'s doc comment for how that was verified.
     fizzy.app.window.backend.refresh();
 }
-fn shellAllocUntitledPath(ctx: *anyopaque) anyerror![]u8 {
-    return shellCtx(ctx).allocNextUntitledPath();
+fn fizzyAllocUntitledPath(ctx: *anyopaque) anyerror![]u8 {
+    return fizzyCtx(ctx).allocNextUntitledPath();
 }
-fn shellCreateDocument(ctx: *anyopaque, path: []const u8, grid: sdk.EditorAPI.NewDocGrid) anyerror!sdk.DocHandle {
-    return shellCtx(ctx).newFile(path, grid);
+fn fizzyCreateDocument(ctx: *anyopaque, path: []const u8, grid: sdk.EditorAPI.NewDocGrid) anyerror!sdk.DocHandle {
+    return fizzyCtx(ctx).newFile(path, grid);
 }
-fn shellSetExplorerNewFilePath(ctx: *anyopaque, path: []const u8) anyerror!void {
+fn fizzySetExplorerNewFilePath(ctx: *anyopaque, path: []const u8) anyerror!void {
     const Files = fizzy.Explorer.files;
     if (Files.new_file_path) |old| {
         fizzy.app.allocator.free(old);
@@ -1835,33 +1905,33 @@ fn shellSetExplorerNewFilePath(ctx: *anyopaque, path: []const u8) anyerror!void 
     Files.new_file_path = try fizzy.app.allocator.dupe(u8, path);
     _ = ctx;
 }
-fn shellRequestSaveAs(ctx: *anyopaque) void {
-    shellCtx(ctx).requestSaveAs();
+fn fizzyRequestSaveAs(ctx: *anyopaque) void {
+    fizzyCtx(ctx).requestSaveAs();
 }
-fn shellRequestWebSave(ctx: *anyopaque, kind: sdk.EditorAPI.WebSaveKind) void {
+fn fizzyRequestWebSave(ctx: *anyopaque, kind: sdk.EditorAPI.WebSaveKind) void {
     const native_kind: Dialogs.WebSaveAs.Kind = switch (kind) {
         .save => .save,
         .save_as => .save_as,
     };
-    shellCtx(ctx).requestWebSaveDialog(native_kind);
+    fizzyCtx(ctx).requestWebSaveDialog(native_kind);
 }
-fn shellCancelPendingSaveDialog(ctx: *anyopaque) void {
-    shellCtx(ctx).cancelPendingSaveDialog();
+fn fizzyCancelPendingSaveDialog(ctx: *anyopaque) void {
+    fizzyCtx(ctx).cancelPendingSaveDialog();
 }
-fn shellSetPendingCloseDocId(ctx: *anyopaque, id: u64) void {
-    shellCtx(ctx).pending_close_file_id = id;
+fn fizzySetPendingCloseDocId(ctx: *anyopaque, id: u64) void {
+    fizzyCtx(ctx).pending_close_file_id = id;
 }
-fn shellQueueCloseAfterSave(ctx: *anyopaque, id: u64) anyerror!void {
-    try shellCtx(ctx).pending_close_after_save.put(fizzy.app.allocator, id, {});
+fn fizzyQueueCloseAfterSave(ctx: *anyopaque, id: u64) anyerror!void {
+    try fizzyCtx(ctx).pending_close_after_save.put(fizzy.app.allocator, id, {});
 }
-fn shellTrackQuitSaveInFlight(ctx: *anyopaque, id: u64) anyerror!void {
-    try shellCtx(ctx).quit_saves_in_flight.put(fizzy.app.allocator, id, {});
+fn fizzyTrackQuitSaveInFlight(ctx: *anyopaque, id: u64) anyerror!void {
+    try fizzyCtx(ctx).quit_saves_in_flight.put(fizzy.app.allocator, id, {});
 }
-fn shellResumeSaveAllQuit(ctx: *anyopaque) void {
-    shellCtx(ctx).pending_quit_continue = true;
+fn fizzyResumeSaveAllQuit(ctx: *anyopaque) void {
+    fizzyCtx(ctx).pending_quit_continue = true;
 }
-fn shellAbortSaveAllQuit(ctx: *anyopaque) void {
-    shellCtx(ctx).abortSaveAllQuit();
+fn fizzyAbortSaveAllQuit(ctx: *anyopaque) void {
+    fizzyCtx(ctx).abortSaveAllQuit();
 }
 
 /// Store a loaded/created document in the plugin registry and register its handle.
@@ -2087,29 +2157,29 @@ fn activelyDrawing(editor: *Editor) bool {
     return false;
 }
 
-/// Composes the shell's own fields (`Settings.serialize`) together with every plugin's pending
+/// Composes fizzy's own fields (`Settings.serialize`) together with every plugin's pending
 /// settings write into one `<config>/settings.zon` and writes it in a single pass (see
-/// `docs/PLUGIN_MANIFEST_PLAN.md` R10). This *must* stay one combined write: writing the shell's
+/// `docs/PLUGIN_MANIFEST_PLAN.md` R10). This *must* stay one combined write: writing fizzy's
 /// fields and the plugins' blobs independently would let whichever write ran second silently
-/// drop the other's data, since `Settings.serialize` only knows the shell's own fields and has no
+/// drop the other's data, since `Settings.serialize` only knows fizzy's own fields and has no
 /// notion of `.plugins` at all. `settings_last_saved_hash` dedupes over the *whole* composed
-/// text, so a plugin-only settings change still triggers a real write even when the shell's own
+/// text, so a plugin-only settings change still triggers a real write even when fizzy's own
 /// fields haven't moved.
 ///
 /// Shared by `writeMergedSettings` and the startup dedup-hash seed (see `init`): composes the
-/// merged `settings.zon` text from the shell's current in-memory fields plus `overlay`'s plugin
+/// merged `settings.zon` text from fizzy's current in-memory fields plus `overlay`'s plugin
 /// blocks, layered onto whatever is already on disk at `settings_path` (see
 /// `SettingsPluginsZon.composeMergedText`'s doc comment for exactly what's preserved vs.
 /// overlaid). External hand-edits are reconciled live by `SettingsWatcher` (R11/R12) before the
 /// next autosave can clobber them. Caller-owned; free with `gpa`.
 fn composeSettingsText(editor: *Editor, gpa: std.mem.Allocator, settings_path: []const u8, overlay: []const SettingsPluginsZon.Entry) ![]u8 {
-    const shell_text = try Settings.serialize(&editor.settings, gpa);
-    defer gpa.free(shell_text);
+    const fizzy_text = try Settings.serialize(&editor.settings, gpa);
+    defer gpa.free(fizzy_text);
 
     const existing = fizzy.fs.readZ(gpa, dvui.io, settings_path) catch null;
     defer if (existing) |e| gpa.free(e);
 
-    return SettingsPluginsZon.composeMergedText(gpa, shell_text, existing, overlay);
+    return SettingsPluginsZon.composeMergedText(gpa, fizzy_text, existing, overlay);
 }
 
 fn writeMergedSettings(editor: *Editor, settings_path: []const u8) !void {
@@ -2220,13 +2290,13 @@ pub fn reconcileExternalSettingsChange(editor: *Editor) void {
     }
     dvui.log.info("settings watcher: external change to settings.zon detected; reconciling", .{});
 
-    // Always refresh an open settings.zon tab from disk first — even if the shell fails to
+    // Always refresh an open settings.zon tab from disk first — even if fizzy fails to
     // parse the file below. The text buffer should still track what the user (or another
     // tool) wrote; parse failure must not leave the tab stuck on a stale snapshot.
     if (editor.document_watcher) |*w| w.notifyPathChanged(editor, settings_path);
 
     // Parse without falling back to defaults on failure (see `Settings.parseOnly`'s doc
-    // comment) — a torn/partial read here must never reset every shell field and every
+    // comment) — a torn/partial read here must never reset every fizzy field and every
     // plugin's settings. Left unreconciled until another external change retriggers a read
     // (rare in practice: the watcher's debounce already gives a normal atomic save time to
     // settle before this runs at all).
@@ -2236,7 +2306,7 @@ pub fn reconcileExternalSettingsChange(editor: *Editor) void {
     };
     defer Settings.freeParsed(gpa, parsed);
 
-    // Shell fields, one at a time rather than `editor.settings = parsed` wholesale: `theme` is
+    // Fizzy fields, one at a time rather than `editor.settings = parsed` wholesale: `theme` is
     // runtime-owned (see its doc comment on `Settings`) and must not be clobbered by the raw
     // parsed copy, which is exactly what a whole-struct assign would do. If you add a field to
     // `Settings`, add it here too, unless it's `theme`.
@@ -2964,8 +3034,10 @@ pub fn tick(editor: *Editor) !dvui.App.Result {
             const bg_box = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both });
             defer bg_box.deinit();
 
-            // On macOS, the menu is handled natively, so we don't need to draw it here
-            if (builtin.os.tag != .macos) {
+            // On macOS, the menu is handled natively, so we don't need to draw it here — except
+            // when the TEMPORARY `Menu.debug_force_on_macos` toggle (View > "Show DVUI Menu
+            // (macOS)") is on, for comparing the two menu bars side by side.
+            if (builtin.os.tag != .macos or Menu.debug_force_on_macos) {
                 const result = try Menu.draw();
                 if (result != .ok) {
                     return result;
@@ -3849,9 +3921,9 @@ pub fn forceCloseFile(editor: *Editor, index: usize) !void {
     }
 }
 
-/// Dispatch a generic shell action to the active document owner's command (`<owner_id>.<action>`).
+/// Dispatch a generic fizzy action to the active document owner's command (`<owner_id>.<action>`).
 /// No active doc, or an owner that registered no such command, is a clean no-op. This is how the
-/// shell's Edit menu / keybinds reach per-editor actions without naming any plugin.
+/// fizzy's Edit menu / keybinds reach per-editor actions without naming any plugin.
 fn runActiveDocCommand(editor: *Editor, action: []const u8) !void {
     const doc = editor.activeDoc() orelse return;
     const id = try std.fmt.allocPrint(editor.arena.allocator(), "{s}.{s}", .{ doc.owner.id, action });
@@ -3896,7 +3968,7 @@ pub fn paste(editor: *Editor) !void {
 /// widget currently holds dvui keyboard focus. On macOS, Cmd+C/Cmd+V only ever reach us as a
 /// native menu action (see `Keybinds.tick`'s `builtin.os.tag != .macos` guard), and that path
 /// otherwise only knows how to talk to the active *document* (`runActiveDocCommand`). Any other
-/// focused widget with its own copy/paste handling — the shell's Output Panel, a plugin's search
+/// focused widget with its own copy/paste handling — fizzy's Output Panel, a plugin's search
 /// box, dvui's own text-selection widgets — never sees the raw keystroke at all, unlike on
 /// Windows/Linux where the un-marked-handled key event still reaches it normally. Synthesizing
 /// the event here routes it through the same per-widget handling those platforms already use.
@@ -4190,7 +4262,7 @@ pub fn closeFile(editor: *Editor, index: usize) !void {
 }
 
 /// Tear down a document via its owning plugin, falling back to a direct `deinit`.
-/// Removes the entry from the plugin's document registry; the shell still removes
+/// Removes the entry from the plugin's document registry; fizzy still removes
 /// the matching `DocHandle` from `open_files`.
 fn closeDocumentResources(_: *Editor, doc: sdk.DocHandle) void {
     _ = doc.owner.closeDocument(doc);

@@ -1,4 +1,4 @@
-//! Draws the shell's built-in "Output" bottom panel: a scrolling, color-coded view of
+//! Draws fizzy's built-in "Output" bottom panel: a scrolling, color-coded view of
 //! everything captured in `OutputLog`, with a vertical tab strip on the left to filter by
 //! source scope ("All" plus one tab per plugin/scope seen so far). Registered with
 //! `owner = null` in `Editor.zig`, same as the Settings sidebar view.

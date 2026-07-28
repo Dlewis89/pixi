@@ -301,7 +301,7 @@ pub const InitOptions = struct {
     /// Optional undo/redo capture hook — see `EditNotify`.
     edit_notify: ?EditNotify = null,
     /// When true, this widget does not handle Cmd/Ctrl+C / Cmd/Ctrl+V itself — the host owns
-    /// copy/paste (e.g. registers `Command`s the shell's Edit menu / native menu / global
+    /// copy/paste (e.g. registers `Command`s fizzy's Edit menu / native menu / global
     /// keybind dispatch to). Otherwise both the widget's own key handling *and* the host's
     /// path fire for the same keystroke (a native menu item's key equivalent doesn't stop the
     /// underlying key event from also reaching the focused widget in this app), inserting
@@ -1943,7 +1943,7 @@ pub fn processEvent(self: *TextEntryWidget, e: *Event) void {
                     // where textEntry will get it first. Ctrl/Command/Alt combos are
                     // excluded: those never produce a `.text` composition event (so there's
                     // nothing here to protect from double-typing), and on Windows/Linux
-                    // global shell shortcuts (save, save-as, paste, ...) are only ever
+                    // global fizzy shortcuts (save, save-as, paste, ...) are only ever
                     // delivered through this same dvui event stream — macOS instead routes
                     // them via native NSMenu key equivalents, so this swallow was invisible
                     // there. Without this exclusion, focusing the editor silently ate every

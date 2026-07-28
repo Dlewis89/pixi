@@ -1,4 +1,4 @@
-//! Markdown plugin state — caches parsed preview state keyed by shell document id.
+//! Markdown plugin state — caches parsed preview state keyed by fizzy document id.
 const std = @import("std");
 const Preview = @import("markdown.zig").Preview;
 

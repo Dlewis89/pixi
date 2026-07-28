@@ -14,7 +14,7 @@ pub const Sidebar = @This();
 /// Persisted scroll position for the plugin-icon rail (retained across frames).
 var scroll_info: dvui.ScrollInfo = .{};
 
-/// Shell built-in views pinned to the bottom of the rail (always visible). Everything else —
+/// Fizzy built-in views pinned to the bottom of the rail (always visible). Everything else —
 /// the plugin-contributed views — scrolls above them in registration (load) order.
 fn isPinned(id: []const u8) bool {
     return std.mem.eql(u8, id, PluginStore.view_id) or

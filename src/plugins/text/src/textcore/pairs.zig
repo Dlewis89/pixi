@@ -127,10 +127,10 @@ pub fn indentLevelAt(text: []const u8, pos: usize, tab_size: u8) u8 {
     return @truncate(col / ts);
 }
 
-/// Per-kind offset into the palette. Spaced around a 7-colour wheel so braces / parens /
-/// square brackets at the same indent land on visually distinct slots (and stay distinct
-/// after `palette.bracket`'s scramble). Open and close of a kind share the offset, so a
-/// matching pair still paints the same colour.
+/// Per-kind offset into the palette. Spaced so braces / parens / square brackets at the same
+/// indent land on visually distinct slots — `core.palette.bracket_colors` has a comptime check
+/// that its length keeps these three offsets from colliding. Open and close of a kind share the
+/// offset, so a matching pair still paints the same colour.
 fn kindOffset(c: u8) u8 {
     return switch (c) {
         '{', '}' => 0,

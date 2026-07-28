@@ -3,4 +3,6 @@
     .name = "Image",
     .version = "0.1.0",
     .min_sdk_version = "",
+    .description = "Read-only PNG/JPG/JPEG viewer with zoom and pan.",
+    .tags = .{ "viewer", "image" },
 }

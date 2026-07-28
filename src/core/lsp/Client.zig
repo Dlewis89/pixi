@@ -1194,6 +1194,12 @@ fn spawnChild(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, cwd:
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
+        // Windows-only; a no-op elsewhere. Without it, spawning a console-subsystem server
+        // (zls.exe) from a Windows-subsystem fizzy build (Release) pops up a visible console
+        // window for the child — stdio is already piped, so nothing needs that console. Debug
+        // builds masked this because they still link the console subsystem, so the child shares
+        // fizzy's own console instead of getting a new one.
+        .create_no_window = true,
     });
 }
 

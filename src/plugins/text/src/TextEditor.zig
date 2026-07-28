@@ -200,8 +200,8 @@ fn drawEditor(doc: *Document, ext: []const u8, id_extra: u64, gpa: std.mem.Alloc
         // `auto_indent_newline` rather than another setting to find and toggle.
         .highlight_matching_bracket = true,
         // Indent-level rainbow from `core.palette.bracket` — same-kind pairs match; kinds
-        // at the same indent take different slots (and a scrambled walk vs the file tree).
-        .rainbow_brackets = true,
+        // at the same indent take different slots.
+        .rainbow_brackets = plugin_impl.statePtr().settings.rainbow_brackets.get(),
     }, chromeless.override(.{
         .expand = .both,
         .font = font,
@@ -284,10 +284,21 @@ fn drawEditor(doc: *Document, ext: []const u8, id_extra: u64, gpa: std.mem.Alloc
 
     doc.sel_start = te.textLayout.selection.start;
     doc.sel_end = te.textLayout.selection.end;
-    // Read before `te.deinit()` below, same as the selection: the shell's Copy/Paste routing
+    // Read before `te.deinit()` below, same as the selection: fizzy's Copy/Paste routing
     // asks the owner whether the verb is enabled, and this is the owner's answer to "is focus
     // mine?" (see `Document.editor_focused`).
-    doc.editor_focused = dvui.focusedWidgetId() == te.data().id;
+    //
+    // `focusedWidgetIdInCurrentSubwindow`, not `focusedWidgetId`: the latter is scoped to
+    // whichever subwindow is *globally* active, which becomes the Edit menu's own floating
+    // subwindow the instant it opens — so every frame the menu is open, including the one where
+    // Copy/Paste is clicked, this editor would read as unfocused and the dvui Edit menu would
+    // show them permanently disabled (while the native macOS menu never hit this, since it
+    // bypasses the enabled check for Copy/Paste entirely via `native_always_enabled`, for a
+    // different but related reason). This document's own draw always runs as part of the main
+    // subwindow's content, so asking "was I focused within *that* subwindow" — which dvui tracks
+    // independently of whatever subwindow currently has the OS-level active focus — gives the
+    // right answer even while a floating menu is open above it.
+    doc.editor_focused = dvui.focusedWidgetIdInCurrentSubwindow() == te.data().id;
 
     const text_changed = te.text_changed;
     // `si` is a pointer into dvui's persistent per-widget-id data store (not a value owned by
@@ -1688,7 +1699,7 @@ fn drawLineNumbers(
     const prev_clip = dvui.clip(rs.r);
     defer dvui.clipSet(prev_clip);
 
-    const line_number_color = dvui.themeGet().color(.content, .text).opacity(0.55);
+    const line_number_color = dvui.themeGet().color(.control, .text).opacity(0.5);
 
     const first_line: usize = @intCast(@max(0, @as(i64, @intFromFloat((scroll_y - editor_pad_y) / line_height))));
 

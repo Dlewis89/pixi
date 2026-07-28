@@ -1,8 +1,8 @@
-//! Shell region contributions. A plugin's `register(host)` imperatively adds as
+//! Fizzy region contributions. A plugin's `register(host)` imperatively adds as
 //! many of these as it wants (multiple sidebar icons, bottom-panel views, center
-//! providers, menubar entries). The near-empty shell owns no features of its own —
+//! providers, menubar entries). The near-empty fizzy owns no features of its own —
 //! it just iterates these registries (see `Host`) and draws whatever plugins
-//! contributed. Built-in shell items (e.g. Settings) register with `owner = null`.
+//! contributed. Built-in fizzy items (e.g. Settings) register with `owner = null`.
 //!
 //! `ctx` is contribution-owned opaque state passed back to its `draw` fn (null for
 //! contributions that reach through the `fizzy.*` globals directly). `id`s are
@@ -71,12 +71,12 @@ pub const MenuContribution = struct {
     draw: *const fn (ctx: ?*anyopaque) anyerror!void,
 };
 
-/// Items injected into an already-open parent menu (e.g. shell View). The parent
+/// Items injected into an already-open parent menu (e.g. fizzy View). The parent
 /// menu's `draw` iterates sections whose `parent_menu_id` matches and calls `draw`
 /// while its floating submenu is open.
 pub const MenuSectionContribution = struct {
     id: []const u8,
-    /// Parent top-level menu id, e.g. "shell.menu.view".
+    /// Parent top-level menu id, e.g. "fizzy.menu.view".
     parent_menu_id: []const u8,
     owner: ?*Plugin = null,
     /// When true, this section is skipped by the in-app bar's `drawMenuSections`. See
@@ -97,20 +97,20 @@ pub const MenuSectionContribution = struct {
 pub const NativeMenuItem = struct {
     id: []const u8,
     owner: ?*Plugin = null,
-    /// Parent top-level menu: one of the shell's ids ("workbench.menu.file", "shell.menu.edit",
-    /// "shell.menu.view", "shell.menu.help") to append into an existing native menu, or a
+    /// Parent top-level menu: one of fizzy's ids ("workbench.menu.file", "fizzy.menu.edit",
+    /// "fizzy.menu.view", "fizzy.menu.help") to append into an existing native menu, or a
     /// plugin's own `MenuContribution.id` to populate a new top-level menu (created lazily,
     /// titled from that contribution's `title`).
     parent_menu_id: []const u8,
     title: []const u8,
     /// The registered `Command` this item stands for, e.g. `"text.format"`. Optional, and
-    /// purely about the *chord*: `run` is still what a click invokes. The shell stamps this
+    /// purely about the *chord*: `run` is still what a click invokes. Fizzy stamps this
     /// command's current binding onto the `NSMenuItem` as its key equivalent and restamps on
     /// every rebind, so the macOS menu shows the same shortcut as the in-app one instead of
     /// none at all. Leave null for an item with no command behind it — the item then never
     /// carries a shortcut.
     command: ?[]const u8 = null,
-    /// SF Symbol name for the item's icon (e.g. `"wand.and.stars"`), matching what the shell's
+    /// SF Symbol name for the item's icon (e.g. `"wand.and.stars"`), matching what fizzy's
     /// own items use. Null draws no icon.
     sf_symbol: ?[]const u8 = null,
     /// See `MenuContribution.hidden`.
@@ -119,12 +119,12 @@ pub const NativeMenuItem = struct {
     run: *const fn (ctx: ?*anyopaque) anyerror!void,
 };
 
-/// A named, invocable action a plugin registers with the Host. The shell, menus, and
+/// A named, invocable action a plugin registers with the Host. Fizzy, menus, and
 /// keybindings trigger it by `id` via `Host.runCommand(id)` **without knowing what it
 /// does** — this is how a plugin contributes its own features (atlas pack, raster
-/// transform, a grid-layout dialog, …) without the SDK or shell naming them. Ids are
+/// transform, a grid-layout dialog, …) without the SDK or fizzy naming them. Ids are
 /// plugin-namespaced (`"pixelart.packProject"`). The owner resolves any context it needs
-/// (active doc, selection, …) inside `run`; the shell passes only the owner's opaque state.
+/// (active doc, selection, …) inside `run`; fizzy passes only the owner's opaque state.
 pub const Command = struct {
     id: []const u8,
     owner: ?*Plugin = null,
@@ -135,5 +135,10 @@ pub const Command = struct {
     /// Optional enabled-state query — e.g. grey out while busy or with no active document.
     /// Absent = always enabled.
     isEnabled: ?*const fn (state: *anyopaque) bool = null,
+    /// Optional TVG icon bytes (e.g. `icons.tvg.lucide.save`) shown ahead of this command's
+    /// label wherever fizzy draws a row for it: the in-app dvui menu (a fizzy-owned
+    /// `CommandItem`'s row, or a plugin's `MenuSectionContribution` row via `Host.drawMenuItem`)
+    /// and the command palette. Absent draws no icon, not a placeholder glyph.
+    icon: ?[]const u8 = null,
 };
 

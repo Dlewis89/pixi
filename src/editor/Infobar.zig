@@ -26,7 +26,7 @@ pub fn draw(_: Infobar) !void {
     const font = dvui.Font.theme(.body).larger(-1.0);
     const bar_h = Constants.infobar_height;
 
-    // Shell owns height: pin min+max so plugin (or icon) content cannot grow the bar.
+    // Fizzy owns height: pin min+max so plugin (or icon) content cannot grow the bar.
     // Horizontal scroll covers overflow width; vertical overflow is clipped.
     var scrollarea = dvui.scrollArea(@src(), .{ .vertical = .none, .horizontal = .auto }, .{
         .expand = .horizontal,
@@ -113,7 +113,7 @@ pub fn draw(_: Infobar) !void {
 
     _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 12 } });
 
-    // Remaining width is the plugin slot: shell-sized, clipped, rect handed to the owner.
+    // Remaining width is the plugin slot: fizzy-sized, clipped, rect handed to the owner.
     {
         var plugin_slot = dvui.box(@src(), .{ .dir = .horizontal }, .{
             .expand = .both,

@@ -1,4 +1,4 @@
-//! Shell built-in: the **Plugins** sidebar tab — discover / install / update / enable / disable
+//! Fizzy built-in: the **Plugins** sidebar tab — discover / install / update / enable / disable
 //! / uninstall plugins. Registered above Settings.
 //!
 //! Downloads run on a worker thread (`Job`); the actual live load happens on the main thread in
@@ -34,24 +34,30 @@ const Readme = if (builtin.target.cpu.arch == .wasm32) struct {
 
 const StoreIcon = if (builtin.target.cpu.arch == .wasm32) struct {
     pub fn request(_: []const u8, _: []const u8, _: []const u8) void {}
-    pub fn draw(_: []const u8) bool {
+    pub fn draw(_: []const u8, _: f32) bool {
         return false;
     }
     pub fn deinit() void {}
 } else @import("store_icon.zig");
 
-pub const view_id = "shell.store";
+pub const view_id = "fizzy.store";
 /// Center provider that renders the selected plugin's README. Mirrors the way the workbench
 /// center renders the active document: while the store tab is active and a plugin is selected,
 /// `tick` swaps the active center to this provider; deselecting (or leaving the tab) restores
 /// the previous center.
-pub const readme_center_id = "shell.store.readme";
+pub const readme_center_id = "fizzy.store.readme";
 const default_registry_url = "https://plugins.fizzyed.it/catalog";
 
 /// True while we have hijacked the active center to show a README, plus the center id to restore
 /// when the selection is cleared or the store tab is no longer active.
 var readme_center_active = false;
 var saved_center: ?[]const u8 = null;
+
+/// Which sub-view the detail center shows below the header — VSCode marketplace-style. Reset to
+/// `.details` whenever the selection changes (`toggleSelect`), so switching plugins never leaves
+/// you stranded on a tab the new selection didn't ask for.
+const DetailTab = enum { details, changelog };
+var selected_detail_tab: DetailTab = .details;
 
 var catalog: ?store.Catalog = null;
 var registry_url_owned: ?[]u8 = null;
@@ -122,6 +128,71 @@ var name_cache: std.StringArrayHashMapUnmanaged([]u8) = .empty;
 /// reuse it as the "current version" for disabled/failed cards.
 var version_cache: std.StringArrayHashMapUnmanaged(std.SemanticVersion) = .empty;
 
+/// Disk-probed manifest fields per plugin id (app-allocator owned keys and values; an all-empty
+/// entry means "probed, genuinely has nothing" so it isn't re-probed every frame either). Backs
+/// the `PluginLoader.probeManifestInfo` fallback shared by `descriptionFor`/`tagsFor`/`authorFor`/
+/// `authorUrlFor` — registry and built-in values are already cheap and never touch this. One
+/// cache rather than one per field, because a single `dlopen` + parse yields all of them at once.
+/// Cleared by `refreshDiskScan`.
+var manifest_cache: std.StringArrayHashMapUnmanaged(PluginLoader.ProbedManifest) = .empty;
+
+/// Every plugin id with a directory in `{config}/plugins/` (app-allocator owned), refreshed by
+/// `refreshDiskScan`. The installed pane's in-memory sources (loaded plugins, disabled ids,
+/// recorded load failures) each describe a *state* fizzy put a plugin into; this describes
+/// what is actually on disk, which is the only thing that guarantees a broken plugin always has
+/// a card to uninstall or reinstall from — even one that arrived in a state nothing recorded
+/// (a half-finished install, a sideloaded directory, a build fizzy never tried to load).
+var disk_ids: std.ArrayListUnmanaged([]u8) = .empty;
+/// Set when the plugins directory may have changed (first draw, Refresh, and after any install /
+/// uninstall / enable-disable applied in `tick`) so `draw` rescans once instead of listing the
+/// directory on every frame the tab is open.
+var disk_scan_dirty = true;
+
+fn freeDiskIds() void {
+    for (disk_ids.items) |id| fizzy.app.allocator.free(id);
+    disk_ids.clearRetainingCapacity();
+}
+
+fn clearManifestCache() void {
+    for (manifest_cache.keys()) |k| fizzy.app.allocator.free(k);
+    for (manifest_cache.values()) |v| PluginLoader.freeProbedManifest(fizzy.app.allocator, v);
+    manifest_cache.clearRetainingCapacity();
+}
+
+/// Re-list `{config}/plugins/` into `disk_ids`. Best-effort: an unreadable directory (or one that
+/// doesn't exist yet, before the first install) just leaves the list empty.
+fn refreshDiskScan() void {
+    disk_scan_dirty = false;
+    freeDiskIds();
+    clearManifestCache();
+    if (comptime builtin.target.cpu.arch == .wasm32) return;
+
+    const a = fizzy.app.allocator;
+    const plugins_dir = std.fs.path.join(a, &.{ fizzy.editor.config_folder, "plugins" }) catch return;
+    defer a.free(plugins_dir);
+
+    var dir = std.Io.Dir.cwd().openDir(dvui.io, plugins_dir, .{ .iterate = true }) catch return;
+    defer dir.close(dvui.io);
+
+    var iter = dir.iterate();
+    while (iter.next(dvui.io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        // `.load-tmp` and friends are loader scratch, not plugin ids (see `PluginLoader`).
+        if (entry.name.len == 0 or entry.name[0] == '.') continue;
+        if (!std.unicode.utf8ValidateSlice(entry.name)) continue;
+        const dup = a.dupe(u8, entry.name) catch continue;
+        disk_ids.append(a, dup) catch a.free(dup);
+    }
+}
+
+/// True if `id` has a directory in the plugins dir as of the last `refreshDiskScan`.
+fn isOnDisk(id: []const u8) bool {
+    for (disk_ids.items) |d| {
+        if (std.mem.eql(u8, d, id)) return true;
+    }
+    return false;
+}
+
 /// Cache `id`'s version. Overwrites an existing entry so a reload/update always reflects the
 /// latest known value.
 fn rememberVersion(id: []const u8, v: std.SemanticVersion) void {
@@ -181,20 +252,20 @@ pub fn displayName(id: []const u8) []const u8 {
     return resolveTitle(id, id);
 }
 
-/// Query the real display name + version of every disabled plugin straight from its on-disk
-/// dylib (embedded `plugin.zig.zon` via `fizzy_plugin_manifest_zon`, falling back to the
-/// `fizzy_plugin_name`/version exports — no register, no on-disk sidecar), seeding `name_cache`
-/// and `version_cache`. Covers plugins disabled before they were loaded this session. Cheap and
-/// bounded: only runs on first draw / Refresh, and only probes ids whose name or version we
-/// don't already know.
-fn probeDisabledInfo() void {
+/// Query the real display name + version of every on-disk plugin that isn't currently loaded,
+/// straight from its dylib (embedded `plugin.zig.zon` via `fizzy_plugin_manifest_zon`, falling
+/// back to the `fizzy_plugin_name`/version exports — no register, no on-disk sidecar), seeding
+/// `name_cache` and `version_cache`. Covers plugins disabled before they were loaded this session
+/// as well as builds that never loaded at all (wrong SDK, etc.) — a broken plugin still shows its
+/// real name and version on its card. Cheap and bounded: only runs on first draw / Refresh, and
+/// only probes ids whose name or version we don't already know.
+fn probeOnDiskInfo() void {
     const editor = fizzy.editor;
     const a = fizzy.app.allocator;
     const plugins_dir = std.fs.path.join(a, &.{ editor.config_folder, "plugins" }) catch return;
     defer a.free(plugins_dir);
 
-    for (editor.disabled_plugin_ids.items) |id| {
-        if (!std.unicode.utf8ValidateSlice(id)) continue;
+    for (disk_ids.items) |id| {
         if (editor.host.pluginById(id) != null) continue; // loaded → info comes from the live plugin
         const have_name = name_cache.get(id) != null;
         const have_version = version_cache.get(id) != null;
@@ -217,6 +288,14 @@ fn probeDisabledInfo() void {
     }
 }
 
+/// Re-read local state: what's in the plugins directory, plus the name/version of anything there
+/// we can't ask a live plugin about. Both halves are cheap and only run when the directory may
+/// have changed (see `disk_scan_dirty`).
+fn refreshLocalInfo() void {
+    refreshDiskScan();
+    probeOnDiskInfo();
+}
+
 pub fn register(host: *sdk.Host) !void {
     if (comptime builtin.target.cpu.arch == .wasm32) return; // no dylib loading on web
     const url = resolveRegistryUrl();
@@ -237,10 +316,12 @@ pub fn register(host: *sdk.Host) !void {
     });
 }
 
-/// Center provider: paint the selected plugin's README. Active only while `tick` has swapped us
-/// in (store tab active + a plugin selected). Uses the same rounded, content-colored card the
-/// workbench homepage / empty state draws (`sdk.pane_layout.emptyStateCard`) so the store center
-/// matches the rest of the app.
+/// Center provider: a VSCode marketplace-style detail page for the selected plugin. Active only
+/// while `tick` has swapped us in (store tab active + a plugin selected). Same rounded,
+/// content-colored "window" chrome every other center provider uses (`sdk.pane_layout.emptyStateCard`'s
+/// corners + top/bottom margin) so this page sizes and insets identically to the workbench
+/// homepage — just stacked vertically (header/tabs/content) instead of that helper's horizontal
+/// direction, so it isn't reused directly.
 fn drawReadmeCenter(_: ?*anyopaque) anyerror!dvui.App.Result {
     const host = &fizzy.editor.host;
     var content_color = dvui.themeGet().color(.window, .fill);
@@ -251,13 +332,297 @@ fn drawReadmeCenter(_: ?*anyopaque) anyerror!dvui.App.Result {
         else => {},
     }
 
-    var card = sdk.pane_layout.emptyStateCard(content_color, hashId(readme_center_id));
-    defer card.deinit();
-
-    var pane = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both, .padding = .all(16) });
+    var pane = dvui.box(@src(), .{ .dir = .vertical }, .{
+        .expand = .both,
+        .background = true,
+        .color_fill = content_color,
+        .corners = dvui.CornerRect.all(16),
+        .margin = .{ .y = 10 },
+        .id_extra = hashId(readme_center_id),
+    });
     defer pane.deinit();
-    Readme.draw();
+
+    const cat = if (catalog) |*c| c else return .ok;
+    const snapshot = cat.acquire();
+    defer cat.release();
+
+    const entry = selectedEntry(snapshot) orelse {
+        dvui.labelNoFmt(@src(), "Select a plugin to see its details.", .{}, .{
+            .expand = .both,
+            .gravity_x = 0.5,
+            .gravity_y = 0.5,
+            .color_text = dvui.themeGet().color(.window, .text).opacity(0.7),
+        });
+        return .ok;
+    };
+
+    drawDetailHeader(entry);
+    drawDetailTabs();
+
+    switch (selected_detail_tab) {
+        .details => {
+            var body = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both, .padding = .all(16) });
+            defer body.deinit();
+            Readme.draw();
+        },
+        .changelog => {
+            // A plain wrapper, packed normally below the header/tabs like `.details`'s `body`
+            // above — `drawChangelogPlaceholder`'s own box centers itself via `gravity_y = 0.5`,
+            // which only a *normally-packed* parent can safely allow: `pane` is a vertical box
+            // with the header and tabs as earlier siblings, so a gravity-in-(0,1) direct child of
+            // *that* is treated as positioned/overlay (see `BoxWidget.rectFor`'s
+            // `child_positioned` check) and placed relative to `pane`'s *full* content rect —
+            // ignoring the space the header/tabs already consumed, i.e. drawn at the very top of
+            // the pane, over everything above it. Routing through this intermediate box first
+            // means the centering is relative to *its* (correctly, normally-packed) rect instead.
+            var body = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both });
+            defer body.deinit();
+            drawChangelogPlaceholder();
+        },
+    }
     return .ok;
+}
+
+/// VSCode-marketplace-style header: logo, then a stacked name/id/author/description column, with
+/// the same install/update/uninstall controls the card list uses (`drawCardControls`) pinned to
+/// the top-right.
+fn drawDetailHeader(entry: StoreEntry) void {
+    const theme = dvui.themeGet();
+    const muted = theme.color(.window, .text).opacity(0.7);
+
+    var header_box = dvui.box(@src(), .{ .dir = .horizontal }, .{
+        .expand = .horizontal,
+        .padding = .{ .x = 16, .y = 16, .w = 16, .h = 8 },
+        .id_extra = hashId(entry.id),
+    });
+    defer header_box.deinit();
+
+    // 1. Logo — same fetch-or-fallback chain the card list uses.
+    {
+        var logo = dvui.box(@src(), .{ .dir = .horizontal }, .{
+            .gravity_y = 0.0,
+            .min_size_content = .{ .w = 64, .h = 64 },
+        });
+        defer logo.deinit();
+        if (repoSource(entry)) |src| StoreIcon.request(entry.id, src.repo, src.subpath);
+        // 60 rather than the full 64 of `logo`'s box — just enough breathing room that the
+        // image doesn't touch the header's own edges, per the "less empty space" ask.
+        const drew = StoreIcon.draw(entry.id, 60) or fizzy.editor.host.drawPluginIcon(entry.id);
+        if (!drew) {
+            dvui.icon(
+                @src(),
+                "PluginLogo",
+                icons.tvg.lucide.package,
+                .{ .stroke_color = theme.color(.window, .text) },
+                .{ .gravity_y = 0.0, .min_size_content = .{ .w = 64, .h = 64 } },
+            );
+        }
+    }
+
+    // 2. Install/update/uninstall controls. `drawCardControls` already right-justifies itself
+    // (its own `gravity_x = 1.0` box) — laid out before the expanding info column for the same
+    // reason `drawCard` does: an expand-horizontal sibling's reported min width is its full
+    // unwrapped text, which would otherwise eat all the remaining space and starve these controls
+    // to zero width (see `drawCard`'s comment on this exact ordering).
+    drawCardControls(entry);
+
+    // 3. Stacked info: name (large, settings-root-style), id (small mono, dim), author (dim),
+    // then the wrapped description.
+    {
+        var info = dvui.box(@src(), .{ .dir = .vertical }, .{
+            .expand = .horizontal,
+            .margin = .{ .x = 12 },
+        });
+        defer info.deinit();
+
+        const title_font = dvui.Font.theme(.body);
+        dvui.labelNoFmt(@src(), entry.title, .{}, .{
+            .font = title_font.withSize(title_font.size * 3 - 1).withWeight(.bold),
+            .expand = .horizontal,
+            .margin = dvui.Rect.all(0),
+            .padding = .{ .h = 2 },
+        });
+        dvui.labelNoFmt(@src(), entry.id, .{}, .{
+            .font = dvui.Font.theme(.mono),
+            .color_text = muted,
+            .expand = .horizontal,
+            .margin = dvui.Rect.all(0),
+            .padding = .{ .h = 4 },
+        });
+        drawAuthorLine(entry, muted);
+        if (descriptionFor(entry)) |desc| {
+            var tl = dvui.textLayout(@src(), .{ .break_lines = true }, .{
+                .background = false,
+                .expand = .horizontal,
+                .margin = dvui.Rect.all(0),
+                // `TextLayoutWidget`'s own default padding is `Rect.all(6)` — unlike the labels
+                // above, which each override `.padding` down to just a bottom gap (`.{ .h = N }`,
+                // leaving left at 0). Left unset here, that default 6px left inset was the only
+                // thing pushing this line out of alignment with the other three.
+                .padding = dvui.Rect.all(0),
+                .font = dvui.Font.theme(.body),
+            });
+            tl.addText(desc, .{ .color_text = theme.color(.window, .text).opacity(0.9) });
+            tl.deinit();
+        }
+    }
+}
+
+/// Only ever hand a `http`/`https` URL to `dvui.openURL`. `author_url` is author-controlled text
+/// out of a `plugin.zig.zon`, and `openURL` ultimately reaches the OS URL handler — a `file:`,
+/// `smb:`, or custom-scheme URL there would let a plugin manifest launch an arbitrary registered
+/// handler on the user's machine just by being listed in the store.
+fn isSafeExternalUrl(url: []const u8) bool {
+    return std.ascii.startsWithIgnoreCase(url, "https://") or std.ascii.startsWithIgnoreCase(url, "http://");
+}
+
+/// The credit line under the plugin id: `publisher · author`.
+///
+/// Two different kinds of claim, deliberately shown together rather than collapsed into one
+/// "author" string. `publisher` is derived from where the binary is actually published and is the
+/// half a user can rely on; `author` is a free string the plugin says about itself. Either may be
+/// absent — a sideloaded plugin has no publisher, and a plugin that never sets `.author` has no
+/// credit — in which case only the other is drawn, and the row is skipped entirely if neither
+/// exists. Each is a link only when there is somewhere meaningful to go.
+fn drawAuthorLine(entry: StoreEntry, muted: dvui.Color) void {
+    const publisher = publisherFor(entry);
+    const author = authorFor(entry);
+    if (publisher == null and author == null) return;
+
+    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+        .expand = .horizontal,
+        .margin = dvui.Rect.all(0),
+        .padding = .{ .h = 6 },
+    });
+    defer row.deinit();
+
+    if (publisher) |p| {
+        // Publisher links to the account itself, built from the publisher name rather than from
+        // any URL the plugin supplied — the whole point of this half is that it isn't
+        // author-controlled.
+        const url = std.fmt.allocPrint(dvui.currentWindow().arena(), "https://github.com/{s}", .{p}) catch "";
+        drawCreditLink(@src(), p, if (url.len > 0) url else null, muted);
+    }
+
+    if (publisher != null and author != null) {
+        dvui.labelNoFmt(@src(), " · ", .{}, .{
+            .font = dvui.Font.theme(.body),
+            .color_text = muted.opacity(0.6),
+            .gravity_y = 0.5,
+            .margin = dvui.Rect.all(0),
+            .padding = dvui.Rect.all(0),
+        });
+    }
+
+    if (author) |a| {
+        const url = authorUrlFor(entry);
+        const safe = if (url) |u| (if (isSafeExternalUrl(u)) u else null) else null;
+        drawCreditLink(@src(), a, safe, muted);
+    }
+}
+
+/// One name in the credit line — a plain dim label, or a clickable one when `url` is non-null.
+fn drawCreditLink(src: std.builtin.SourceLocation, text: []const u8, url: ?[]const u8, muted: dvui.Color) void {
+    const target = url orelse {
+        dvui.labelNoFmt(src, text, .{}, .{
+            .font = dvui.Font.theme(.body),
+            .color_text = muted,
+            .gravity_y = 0.5,
+            .margin = dvui.Rect.all(0),
+            .padding = dvui.Rect.all(0),
+        });
+        return;
+    };
+
+    if (dvui.labelClick(src, "{s}", .{text}, .{}, .{
+        .font = dvui.Font.theme(.body),
+        .color_text = muted,
+        .gravity_y = 0.5,
+        .margin = dvui.Rect.all(0),
+        .padding = dvui.Rect.all(0),
+    })) {
+        _ = dvui.openURL(.{ .url = target });
+    }
+}
+
+/// Simple two-tab strip: no fill of its own (reads as part of the pane behind it, not a
+/// separate bar), regular body text, and the selected tab marked by a `window`-text-colored
+/// underline rather than a filled pill. No drag/drop and no scroll area — there are only ever
+/// two tabs here.
+fn drawDetailTabs() void {
+    var strip = dvui.box(@src(), .{ .dir = .horizontal }, .{
+        .expand = .horizontal,
+        .padding = .{ .x = 12 },
+    });
+    defer strip.deinit();
+
+    drawDetailTab(@src(), "DETAILS", 0, selected_detail_tab == .details);
+    drawDetailTab(@src(), "CHANGELOG", 1, selected_detail_tab == .changelog);
+}
+
+fn drawDetailTab(src: std.builtin.SourceLocation, label: []const u8, id_extra: usize, selected: bool) void {
+    const theme = dvui.themeGet();
+
+    // Sized to the label's own width (no expand), so the underline drawn below — which does
+    // expand horizontally, but only within this column — lines up under the text exactly rather
+    // than spanning the whole strip.
+    var col = dvui.box(@src(), .{ .dir = .vertical }, .{ .id_extra = id_extra, .margin = .{ .x = 2 } });
+    defer col.deinit();
+
+    const tab_font = dvui.Font.theme(.body);
+    const clicked = dvui.button(src, label, .{}, .{
+        .id_extra = id_extra,
+        .background = false,
+        .border = dvui.Rect.all(0),
+        .margin = dvui.Rect.all(0),
+        .padding = .{ .x = 4, .y = 6, .w = 4, .h = 4 },
+        .color_text = if (selected) theme.color(.window, .text) else theme.color(.control, .text),
+        .font = tab_font.withSize(tab_font.size - 1),
+    });
+    if (clicked) {
+        selected_detail_tab = if (id_extra == 0) .details else .changelog;
+    }
+
+    var underline = dvui.box(@src(), .{}, .{
+        .id_extra = id_extra,
+        .expand = .horizontal,
+        .min_size_content = .{ .h = 2 },
+        .background = true,
+        .color_fill = if (selected) theme.color(.window, .text) else .transparent,
+    });
+    underline.deinit();
+}
+
+/// CHANGELOG's content until real GitHub Releases fetching lands (tracked separately) — an
+/// empty-state hint rather than a blank pane, matching how the workbench's own empty states read.
+fn drawChangelogPlaceholder() void {
+    var box = dvui.box(@src(), .{ .dir = .vertical }, .{
+        .expand = .both,
+        .gravity_x = 0.5,
+        .gravity_y = 0.5,
+    });
+    defer box.deinit();
+
+    const muted = dvui.themeGet().color(.window, .text).opacity(0.7);
+    dvui.icon(@src(), "ChangelogPlaceholder", icons.tvg.lucide.@"history", .{ .stroke_color = muted }, .{
+        .gravity_x = 0.5,
+        .min_size_content = .{ .w = 32, .h = 32 },
+        .margin = .{ .h = 8 },
+    });
+    dvui.labelNoFmt(@src(), "Changelog coming soon", .{}, .{
+        .font = dvui.Font.theme(.title),
+        .color_text = muted,
+        .gravity_x = 0.5,
+    });
+    var tl = dvui.textLayout(@src(), .{ .break_lines = true }, .{
+        .background = false,
+        .gravity_x = 0.5,
+        .max_size_content = .{ .w = 320, .h = std.math.floatMax(f32) },
+        .margin = .{ .y = 6 },
+        .font = dvui.Font.theme(.body),
+    });
+    tl.addText("Release notes for this plugin will appear here in a future update.", .{ .color_text = muted });
+    tl.deinit();
 }
 
 /// `FIZZY_PLUGIN_REGISTRY_URL` overrides the default catalog *base* URL (used for local E2E
@@ -288,6 +653,10 @@ pub fn deinit() void {
     name_cache.deinit(fizzy.app.allocator);
     for (version_cache.keys()) |k| fizzy.app.allocator.free(k);
     version_cache.deinit(fizzy.app.allocator);
+    clearManifestCache();
+    manifest_cache.deinit(fizzy.app.allocator);
+    freeDiskIds();
+    disk_ids.deinit(fizzy.app.allocator);
     Readme.deinit();
     StoreIcon.deinit();
     if (catalog) |*c| c.deinit();
@@ -317,6 +686,9 @@ pub fn tick() void {
 
     syncReadmeCenter();
 
+    // Anything applied below can add to, remove from, or change the load state of the plugins
+    // directory, so the next draw rescans it (see `disk_scan_dirty`).
+    if (pending_actions.items.len > 0) disk_scan_dirty = true;
     for (pending_actions.items) |action| switch (action) {
         .set_enabled => |a| {
             applySetEnabled(a.id, a.enabled);
@@ -335,6 +707,8 @@ pub fn tick() void {
         switch (@as(JobStatus, @enumFromInt(job.status.load(.acquire)))) {
             .downloading, .failed => i += 1,
             .downloaded => {
+                // A freshly downloaded file is already sitting in the plugins directory.
+                disk_scan_dirty = true;
                 // `force = false`: an in-place update must not silently discard unsaved
                 // documents the plugin owns, same protection `applySetEnabled`/
                 // `applyUninstall` give the manual disable/uninstall actions. On
@@ -393,9 +767,140 @@ fn toggleSelect(entry: StoreEntry) void {
             return;
         }
     }
+    selected_detail_tab = .details;
     const src = readmeSource(entry) orelse RepoSource{ .repo = "" };
     Readme.select(entry.id, src.repo, src.subpath);
 }
+
+/// Reconstruct the `StoreEntry` for whichever plugin is currently selected in the detail center
+/// (`Readme.selectedId()`), in the same priority order the install/store lists build theirs
+/// (`draw`'s entry-building pass) — just for one id instead of the whole list. `snapshot` is the
+/// caller's already-acquired catalog snapshot (or null when the catalog has never loaded); this
+/// makes no locking decisions of its own.
+fn selectedEntry(snapshot: ?store.Catalog.Snapshot) ?StoreEntry {
+    const id = Readme.selectedId() orelse return null;
+    const editor = fizzy.editor;
+    const registry = if (snapshot) |snap| snap.summary.pluginById(id) else null;
+    const release = if (snapshot) |snap| snap.shard.releaseFor(id) else null;
+
+    if (editor.host.pluginById(id)) |plugin| {
+        return .{ .id = id, .title = plugin.display_name, .kind = .local, .registry = registry, .release = release, .plugin = plugin };
+    }
+    if (editor.isPluginDisabled(id)) {
+        return .{ .id = id, .title = resolveTitle(id, id), .kind = .disabled, .registry = registry, .release = release };
+    }
+    if (editor.isFailedUserPlugin(id)) {
+        return .{ .id = id, .title = resolveTitle(id, id), .kind = .failed, .registry = registry, .release = release };
+    }
+    if (isOnDisk(id)) {
+        return .{ .id = id, .title = resolveTitle(id, id), .kind = .on_disk, .registry = registry, .release = release };
+    }
+    if (registry != null) {
+        return .{ .id = id, .title = resolveTitle(id, id), .kind = .registry, .registry = registry, .release = release };
+    }
+    return null;
+}
+
+/// `entry`'s on-disk manifest fields, probed once and memoised in `manifest_cache`. A dylib open
+/// + zon parse per call is far too costly to redo every frame — these resolvers run once per
+/// *listed card* (see `drawCardShell`), not just for the selected detail header. Returns an
+/// all-empty `ProbedManifest` when the plugin has no readable dylib, which is cached too so a
+/// missing/unreadable file isn't retried every frame. `manifest_cache` is cleared by
+/// `refreshDiskScan` (install/uninstall/update/Refresh) so stale values can't stick.
+fn probedManifestFor(id: []const u8) PluginLoader.ProbedManifest {
+    if (manifest_cache.get(id)) |cached| return cached;
+
+    const a = fizzy.app.allocator;
+    const editor = fizzy.editor;
+    const empty: PluginLoader.ProbedManifest = .{};
+
+    const plugins_dir = std.fs.path.join(a, &.{ editor.config_folder, "plugins" }) catch return empty;
+    defer a.free(plugins_dir);
+    const file_name = PluginLoader.pluginFilename(id, a) catch return empty;
+    defer a.free(file_name);
+    const path = std.fs.path.join(a, &.{ plugins_dir, id, file_name }) catch return empty;
+    defer a.free(path);
+
+    const probed = PluginLoader.probeManifestInfo(a, path) orelse empty;
+    const id_dup = a.dupe(u8, id) catch return probed;
+    manifest_cache.put(a, id_dup, probed) catch {
+        a.free(id_dup);
+        PluginLoader.freeProbedManifest(a, probed);
+        return empty;
+    };
+    return probed;
+}
+
+/// Best-known one-line description for `entry`: the registry's own (freshest — a published
+/// `summary.json` entry may know more than a locally built manifest), else the plugin's own
+/// manifest (`Editor.builtinManifest` for a built-in — no dylib to probe — or `probedManifestFor`
+/// against its on-disk dylib for anything else). Null when none of the three have one.
+fn descriptionFor(entry: StoreEntry) ?[]const u8 {
+    if (entry.registry) |r| {
+        if (r.description.len > 0) return r.description;
+    }
+    if (fizzy.editor.builtinManifest(entry.id)) |m| {
+        return if (m.description.len > 0) m.description else null;
+    }
+    const probed = probedManifestFor(entry.id);
+    return if (probed.description.len > 0) probed.description else null;
+}
+
+/// Best-known tag list for `entry` — same three-tier fallback as `descriptionFor`. Empty slice,
+/// never null, when none of the three have any: every call site only ever iterates the result.
+fn tagsFor(entry: StoreEntry) []const []const u8 {
+    if (entry.registry) |r| {
+        if (r.tags.len > 0) return r.tags;
+    }
+    if (fizzy.editor.builtinManifest(entry.id)) |m| return m.tags;
+    return probedManifestFor(entry.id).tags;
+}
+
+/// Best-known **cosmetic** author credit for `entry` — self-asserted, never a trust signal (see
+/// `publisherFor` for the attestable half). Same three-tier fallback as `descriptionFor`: a
+/// registry entry's own `author` wins, since it's PR-reviewed and editable without a release.
+fn authorFor(entry: StoreEntry) ?[]const u8 {
+    if (entry.registry) |r| {
+        if (r.author.len > 0) return r.author;
+    }
+    if (fizzy.editor.builtinManifest(entry.id)) |m| {
+        return if (m.author.len > 0) m.author else null;
+    }
+    const probed = probedManifestFor(entry.id);
+    return if (probed.author.len > 0) probed.author else null;
+}
+
+/// Optional custom link for `authorFor`'s credit. Same three-tier fallback as the rest; the
+/// catalog carries it so an *uninstalled* store plugin's credit is still clickable, since there
+/// is no local dylib to probe until it's installed. Only ever `http`/`https` — see
+/// `drawAuthorLine`.
+fn authorUrlFor(entry: StoreEntry) ?[]const u8 {
+    if (entry.registry) |r| {
+        if (r.author_url.len > 0) return r.author_url;
+    }
+    if (fizzy.editor.builtinManifest(entry.id)) |m| {
+        return if (m.author_url.len > 0) m.author_url else null;
+    }
+    const probed = probedManifestFor(entry.id);
+    return if (probed.author_url.len > 0) probed.author_url else null;
+}
+
+/// The **attestable** half of the credit line: who actually published the binary this host would
+/// install. Derived server-side at ingest from the release URL the plugin's `manifest.json` was
+/// fetched from — never self-asserted, so unlike `authorFor` it can't be spoofed by editing a
+/// `plugin.zig.zon`. Built-ins ship inside the fizzy binary itself, so they're attributed to the
+/// fizzy org directly rather than through the registry. Null when the store has no entry (a
+/// sideloaded or purely local plugin has no publisher at all — that's the point).
+fn publisherFor(entry: StoreEntry) ?[]const u8 {
+    if (isBundled(entry.id)) return fizzy_publisher;
+    if (entry.registry) |r| {
+        if (r.publisher.len > 0) return r.publisher;
+    }
+    return null;
+}
+
+/// Owner of `fizzy_repo_url` — the publisher every bundled built-in is attributed to.
+const fizzy_publisher = "fizzyedit";
 
 fn worker(job: *Job) void {
     store.download.download(fizzy.app.allocator, dvui.io, job.url, job.sha256, job.dest) catch |err| {
@@ -492,7 +997,7 @@ fn failedInfo(id: []const u8) ?fizzy.Editor.FailedPlugin {
 /// The plugin's current on-disk version, regardless of whether it is loaded, disabled, or a
 /// rejected (failed) build: the live loaded version when running, else a failed build's probed
 /// version, else the last version we remembered (loaded earlier this session, or probed while
-/// disabled — see `probeDisabledInfo`).
+/// disabled — see `probeOnDiskInfo`).
 fn currentVersion(id: []const u8) ?std.SemanticVersion {
     if (installedVersion(id)) |v| return v;
     if (failedInfo(id)) |f| {
@@ -531,7 +1036,9 @@ fn isBundled(id: []const u8) bool {
 const StoreEntry = struct {
     id: []const u8,
     title: []const u8,
-    kind: enum { registry, local, disabled, failed },
+    /// `on_disk` is the catch-all for a plugin directory that exists but is in none of the
+    /// fizzy's in-memory states (not loaded, not disabled, no recorded failure) — see `disk_ids`.
+    kind: enum { registry, local, disabled, failed, on_disk },
     registry: ?store.SummaryEntry = null,
     /// This host's release for `id`, if the fetched shard has one (already fingerprint-resolved
     /// server-side — see `store.ShardRelease`). Still needs an arch check; see `selectedRelease`.
@@ -585,17 +1092,19 @@ fn scoreEntry(entry: StoreEntry, query: *const fuzzy.Query) ?f64 {
     }
     var best = fuzzy.scoreBest(identity[0..n], query, .{ .plain = true });
 
-    if (entry.registry) |r| {
-        var prose = fuzzy.scoreBest(&.{ r.description, r.author }, query, .{ .plain = true });
-        for (r.tags) |tag| {
-            if (fuzzy.score(tag, query, .{ .plain = true })) |s| {
-                if (prose == null or s < prose.?) prose = s;
-            }
+    // `descriptionFor`/`tagsFor` already fall back past the registry (built-in manifest, then a
+    // dylib probe), so a plugin with no registry entry yet still scores on its own prose — only
+    // `author` has no such fallback (it's registry-only, see `docs/PLUGIN_MANIFEST_PLAN.md`).
+    const author = if (entry.registry) |r| r.author else "";
+    var prose = fuzzy.scoreBest(&.{ descriptionFor(entry) orelse "", author }, query, .{ .plain = true });
+    for (tagsFor(entry)) |tag| {
+        if (fuzzy.score(tag, query, .{ .plain = true })) |s| {
+            if (prose == null or s < prose.?) prose = s;
         }
-        if (prose) |s| {
-            const penalised = s + prose_match_penalty;
-            if (best == null or penalised < best.?) best = penalised;
-        }
+    }
+    if (prose) |s| {
+        const penalised = s + prose_match_penalty;
+        if (best == null or penalised < best.?) best = penalised;
     }
     return best;
 }
@@ -638,12 +1147,13 @@ fn draw(_: ?*anyopaque) anyerror!void {
     var vbox = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both });
     defer vbox.deinit();
 
-    // First time the tab is shown, fetch the registry and learn disabled plugins' real names.
+    // First time the tab is shown, fetch the registry. Local state is rescanned here too, and
+    // again whenever an install/uninstall/enable has touched the plugins directory since.
     if (!first_draw_done) {
         first_draw_done = true;
         if (catalog) |*c| c.refresh();
-        probeDisabledInfo();
     }
+    if (disk_scan_dirty) refreshLocalInfo();
 
     try drawHeader();
 
@@ -668,6 +1178,27 @@ fn draw(_: ?*anyopaque) anyerror!void {
     const cat = if (catalog) |*c| c else return;
     const maybe_snapshot = cat.acquire();
     defer cat.release();
+
+    // Very first fetch: draw one spinner instead of the split. Both panes would otherwise render
+    // cards that are visibly half-empty and then fill themselves in — the store list is empty
+    // until the summary lands, and every *installed* card is missing its registry half
+    // (description, author, "store vX", update availability), since those cards build from local
+    // state alone and only get enriched once a snapshot exists. A manual refresh deliberately
+    // does *not* come through here: a snapshot is already present, so the existing cards stay put
+    // under the smaller inline banner below rather than blanking the whole pane.
+    if (maybe_snapshot == null and cat.status() == .fetching) {
+        const now = fizzy.perf.nanoTimestamp();
+        const started = first_fetch_started_ns orelse blk: {
+            first_fetch_started_ns = now;
+            break :blk now;
+        };
+        if (now - started < first_fetch_placeholder_max_ns) {
+            drawFetchingPlaceholder();
+            return;
+        }
+    } else {
+        first_fetch_started_ns = null;
+    }
 
     const arena = dvui.currentWindow().arena();
     const editor = fizzy.editor;
@@ -733,11 +1264,26 @@ fn draw(_: ?*anyopaque) anyerror!void {
             .release = if (maybe_snapshot) |snap| snap.shard.releaseFor(f.id) else null,
         }) catch {};
     }
+    // Anything else sitting in the plugins directory. Nothing in fizzy's memory describes
+    // these (a half-finished install, a sideloaded directory, a build from a previous session we
+    // never tried to load), but they are on disk, so they get a card — and therefore always an
+    // Uninstall, and a Reinstall when the store has a build for this host (see `drawCardControls`).
+    for (disk_ids.items) |id| {
+        if (isBundled(id)) continue;
+        if (containsId(installed_entries.items, id)) continue;
+        installed_entries.append(arena, .{
+            .id = id,
+            .title = resolveTitle(id, id),
+            .kind = .on_disk,
+            .registry = if (maybe_snapshot) |snap| snap.summary.pluginById(id) else null,
+            .release = if (maybe_snapshot) |snap| snap.shard.releaseFor(id) else null,
+        }) catch {};
+    }
     rankEntries(&installed_entries, &query);
 
     // Surface registry-fetch state above the split (installed plugins still render below it).
-    // `.fetching` fires both on the initial load and on a manual refresh, so the spinner shows
-    // even once `maybe_snapshot` is already populated from a previous fetch.
+    // Only the *refresh* case lands here — the first-fetch case returned above with a full-pane
+    // placeholder instead, since there is nothing worth drawing under this banner yet.
     switch (cat.status()) {
         .fetching => {
             var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .margin = .{ .y = 8 } });
@@ -748,7 +1294,7 @@ fn draw(_: ?*anyopaque) anyerror!void {
                 .color_text = dvui.themeGet().color(.window, .text),
                 .padding = .{ .w = 8 },
             }, .{});
-            dvui.labelNoFmt(@src(), "Fetching plugin registry…", .{}, .{ .gravity_y = 0.5 });
+            dvui.labelNoFmt(@src(), "Refreshing plugin registry…", .{}, .{ .gravity_y = 0.5 });
         },
         .failed => if (maybe_snapshot == null) dvui.labelNoFmt(@src(), "Could not reach the plugin registry.", .{}, .{
             .margin = .{ .y = 8 },
@@ -803,8 +1349,70 @@ fn draw(_: ?*anyopaque) anyerror!void {
     prev_installed_shown = shown_installed;
 
     if (paned.showSecond()) {
-        _ = drawStoreSection(store_entries.items, filter_text, maybe_snapshot == null and cat.status() == .fetching);
+        _ = drawStoreSection(store_entries.items, filter_text);
     }
+}
+
+/// Monotonic timestamp at which the current first-fetch placeholder started showing, or null when
+/// the placeholder isn't up. Paired with `first_fetch_placeholder_max_ns` to time-box it: nothing
+/// in the catalog fetch path sets a network timeout, so a registry that is unreachable *without
+/// failing* (captive portal, blackholed DNS) parks `Catalog.status()` on `.fetching` indefinitely.
+/// Left unbounded, that would hide the installed pane forever — and managing installed plugins
+/// needs no registry data at all. After the cap the split renders as usual, with the smaller
+/// inline "Refreshing…" banner still showing that a fetch is outstanding.
+var first_fetch_started_ns: ?i128 = null;
+const first_fetch_placeholder_max_ns: i128 = 6 * std.time.ns_per_s;
+
+/// Centered "Fetching store…" spinner shown in place of the whole split during the very first
+/// catalog fetch. See the call site in `draw` for why the refresh case doesn't use this.
+fn drawFetchingPlaceholder() void {
+    var center = dvui.box(@src(), .{ .dir = .vertical }, .{
+        .expand = .both,
+        .background = false,
+    });
+    defer center.deinit();
+
+    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+        .gravity_x = 0.5,
+        .gravity_y = 0.5,
+        .background = false,
+    });
+    defer row.deinit();
+
+    fizzy.dvui.bubbleSpinner(@src(), .{
+        .min_size_content = .{ .w = 20, .h = 20 },
+        .gravity_y = 0.5,
+        .color_text = dvui.themeGet().color(.window, .text),
+        .padding = .{ .w = 10 },
+    }, .{});
+    dvui.labelNoFmt(@src(), "Fetching store…", .{}, .{
+        .gravity_y = 0.5,
+        .color_text = dvui.themeGet().color(.window, .text).opacity(0.8),
+    });
+}
+
+/// How many cards the entry animation staggers across before every later card shares the last
+/// card's delay — without a cap, a large store would spend seconds trickling cards in.
+const card_stagger_cap: usize = 10;
+
+/// Slide a card in from the left with a slight overshoot the first time its id is drawn,
+/// staggered by list position so a freshly-fetched list cascades instead of appearing all at
+/// once. Same widget and easing the workspace's recent-folder list uses.
+///
+/// `id_extra` is the plugin id's hash rather than the loop index on purpose: `dvui.animate`
+/// re-triggers whenever `dvui.firstFrame` sees a new widget id, so indexing by position would
+/// replay the whole cascade every time re-ranking moved a card (i.e. on every filter keystroke).
+/// Keyed by id, each plugin animates exactly once, no matter how the list is later sorted.
+fn cardAnimator(src: std.builtin.SourceLocation, entry: StoreEntry, index: usize) *dvui.AnimateWidget {
+    const stagger = @min(index, card_stagger_cap);
+    return dvui.animate(src, .{
+        .kind = .horizontal,
+        .duration = 200_000 + 40_000 * @as(i32, @intCast(stagger)),
+        .easing = dvui.easing.outBack,
+    }, .{
+        .id_extra = hashId(entry.id),
+        .expand = .horizontal,
+    });
 }
 
 /// Lower pane: a pure "browse the store" list, one card per registry plugin. Wrapped in its
@@ -812,7 +1420,7 @@ fn draw(_: ?*anyopaque) anyerror!void {
 /// `explorer/Explorer.zig` uses, so a manually-shrunk pane or an overly-wide card still scrolls
 /// with the usual visual hint instead of clipping silently. Returns the shown count (unused by
 /// the caller now that the store pane no longer drives the paned autofit).
-fn drawStoreSection(entries: []const StoreEntry, filter_text: []const u8, is_first_fetch: bool) usize {
+fn drawStoreSection(entries: []const StoreEntry, filter_text: []const u8) usize {
     dvui.labelNoFmt(@src(), "STORE", .{}, .{ .font = dvui.Font.theme(.heading), .margin = .{ .x = 8 } });
 
     var pane_box = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both, .background = false });
@@ -827,12 +1435,14 @@ fn drawStoreSection(entries: []const StoreEntry, filter_text: []const u8, is_fir
     // `entries` is already filtered and ranked by `rankEntries` — best match first.
     var shown: usize = 0;
     for (entries) |entry| {
+        var anim = cardAnimator(@src(), entry, shown);
+        defer anim.deinit();
         shown += 1;
         drawStoreCard(entry);
     }
-    // While the very first fetch is still in flight, the top banner's spinner already explains
-    // the empty pane — skip the "no plugins" fallback so we don't show both at once.
-    if (shown == 0 and !is_first_fetch) {
+    // The first fetch never reaches here (`draw` returns early with a full-pane spinner), so an
+    // empty list at this point genuinely means the store has nothing to show.
+    if (shown == 0) {
         dvui.labelNoFmt(
             @src(),
             if (filter_text.len > 0) "No store plugins match the filter." else "No plugins available in the store.",
@@ -875,6 +1485,8 @@ fn drawInstalledSection(entries: []const StoreEntry, filter_text: []const u8) us
     for (entries) |entry| {
         if (isBuiltIn(entry.id)) continue;
         if (shown_local == 0) drawSectionHeader("Local", 0);
+        var anim = cardAnimator(@src(), entry, shown_local);
+        defer anim.deinit();
         shown_local += 1;
         shown += 1;
         drawCard(entry);
@@ -884,6 +1496,8 @@ fn drawInstalledSection(entries: []const StoreEntry, filter_text: []const u8) us
     for (entries) |entry| {
         if (!isBuiltIn(entry.id)) continue;
         if (shown_builtin == 0) drawSectionHeader("Built-in", 1);
+        var anim = cardAnimator(@src(), entry, shown_builtin);
+        defer anim.deinit();
         shown_builtin += 1;
         shown += 1;
         drawCard(entry);
@@ -941,13 +1555,32 @@ fn drawStoreCard(entry: StoreEntry) void {
     drawCardShell(entry, drawStoreCardControls, storeInfoLine(&buf, entry), false);
 }
 
+/// Static floor under a card's (and so the whole explorer tab's) width: below this, the
+/// scrollArea takes over horizontally rather than squeezing the card further. Deliberately a
+/// constant rather than content-derived (see `drawCardShell`) — roughly enough room for a short
+/// title, a few words of description, and the install/update controls without either crowding
+/// into the other. A fraction of the app width was the other option on the table, but that would
+/// mean plumbing the window size down to every card just to move a number that has no reason to
+/// track it; a plain constant is simpler and just as legible in practice.
+const card_min_w: f32 = 280;
+
+/// Applied as `max_size_content.w` to every card text line (title/description/author/row2) below.
+/// This is *not* a render-width cap — `max_size_content` only clamps a widget's *reported* min
+/// size (see `WidgetData.minSizeSetAndRefresh`), never the rect it actually gets handed to draw
+/// into. With `.expand = .horizontal`, that rect still comes from the card's real (fluid) width;
+/// `LabelWidget`'s default `ellipsize = true` then truncates the render to fit it. What this
+/// *does* do is stop a plain label's other behavior — reporting its full unwrapped text width as
+/// its min size — from ever reaching the card and inflating `card_min_w` into "however long the
+/// longest description happens to be", which is exactly what the scrollArea must not do.
+const card_text_no_floor: f32 = 1;
+
 /// Shared card shell: a clickable container (logo + info + state controls). Clicking anywhere
 /// outside the controls selects the plugin (its README shows in the center). The controls consume
 /// their own clicks so the card-level click never double-fires. `controls` draws the
-/// right-justified state controls (differs between the store and installed cards, see
+/// bottom-right state controls (differs between the store and installed cards, see
 /// `drawStoreCardControls`/`drawCardControls`); `row2_text` is the already-formatted dim
-/// monospace line (differs likewise, see `storeInfoLine`/`infoLine`); `show_failure` gates the
-/// failed-to-load detail block, which only makes sense on an installed-pane card.
+/// monospace id/version line (differs likewise, see `storeInfoLine`/`infoLine`); `show_failure`
+/// gates the failed-to-load detail block, which only makes sense on an installed-pane card.
 fn drawCardShell(entry: StoreEntry, controls: *const fn (StoreEntry) void, row2_text: []const u8, show_failure: bool) void {
     const theme = dvui.themeGet();
     const selected = if (Readme.selectedId()) |sid| std.mem.eql(u8, sid, entry.id) else false;
@@ -964,6 +1597,7 @@ fn drawCardShell(entry: StoreEntry, controls: *const fn (StoreEntry) void, row2_
     bw.init(@src(), .{}, .{
         .id_extra = hashId(entry.id),
         .expand = .horizontal,
+        .min_size_content = .{ .w = card_min_w },
         .margin = .all(4),
         .padding = .all(8),
         .corners = dvui.CornerRect.all(8),
@@ -988,8 +1622,8 @@ fn drawCardShell(entry: StoreEntry, controls: *const fn (StoreEntry) void, row2_
         var hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
         defer hbox.deinit();
 
-        // 1. Logo (gravity 0). Fetch `ICON.png` from the plugin repo when known; fall back to a
-        // loaded plugin's registered icon, then the generic placeholder.
+        // 1. Logo (gravity 0), shown as-is. Fetch `ICON.png` from the plugin repo when known;
+        // fall back to a loaded plugin's registered icon, then the generic placeholder.
         {
             var logo = dvui.box(@src(), .{ .dir = .horizontal }, .{
                 .gravity_y = 0.5,
@@ -997,7 +1631,7 @@ fn drawCardShell(entry: StoreEntry, controls: *const fn (StoreEntry) void, row2_
             });
             defer logo.deinit();
             if (repoSource(entry)) |src| StoreIcon.request(entry.id, src.repo, src.subpath);
-            const drew = StoreIcon.draw(entry.id) or fizzy.editor.host.drawPluginIcon(entry.id);
+            const drew = StoreIcon.draw(entry.id, 32) or fizzy.editor.host.drawPluginIcon(entry.id);
             if (!drew) {
                 dvui.icon(
                     @src(),
@@ -1009,26 +1643,36 @@ fn drawCardShell(entry: StoreEntry, controls: *const fn (StoreEntry) void, row2_
             }
         }
 
-        // 2. State controls, right-justified. Must be laid out *before* the (expand-horizontal)
-        // info column below: a `gravity_x = 1.0` child reserves its natural width from the right
-        // edge of whatever's left regardless of draw order, but an `expand`-ing sibling's
-        // bottom-up min size is its full *unwrapped* text width (wrapping text layouts don't
-        // shrink their reported min size — see the info column) — if info claimed space first,
-        // that inflated want would eat 100% of what's left and starve these controls down to a
-        // zero-width row (the Uninstall trash button silently disappearing). These run their own
-        // processEvents and consume their clicks before the card does.
-        controls(entry);
+        // 2. State controls, bottom-right. `gravity_y = 1.0` on this wrapper (rather than the
+        // shared `controls(entry)`'s own centered `gravity_y = 0.5` — that function is reused
+        // as-is by the detail header, where centered is right) bottom-anchors it within the
+        // card row, reading as "underneath the text stack" without actually nesting inside the
+        // (vertical) info column, which would put it after `bw.processEvents()` below and lose
+        // click priority — see the note there. Must still be laid out *before* the
+        // (expand-horizontal) info column: a `gravity_x = 1.0` child reserves its natural width
+        // from the right edge of whatever's left regardless of draw order, but an `expand`-ing
+        // sibling's bottom-up min size would otherwise eat 100% of what's left and starve this
+        // down to a zero-width row (the Uninstall trash button silently disappearing). This runs
+        // its own processEvents and consumes its clicks before the card does.
+        {
+            var ctl_anchor = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 1.0, .gravity_y = 1.0 });
+            defer ctl_anchor.deinit();
+            controls(entry);
+        }
 
         // Claim the card-body click *now*, before the info column below: `dvui.clicked` skips
         // events a widget earlier in this pass already handled, and a `dvui.textLayout` always
         // captures press/release for its own text-selection (see its `processEvent`) regardless
         // of whether anyone actually wants to select that text. If the info column ran first, it
         // would silently steal every click landing on the failure text (the only remaining
-        // `textLayout` below — title/date/info-line are plain labels now), so this has to run
-        // after the (already-first) controls but before the (still-to-come) text.
+        // `textLayout` below — everything else in the column is a plain label), so this has to
+        // run after the (already-first) controls but before the (still-to-come) text.
         bw.processEvents();
 
-        // 3. Info column: title + upload date on one row, then a dim monospace info row.
+        // 3. Info column: title (largest, bold) — description (single line, ellipsized) —
+        // author — then the dim id/version line. Every line below is always drawn, even with an
+        // empty string, so every card reserves the same four lines of height regardless of which
+        // fields a given plugin actually has (see the "cards that are all the same size" ask).
         {
             var info = dvui.box(@src(), .{ .dir = .vertical }, .{
                 .expand = .horizontal,
@@ -1037,24 +1681,15 @@ fn drawCardShell(entry: StoreEntry, controls: *const fn (StoreEntry) void, row2_
             });
             defer info.deinit();
 
-            // The id/version row (row2, drawn below) is the *only* thing allowed to set the
-            // floor under this card — logo + controls (already laid out) plus this text is
-            // exactly the width the card should never shrink below, triggering the explorer's
-            // horizontal scroll instead. Everything else in this column (title/date, the failure
-            // detail) must be capped to this width rather than being free to inflate the floor
-            // themselves. Measured directly from font metrics (matching what `LabelWidget` does
-            // internally — text size plus its default 6px-a-side padding) so the value is exact
-            // and available *before* row2 is actually drawn below.
-            const row2_font = dvui.Font.theme(.mono);
-            const row2_w = row2_font.textSize(row2_text).w + 12;
-
             {
-                var title_row = dvui.box(@src(), .{ .dir = .horizontal }, .{
-                    .expand = .horizontal,
-                    .max_size_content = .{ .w = row2_w, .h = std.math.floatMax(f32) },
-                });
+                var title_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
                 defer title_row.deinit();
-                dvui.labelNoFmt(@src(), entry.title, .{}, .{ .font = dvui.Font.theme(.title), .expand = .horizontal });
+                const title_font = dvui.Font.theme(.title);
+                dvui.labelNoFmt(@src(), entry.title, .{}, .{
+                    .font = title_font.withWeight(.bold),
+                    .expand = .horizontal,
+                    .max_size_content = .{ .w = card_text_no_floor, .h = std.math.floatMax(f32) },
+                });
                 if (releaseDate(entry)) |date| {
                     dvui.labelNoFmt(@src(), date, .{}, .{
                         .font = dvui.Font.theme(.mono),
@@ -1065,26 +1700,53 @@ fn drawCardShell(entry: StoreEntry, controls: *const fn (StoreEntry) void, row2_
                 }
             }
 
-            // A plain `label` reports its full unwrapped text width as its min size — that's
-            // exactly what we want here: the card (and the whole tab, see `draw`) should never
-            // get squeezed narrower than this line, so a long id/version string pushes the card
-            // wider and the explorer's scrollArea takes over horizontally instead of wrapping.
-            dvui.labelNoFmt(@src(), row2_text, .{}, .{
-                .font = row2_font,
+            // Single line, ellipsized (LabelWidget's default) rather than wrapped — a tooltip
+            // picks up the full text only when it was actually truncated.
+            {
+                var desc_label: dvui.LabelWidget = undefined;
+                desc_label.initNoFmt(@src(), descriptionFor(entry) orelse "", .{}, .{
+                    .font = dvui.Font.theme(.body),
+                    .color_text = theme.color(.window, .text).opacity(0.75),
+                    .expand = .horizontal,
+                    .max_size_content = .{ .w = card_text_no_floor, .h = std.math.floatMax(f32) },
+                });
+                desc_label.draw();
+                if (desc_label.ellipsized) {
+                    dvui.tooltip(
+                        @src(),
+                        .{ .active_rect = desc_label.data().borderRectScale().r, .position = .vertical },
+                        "{s}",
+                        .{desc_label.label_str},
+                        .{},
+                    );
+                }
+                desc_label.deinit();
+            }
+
+            dvui.labelNoFmt(@src(), if (entry.registry) |r| r.author else "", .{}, .{
+                .font = dvui.Font.theme(.body),
                 .color_text = theme.color(.control, .text),
+                .expand = .horizontal,
+                .max_size_content = .{ .w = card_text_no_floor, .h = std.math.floatMax(f32) },
+            });
+
+            dvui.labelNoFmt(@src(), row2_text, .{}, .{
+                .font = dvui.Font.theme(.mono),
+                .color_text = theme.color(.control, .text),
+                .expand = .horizontal,
+                .max_size_content = .{ .w = card_text_no_floor, .h = std.math.floatMax(f32) },
             });
 
             // A local build that is on disk but rejected at load time (ABI/SDK mismatch, id
             // collision, etc.) — this is the *only* place that surfaces it (there is no more
-            // startup dialog), so it must carry every diagnostic detail we have. Unlike the info
-            // line above, this genuinely should wrap rather than widen the card: pin it to row2's
-            // width (see above) rather than the full viewport, or a long error message alone
-            // would force the card — and horizontal scrolling — wider than it needs to be.
-            // Store (upper-pane) cards never show this — see `show_failure`.
+            // startup dialog), so it must carry every diagnostic detail we have. This genuinely
+            // should wrap rather than ellipsize, so it gets a fixed-width column (both min and
+            // max) instead of the zero-floor treatment above. Store (upper-pane) cards never show
+            // this — see `show_failure`.
             if (show_failure) if (failedInfo(entry.id)) |f| {
                 var fail_wrap = dvui.box(@src(), .{ .dir = .vertical }, .{
-                    .min_size_content = .{ .w = row2_w },
-                    .max_size_content = .{ .w = row2_w, .h = std.math.floatMax(f32) },
+                    .min_size_content = .{ .w = min_failure_wrap_w },
+                    .max_size_content = .{ .w = min_failure_wrap_w, .h = std.math.floatMax(f32) },
                 });
                 defer fail_wrap.deinit();
 
@@ -1109,10 +1771,10 @@ fn drawCardShell(entry: StoreEntry, controls: *const fn (StoreEntry) void, row2_
         }
     }
 
-    // The info column's text layouts set an ibeam cursor on hover (for their own text
-    // selection) regardless of whether the card claimed their clicks above — restore the
-    // plain card cursor now that they've all had their turn this frame ("last cursorSet call
-    // wins" for the frame).
+    // The info column's failure-detail text layout sets an ibeam cursor on hover (for its own
+    // text selection) regardless of whether the card claimed its clicks above — restore the
+    // plain card cursor now that it's had its turn this frame ("last cursorSet call wins" for
+    // the frame).
     if (bw.hover) dvui.cursorSet(.arrow);
     if (bw.clicked()) toggleSelect(entry);
 }
@@ -1130,6 +1792,7 @@ fn isInstalled(entry: StoreEntry) bool {
     if (editor.isPluginDisabled(entry.id)) return true;
     if (entry.kind == .local or entry.kind == .disabled) return true;
     if (entry.kind == .failed or editor.isFailedUserPlugin(entry.id)) return true;
+    if (entry.kind == .on_disk or isOnDisk(entry.id)) return true;
     return false;
 }
 
@@ -1199,6 +1862,10 @@ fn storeInfoLine(buf: []u8, entry: StoreEntry) []const u8 {
 }
 
 const part_separator = " · ";
+
+/// Fixed wrap width of a card's failure message (see `drawCardShell`) — wide enough for a few
+/// words per line without going all the way out to the card's actual (fluid) width.
+const min_failure_wrap_w: f32 = 220;
 
 /// Join `parts` with " · ", truncating (rather than overflowing) if `buf` is too small.
 fn joinParts(buf: []u8, parts: []const []const u8) []const u8 {
@@ -1274,33 +1941,57 @@ fn drawCardControls(entry: StoreEntry) void {
 
     const loaded = editor.host.pluginById(entry.id) != null;
     const disabled = editor.isPluginDisabled(entry.id);
-    // A build sitting in the plugins dir that failed to load (ABI/SDK mismatch, etc.). It is on
-    // disk like any installed plugin, so it must stay actionable (replace / uninstall) rather than
-    // dead-ending at a bare "Failed" label the user can't act on.
-    const failed_on_disk = entry.kind == .failed or editor.isFailedUserPlugin(entry.id);
+    // A build sitting in the plugins dir that isn't running: it failed to load (ABI/SDK mismatch,
+    // etc.), or it is simply there with nothing in memory describing it. Either way it is on disk
+    // like any installed plugin, so it must stay actionable (reinstall / uninstall) rather than
+    // dead-ending at a bare "Failed" label — or, worse, at no card at all.
+    const broken = entry.kind == .failed or entry.kind == .on_disk or
+        editor.isFailedUserPlugin(entry.id) or (!loaded and !disabled and isOnDisk(entry.id));
 
-    // Present on disk in some form: loaded, disabled-on-disk, sideloaded local, or a failed build.
-    if (loaded or disabled or entry.kind == .local or entry.kind == .disabled or failed_on_disk) {
+    // Present on disk in some form: loaded, disabled-on-disk, sideloaded local, or a broken build.
+    if (loaded or disabled or entry.kind == .local or entry.kind == .disabled or broken) {
         // Enable/disable only makes sense for a plugin that can actually load — a mismatched
-        // (never-loaded) build has nothing to toggle, so skip the checkbox for the pure-failed case.
+        // (never-loaded) build has nothing to toggle, so skip the checkbox for the pure-broken case.
         if (loaded or disabled) {
             var enabled = !disabled;
             if (dvui.checkbox(@src(), &enabled, "Enabled", .{ .gravity_y = 0.5 })) queueSetEnabled(entry.id, enabled);
         }
         // Replace with a host-compatible registry build, just before uninstall:
         //   * loaded & strictly newer → in-place Update (unload + reload);
-        //   * failed-on-disk          → replace the broken build. Nothing is loaded to unload, so
-        //     route through the install path (is_update = false → installAndLoadPlugin loads the
-        //     freshly downloaded file over the old one and clears the failure record).
+        //   * broken/not loaded       → Reinstall: download this host's build fresh over the one
+        //     on disk and load it. Nothing is loaded to unload, so route through the install path
+        //     (is_update = false → `installAndLoadPlugin`, which re-enables the plugin, loads the
+        //     freshly downloaded file and clears the failure record). This is the way out of a
+        //     wrong-SDK build: the shard is resolved to *this* host's ABI fingerprint, so the
+        //     download is by construction the build this Fizzy can load — even when it carries the
+        //     same version number as the broken one already on disk.
         if (loaded) {
             if (updateRelease(entry)) |rel| {
                 if (dvui.button(@src(), "Update", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 4 } }))
                     startDownload(entry.id, rel, true);
             }
-        } else if (failed_on_disk) {
+        } else if (broken) {
             if (selectedRelease(entry)) |rel| {
-                if (dvui.button(@src(), "Update", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 4 } }))
+                if (dvui.button(@src(), "Reinstall", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 4 } }))
                     startDownload(entry.id, rel, false);
+            } else {
+                // No build for this host in the fetched shard, so there is nothing to reinstall
+                // *from*. Say why (short form — this card also carries the wrapped failure text,
+                // and the controls row shares its width with it) instead of leaving a lone trash
+                // icon next to an unexplained "Failed to load".
+                var no_build_box = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_y = 0.5, .margin = .{ .x = 4 } });
+                defer no_build_box.deinit();
+                dvui.labelNoFmt(@src(), "No store build", .{}, .{
+                    .color_text = theme.color(.err, .text),
+                    .font = dvui.Font.theme(.mono),
+                });
+                dvui.tooltip(
+                    @src(),
+                    .{ .active_rect = no_build_box.data().borderRectScale().r },
+                    "No compatible build in store (SDK {d}.{d}.{d} · ABI 0x{x} · {s})",
+                    .{ version.sdk_version.major, version.sdk_version.minor, version.sdk_version.patch, dylib.abi_fingerprint, compat.hostKey() },
+                    .{},
+                );
             }
         }
         if (dvui.buttonIcon(@src(), "Uninstall", icons.tvg.lucide.@"trash-2", .{}, .{ .stroke_color = theme.color(.err, .text) }, .{ .gravity_y = 0.5 }))
@@ -1448,7 +2139,7 @@ fn drawHeader() !void {
     )) {
         status_len = 0;
         if (catalog) |*c| c.refresh();
-        probeDisabledInfo();
+        refreshLocalInfo();
     }
 
     if (status_len > 0) {

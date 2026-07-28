@@ -1,12 +1,12 @@
 //! Core module root: shared infrastructure (gfx, math, fs, generated atlas,
-//! platform, paths, the generic dvui hub + generic widgets) that both the shell
+//! platform, paths, the generic dvui hub + generic widgets) that both fizzy
 //! and the plugins depend on. Core never imports the `fizzy` app hub.
 //!
 //! Cross-cutting app resources (the allocator, platform input) are injected at
 //! startup via the context fields below so core stays decoupled from the App.
 const std = @import("std");
 
-/// Process allocator, set once at startup by the shell (`App`/`web_main`).
+/// Process allocator, set once at startup by fizzy itself (`App`/`web_main`).
 /// Core infrastructure (e.g. `gfx.image`) allocates through this instead of
 /// reaching into the App hub.
 pub var gpa: std.mem.Allocator = undefined;
