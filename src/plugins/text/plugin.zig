@@ -18,6 +18,12 @@ pub const plugin_options = @import("fizzy_plugin_options");
 /// `Editor.isBundledPluginId`) read instead of retyping the string.
 pub const plugin_id = plugin_options.id;
 
+/// The editing widget, re-exported so `tests/integration.zig` can drive it against dvui's
+/// headless testing backend (a file belongs to exactly one module, so the tests reach it
+/// through this plugin's module rather than rooting their own at the widget). Nothing in the
+/// app imports it this way — `TextEditor.zig` uses the relative path directly.
+pub const TextEntryWidget = @import("src/widgets/TextEntryWidget.zig");
+
 var plugin: sdk.Plugin = .{
     .state = undefined,
     .vtable = &vtable,
@@ -99,6 +105,7 @@ pub fn register(host: *sdk.Host) !void {
         .owner = &plugin,
         .title = "Paste",
         .run = cmdPaste,
+        .isEnabled = cmdPasteEnabled,
     });
     try host.registerCommand(.{
         .id = sdk.Plugin.commandId("text", "format"),
@@ -113,15 +120,19 @@ pub fn register(host: *sdk.Host) !void {
     // "Edit" menu (in-app + native) rather than showing a permanently-greyed generic verb.
     try host.registerMenuSection(.{
         .id = "text.menu.edit_section",
-        .parent_menu_id = "shell.menu.edit",
+        .parent_menu_id = "fizzy.menu.edit",
         .owner = &plugin,
         .draw = drawEditMenuSection,
     });
     try host.registerNativeMenuItem(.{
         .id = "text.native.format",
         .owner = &plugin,
-        .parent_menu_id = "shell.menu.edit",
+        .parent_menu_id = "fizzy.menu.edit",
         .title = "Format Document",
+        // Naming the command is what gets this item's chord onto the macOS menu — and keeps it
+        // there across a rebind. `run` is still the click path.
+        .command = sdk.Plugin.commandId("text", "format"),
+        .sf_symbol = "text.alignleft",
         .run = nativeFormat,
     });
 }
@@ -223,6 +234,9 @@ fn registerOpenDocument(state: *anyopaque, file: *anyopaque) anyerror!*anyopaque
     errdefer gpa.destroy(heap_doc);
     heap_doc.* = doc.*;
     try st.docs.put(gpa, doc.id, heap_doc);
+    // Kick language-server warmup (spawn + didOpen) before the first hover/completion so
+    // cold-start latency isn't paid on first use — see `LanguageSupport.VTable.documentOpened`.
+    sdk.host().documentOpenedFor(std.fs.path.extension(heap_doc.path), heap_doc.path, heap_doc.text.items);
     return heap_doc;
 }
 fn documentPtr(state: *anyopaque, id: u64) ?*anyopaque {
@@ -258,7 +272,7 @@ fn setDocumentPath(_: *anyopaque, handle: DocHandle, path: []const u8) anyerror!
 }
 fn revealPosition(_: *anyopaque, handle: DocHandle, line: u32, character: u32) void {
     const doc = docFrom(handle) orelse return;
-    doc.pending_cursor = doc.byteOffsetForLineCharacter(line, character);
+    doc.pending_sel = .collapsed(doc.byteOffsetForLineCharacter(line, character));
     doc.pending_scroll_line = line;
 }
 fn bindDocumentToPane(_: *anyopaque, _: DocHandle, _: dvui.Id, _: *anyopaque, _: bool) void {
@@ -285,6 +299,7 @@ fn closeDocument(_: *anyopaque, handle: DocHandle) void {
 fn reloadDocument(_: *anyopaque, handle: DocHandle) anyerror!void {
     const doc = docFrom(handle) orelse return error.DocumentNotFound;
     try doc.reloadFromDisk();
+    sdk.host().documentOpenedFor(std.fs.path.extension(doc.path), doc.path, doc.text.items);
 }
 fn isDirty(_: *anyopaque, handle: DocHandle) bool {
     return (docFrom(handle) orelse return false).isDirty();
@@ -292,7 +307,7 @@ fn isDirty(_: *anyopaque, handle: DocHandle) bool {
 fn saveDocument(state: *anyopaque, handle: DocHandle) anyerror!void {
     const doc = docFrom(handle) orelse return;
     const st: *State = @ptrCast(@alignCast(state));
-    if (st.settings.format_on_save) formatDocument(doc);
+    if (st.settings.format_on_save.get()) formatDocument(doc);
     try doc.save();
 }
 fn documentDefaultSaveAsFilename(_: *anyopaque, handle: DocHandle, allocator: std.mem.Allocator) anyerror![]const u8 {
@@ -322,15 +337,25 @@ fn canRedoDocument(_: *anyopaque, handle: DocHandle) bool {
 }
 
 // ---- copy / paste commands -----------------------------------------------------
+//
+// Both report enabled only while this editor holds keyboard focus. That is the shell's
+// discriminator for routing a clipboard verb here versus to another focused text input — a
+// search box, the Output Panel — which it otherwise has no way to tell apart (see
+// `Keybinds.clipboardVerb` in the shell, and `Document.editor_focused`). Reporting enabled
+// while focus is elsewhere would make Copy in that search box copy this document instead.
 
 fn cmdCopyEnabled(state: *anyopaque) bool {
     const doc = activeTextDoc(state) orelse return false;
-    return doc.sel_start != doc.sel_end;
+    return doc.editor_focused and doc.sel_start != doc.sel_end;
 }
 fn cmdCopy(state: *anyopaque) anyerror!void {
     const doc = activeTextDoc(state) orelse return;
     if (doc.sel_start == doc.sel_end) return;
     dvui.clipboardTextSet(doc.text.items[doc.sel_start..doc.sel_end]);
+}
+fn cmdPasteEnabled(state: *anyopaque) bool {
+    const doc = activeTextDoc(state) orelse return false;
+    return doc.editor_focused;
 }
 fn cmdPaste(state: *anyopaque) anyerror!void {
     const doc = activeTextDoc(state) orelse return;
@@ -370,7 +395,7 @@ fn formatDocument(doc: *Document) void {
     };
     doc.sel_start = restore_cursor;
     doc.sel_end = restore_cursor;
-    doc.pending_cursor = restore_cursor;
+    doc.pending_sel = .collapsed(restore_cursor);
 }
 
 /// In-app "Edit" menu section (see `Host.registerMenuSection`) — only draws while the active
@@ -384,7 +409,7 @@ fn drawEditMenuSection(ctx: ?*anyopaque) anyerror!void {
     _ = ctx;
     if (!cmdFormatEnabled(plugin.state)) return;
 
-    if (sdk.host().drawMenuItem("Format Document", "format")) {
+    if (sdk.host().drawMenuItem("Format Document", sdk.Plugin.commandId("text", "format"))) {
         sdk.host().runCommand(sdk.Plugin.commandId("text", "format")) catch |err| {
             dvui.log.err("text: format command failed: {any}", .{err});
         };

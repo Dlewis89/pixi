@@ -446,11 +446,12 @@ pub fn logLine(self: *Host, level: std.log.Level, scope: []const u8, message: []
 }
 
 /// Draw a standard menu-item row inside the currently open menu; returns whether it was
-/// clicked. False (never drawn/clicked) when no shell is installed. See
+/// clicked. `command_id` names the `Command` the row runs, and the shell draws that command's
+/// current chord beside it. False (never drawn/clicked) when no shell is installed. See
 /// `EditorAPI.VTable.drawMenuItem`'s doc comment — `Host.registerMenuSection` draw callbacks
 /// must go through this instead of calling dvui's menu widgets directly.
-pub fn drawMenuItem(self: *Host, title: []const u8, keybind_name: ?[]const u8) bool {
-    return if (self.shell_api) |a| a.drawMenuItem(title, keybind_name) else false;
+pub fn drawMenuItem(self: *Host, title: []const u8, command_id: ?[]const u8) bool {
+    return if (self.shell_api) |a| a.drawMenuItem(title, command_id) else false;
 }
 
 // ---- per-plugin settings store ---------------------------------------------
@@ -677,11 +678,45 @@ pub fn registerFileIcon(self: *Host, drawer: FileIcon) !void {
     try self.file_icons.append(self.allocator, drawer);
 }
 
-/// Draw the file-tree row icon for `ext`/`path` via the first registered drawer that handles it.
-/// Returns true if a plugin drew it; false means the caller should draw a generic default.
+/// Draw the file-tree row icon for `ext`/`path`.
+///
+/// Order (first success wins):
+/// 1. Language plugin that claims the extension (tree-sitter or preview) → that plugin's logo
+/// 2. Explicit `registerFileIcon` drawers (pixi sprites, image glyph, text code glyph, …)
+/// 3. Specialized document owner (`fileTypePriority` below the text fallback) → that plugin's logo
+///
+/// Returns false when nothing claimed it — caller draws a generic filesystem default.
+/// **Caller must reserve a `core.dvui.treeRowGlyph` slot**; drawers use `expand = .ratio`.
 pub fn drawFileIcon(self: *Host, ext: []const u8, path: []const u8, color: dvui.Color) bool {
+    // Language plugins (zig, json, markdown, …) own the identity of their formats even when
+    // `text` owns the document — prefer their logo over the generic code glyph.
+    for (self.language_support.items) |*ls| {
+        const owner = ls.owner orelse continue;
+        var claimed = false;
+        if (ls.vtable.treeSitterHighlight) |hook| {
+            if (hook(owner.state, ext) != null) claimed = true;
+        }
+        if (!claimed) {
+            if (ls.vtable.supportsPreview) |supports| {
+                if (supports(owner.state, ext)) claimed = true;
+            }
+        }
+        if (!claimed) continue;
+        if (self.drawPluginIcon(owner.id)) return true;
+    }
+
     for (self.file_icons.items) |drawer| {
         if (drawer.draw(drawer.ctx, ext, path, color)) return true;
+    }
+
+    // Specialized document plugins (pixi, image, …) that didn't register a FileIcon drawer
+    // still get their logo when they uniquely claim the extension.
+    if (self.pluginForExtension(ext)) |p| {
+        if (p.fileTypePriority(ext)) |prio| {
+            if (prio < Plugin.file_type_fallback_priority) {
+                if (self.drawPluginIcon(p.id)) return true;
+            }
+        }
     }
     return false;
 }
@@ -895,6 +930,16 @@ pub fn previewProviderFor(self: *Host, ext: []const u8) ?*LanguageSupport {
         return ls;
     }
     return null;
+}
+
+/// Notify every language provider that a document was opened/reloaded. Providers gate on
+/// `ext` themselves (see `LanguageSupport.VTable.documentOpened`). Non-blocking.
+pub fn documentOpenedFor(self: *Host, ext: []const u8, path: []const u8, bytes: []const u8) void {
+    for (self.language_support.items) |*ls| {
+        const hook = ls.vtable.documentOpened orelse continue;
+        const owner = ls.owner orelse continue;
+        hook(owner.state, ext, path, bytes);
+    }
 }
 
 /// Non-blocking hover lookup: the first provider with a cached/ready hover result for
@@ -1326,6 +1371,16 @@ test "unregisterPlugin removes a plugin's contributions, service, and resets act
         }.f,
         .setString = struct {
             fn f(_: *anyopaque, _: usize, _: []const u8) void {}
+        }.f,
+        .getZonText = struct {
+            fn f(_: *anyopaque, _: usize, _: std.mem.Allocator) []const u8 {
+                return "";
+            }
+        }.f,
+        .setZonText = struct {
+            fn f(_: *anyopaque, _: usize, _: []const u8) bool {
+                return false;
+            }
         }.f,
         .persist = struct {
             fn f(_: *anyopaque, _: *Plugin) void {}

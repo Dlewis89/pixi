@@ -367,6 +367,7 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .{ "fizzy-layout-anchor-tests", "src/core/math/layout_anchor.zig" },
         .{ "fizzy-window-layout-tests", "src/backend/window_layout.zig" },
         .{ "fizzy-plugin-store-tests", "src/backend/plugin_store/store.zig" },
+        .{ "fizzy-paths-tests", "src/core/paths.zig" },
         .{ "fizzy-lsp-protocol-tests", "src/core/lsp/Protocol.zig" },
         .{ "fizzy-lsp-uri-tests", "src/core/lsp/UriUtil.zig" },
         .{ "fizzy-settings-plugins-zon-tests", "src/editor/SettingsPluginsZon.zig" },
@@ -374,6 +375,13 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         // below never reaches it (nothing in the graph forces `sdk.manifest`), so it
         // needs its own root either way.
         .{ "fizzy-sdk-manifest-tests", "src/sdk/manifest.zig" },
+        // The text plugin's headless editing model. Lives under src/plugins/ but is
+        // deliberately dvui-free (see textcore.zig), so it tests as pure logic from the
+        // app build. One root covers every file below it — they're relative imports.
+        .{ "fizzy-textcore-tests", "src/plugins/text/src/textcore/textcore.zig" },
+        // Keybinding parse/resolve core. Deliberately dvui-free (see keymap.zig) — dvui's
+        // keybind map can't express chords and is keyed by bind name, not command.
+        .{ "fizzy-keymap-tests", "src/editor/keymap/keymap.zig" },
     }) |entry| {
         try unit_test_artifacts.append(b.allocator, b.addTest(.{
             .name = entry[0],
@@ -481,7 +489,7 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .icons = icons_test,
         .backend = dvui_testing_dep.module("testing"),
     }, workbench_opts, fizzy_test_module);
-    _ = text_plugin.addStaticModule(b, target, optimize, .{
+    const text_module_test = text_plugin.addStaticModule(b, target, optimize, .{
         .dvui = dvui_testing_dep.module("dvui_testing"),
         .core = core_module_test,
         .sdk = sdk_module_test,
@@ -515,6 +523,15 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     integration_module.addImport("fizzy", fizzy_test_module);
     integration_module.addImport("dvui", dvui_testing_dep.module("dvui_testing"));
 
+    // The text plugin itself, so integration tests can drive its `TextEntryWidget` directly in
+    // a headless window. Its editing behavior splits in two: the *decisions* live in dvui-free
+    // `textcore/` and are unit-tested there, but applying them (buffer memmoves + selection
+    // arithmetic against a live `TextLayoutWidget`) only exists inside the widget, and that
+    // half needs real frames and real key/text events to exercise. Reuses the module already
+    // built above rather than rooting a second one at the widget — a file may belong to only
+    // one module per compilation, and the plugin's own module already owns it.
+    integration_module.addImport("text", text_module_test);
+
     const integration_tests = b.addTest(.{
         .name = "fizzy-integration-tests",
         .root_module = integration_module,
@@ -534,6 +551,45 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
 
     test_integration_step.dependOn(&b.addRunArtifact(integration_tests).step);
     check_integration_step.dependOn(&integration_tests.step);
+
+    // `zig build bench-text` — text editor frame-cost benchmark. Its own step, never wired into
+    // `test`/`test-all`: it prints timings instead of asserting, and the numbers are
+    // machine-dependent. Same headless harness as the integration tests, so it measures the
+    // real widget rather than a model of it. Compare runs only at equal `-Doptimize` — the C
+    // libraries inside dvui build at the app's optimize level (see the file's doc comment).
+    {
+        const bench_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("tests/bench/bench_text.zig"),
+        });
+        bench_module.addImport("dvui", dvui_testing_dep.module("dvui_testing"));
+        bench_module.addImport("text", text_module_test);
+        // The tree-sitter Zig queries the benchmark highlights with, taken from dvui's examples
+        // instead of vendoring a copy into the repo. The real editor gets its queries from the
+        // external `zig` language plugin; what the benchmark times (query + per-capture chunk
+        // emission) doesn't depend on which of the two supplied them.
+        bench_module.addAnonymousImport("ts_zig_queries", .{
+            .root_source_file = dvui_testing_dep.path("src/Examples/tree_sitter_zig_queries.scm"),
+        });
+        // The documents it benchmarks are this repo's own sources — `@embedFile` can't reach
+        // outside its package, so they arrive the same way.
+        bench_module.addAnonymousImport("sample_large", .{ .root_source_file = b.path("src/editor/Editor.zig") });
+        bench_module.addAnonymousImport("sample_small", .{ .root_source_file = b.path("src/App.zig") });
+
+        const bench_text = b.addTest(.{ .name = "fizzy-bench-text", .root_module = bench_module });
+        bench_text.root_module.link_libcpp = !target_is_windows_msvc;
+        if (target.result.os.tag == .windows) {
+            bench_text.root_module.linkSystemLibrary("comctl32", .{});
+        }
+
+        const bench_step = b.step("bench-text", "Benchmark the text editor's per-frame draw cost (prints timings)");
+        const run_bench = b.addRunArtifact(bench_text);
+        // Timings are the output — never serve a cached result, and don't let a parallel build
+        // step's CPU contention skew them.
+        run_bench.has_side_effects = true;
+        bench_step.dependOn(&run_bench.step);
+    }
 
     // Pure-logic tests that nevertheless sit in a file importing `dvui` (or the SDK)
     // can't join the unit layer, so they get their own roots here. Rooting at

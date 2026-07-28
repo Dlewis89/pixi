@@ -47,7 +47,7 @@ the first time; use it as reference after that.
 | `Plugin` | A plugin's identity + **vtable** of optional hooks. The shell calls these; a plugin implements only what it needs. |
 | `DocHandle` | Opaque handle to an open document: `{ ptr, id, owner: *Plugin }`. The shell stores these per tab and **routes every document operation to `owner`** — it never inspects `ptr`. |
 | `regions` | The contribution structs a plugin registers: `SidebarView`, `BottomView`, `CenterProvider`, `MenuContribution`, `Command`, `LanguageSupport`, … There is no settings region here — see `sdk.settings` below. |
-| `sdk.settings` (`settings.zig`) | Comptime settings API: `sdk.settings.Schema(struct { … })` derives a persisted-values type + a `SettingsSchema` you register with the Host. The shell's settings pane draws it for you — no hand-rolled dvui settings section. |
+| `sdk.settings` (`settings.zig`) | Comptime settings API: `sdk.settings.Schema(struct { … })` over `Value(T, .{ .description = … })` cells derives a persisted-values type + a `SettingsSchema` you register with the Host. The shell's settings pane draws it for you — no hand-rolled dvui settings section. |
 | `dylib` / `dvui_context` | The C-ABI entry contract + dvui-context injection used when a plugin is loaded as a runtime library. |
 
 **The shell owns no features.** Each frame it iterates the Host registries and draws whatever
@@ -327,15 +327,22 @@ fallback when a loaded plugin has no fetchable `ICON.png` (e.g. a sideloaded dyl
 
 There is no `registerSettingsSection` and no author-written settings schema in
 `plugin.zig.zon`. Persisted settings are declared as a plain Zig struct (build-options-style,
-comptime-derived), then registered from `register(host)`:
+comptime-derived) whose every field is a self-describing `sdk.settings.Value` cell, then
+registered from `register(host)`:
 
 ```zig
 const MySettings = sdk.settings.Schema(struct {
-    insert_spaces_on_tab: bool = true,
-    tab_size: enum(u8) { two = 2, four = 4, eight = 8 } = .four,
-    format_on_save: bool = false,
+    insert_spaces_on_tab: sdk.settings.Value(bool, .{
+        .description = "Insert spaces instead of a tab character when pressing Tab.",
+    }) = .init(true),
+    tab_size: sdk.settings.Value(enum(u8) { two = 2, four = 4, eight = 8 }, .{
+        .description = "How many columns a tab occupies.",
+    }) = .init(.four),
+    format_on_save: sdk.settings.Value(bool, .{
+        .description = "Reformat the document each time it is saved.",
+    }) = .init(false),
 });
-var settings: MySettings.Value = .{};
+var settings: MySettings.Cells = .{};
 
 pub fn register(host: *sdk.Host) !void {
     plugin.state = @ptrCast(&plugin_state);
@@ -347,17 +354,40 @@ pub fn register(host: *sdk.Host) !void {
         .value = &settings,                                // shell draws shared controls
     });
 }
+
+// Read a value with `.get()`, write one with `.set()`:
+if (settings.format_on_save.get()) formatDocument(doc);
 ```
 
-`Schema(T)` comptime-walks `T`'s fields (`bool`/`int`/`float`/`enum`/`[]const u8`) into a
-`Setting` table — each entry's `kind: Kind` is a `union(TypeTag)` carrying only the metadata that
+**Every setting describes itself.** A cell's second (comptime) parameter is
+`settings.Options{ description, name, min, max, step }`, and `description` has no default — a
+setting declared without one is a compile error. The pane has a permanent place for it (see the
+row shape below), so there is no shell-side table of strings that can drift from the plugin that
+owns the setting. Metadata lives entirely in the *type*: `@sizeOf(Value(T, …)) == @sizeOf(T)`,
+and only the payload is ever stored or persisted.
+
+The shell draws each setting as one group, VSCode-style: the name (derived from the field name —
+`insert_spaces_on_tab` → `Insert spaces on tab`, or `Options.name` to override), the zon key
+underneath in smaller dim mono, the wrapped description, and then the control at full width.
+Booleans are the exception — their checkbox sits before the description on one line. Both the
+name and the key are matched by the settings search, so users can find a row by either.
+
+`Schema(T)` comptime-walks `T`'s cells into a `Setting` table (`key`, `label`, `description`,
+`kind`) — each entry's `kind: Kind` is a `union(TypeTag)` carrying only the metadata that payload
 type actually uses (`IntKind{min,max,choices}`, `FloatKind{min,max,step}`, `EnumKind{choices}`,
-void for bool/string/color), rather than one flat struct with every type's bounds fields present
-on every entry — and generates `Value` (= `T`), `load`/`store` (a zon round-trip through
+void for bool/string/color/other), rather than one flat struct with every type's bounds fields
+present on every entry — and generates `Cells` (= `T`), `Payloads` (the bare-value mirror that is
+what actually round-trips through zon), `load`/`store` (through
 `Host.loadPluginSettings`/`storePluginSettings`), `applyZon` (parse a blob directly into the live
 value — the primitive `Access.applyBlob` wraps with a `settingsChanged` notification, used by
 external-change reconciliation, see below), and `register` (wires a `SettingsSchema` + typed
 `Access` vtable into the Host).
+
+**Any type is a legal setting.** `bool`/int/float/`enum`/`[]const u8` get dedicated controls;
+anything else `std.zon` can round-trip (a struct, an array, an optional) is `TypeTag.other` and
+the pane draws it as its zon text in an editable entry — text that doesn't parse simply doesn't
+commit. The on-disk shape is always the bare payload (`.tab_size = 8`), never the cell, so
+`settings.zon` files written before cells existed keep loading unchanged.
 
 Every plugin's block lives as a real, hand-editable nested ZON struct literal keyed by plugin
 id inside the shell's own `{config}/settings.zon`:
@@ -382,7 +412,7 @@ scalars/enums. Don't free a string field yourself, and don't assign one directly
 persisted — go through the settings pane or `applyZon`, or you'll leak the schema's copy.
 
 Author fields live under `.settings` so they can never collide with the shell-reserved
-`.enabled`. Only fields that differ from `T`'s own declared defaults are written; an all-default
+`.enabled`. Only fields whose payload differs from the cell's declared default is written; an all-default
 value removes that plugin's `.settings` (and if also disabled, the whole `.plugins.<id>` entry).
 `src/editor/SettingsPluginsZon.zig` locates/composes fields by source byte-span via the same
 `std.zig.Ast`/`ZonGen` machinery `std.zon.parse` uses, so nothing else in the file is
@@ -525,6 +555,30 @@ focusing a pixi doc runs `"pixi.copy"`; a second editor answers the same shell a
 registering its own `"<its_id>.copy"`, `…transform`, etc. An action the owner didn't register is
 simply a no-op for its documents.
 
+**Menu rows name a command, and get its chord for free.** A menu item is never told what
+shortcut to display — it names the command it runs and the shell resolves the chord from the
+live keymap, so a rebind in the Keyboard Shortcuts pane shows up in both menu bars immediately:
+
+```zig
+// in-app menu (inside a `registerMenuSection` draw callback)
+if (host.drawMenuItem("Grid Layout…", "pixi.gridLayout")) { … }
+
+// macOS NSMenu leaf
+try host.registerNativeMenuItem(.{ …, .command = "pixi.gridLayout", .sf_symbol = "square.grid.3x3", .run = … });
+```
+
+Both fields are optional; omit them for a row with no command behind it, which then simply
+carries no accelerator. `drawMenuItem`'s second parameter used to be a dvui *bind name* — a
+separate flat namespace plugin commands have no entry in — so it never resolved to anything.
+
+**Command palette flattening.** Document verbs that the shell forwards (`copy`, `paste`, `undo`,
+`redo`, `deleteSelection`, `acceptEdit`, `cancelEdit`) appear **once** in the palette as the
+Fizzy stub (`fizzy.copy`, …) — greyed when no active document offers that action. Plugin
+implementations (`text.copy`, `pixi.copy`, …) stay registered for dispatch/menus/keybinds but are
+hidden from the palette so the same title isn't listed N times. Verbs with no Fizzy stub
+(*Transform*, *Grid Layout*) show only the active owner's command when present. Global commands
+(`pixi.packProject`, `fizzy.save`, …) always appear as their own rows.
+
 ### 3.5 Memory: one allocator, one arena
 
 - **`host.allocator`** (== `sdk.allocator()`) — the persistent heap allocator. Use it for anything
@@ -588,6 +642,7 @@ Every hook is optional and independent — implement only what your plugin offer
 | `treeSitterHighlight(state, ext) ?TreeSitterHighlight` | Tree-sitter grammar, query, and capture→style table for syntax highlighting |
 | `previewPane(state, ext, bytes, id_extra, gpa) !void` | Draw a read-only preview pane (markdown render, JSON tree, …) |
 | `supportsPreview(state, ext) bool` | Optional gate; defaults to checking whether `previewPane` is populated |
+| `documentOpened(state, ext, path, bytes) void` | Non-blocking; fired when text opens/reloads a document — LSP plugins use this to spawn the server and `didOpen` before first hover |
 | `hover(state, ext, path, bytes, byte_offset) ?HoverResult` | Non-blocking; hover text for the token at `byte_offset`. Called every frame the mouse dwells over a token — see §3.9 |
 | `gotoDefinition(state, ext, path, bytes, byte_offset) ?DefinitionLocation` | May block briefly; Ctrl/Cmd-click jump target |
 | `completion(state, ext, path, bytes, byte_offset) ?[]const CompletionItem` | Non-blocking; ghost-text + dropdown candidates at the cursor |
@@ -596,8 +651,8 @@ Every hook is optional and independent — implement only what your plugin offer
 | `supportsFormat(state, ext) bool` | Non-blocking gate for a "Format Document" menu item |
 | `format(state, ext, path, bytes) ?[]const u8` | May block briefly; whole-document reformat on explicit user action |
 
-The text editor calls `host.treeSitterHighlightFor(ext)` and `host.previewProviderFor(ext)` —
-first registered provider that answers for the extension wins. When a preview provider exists,
+The text editor calls `host.treeSitterHighlightFor(ext)`, `host.previewProviderFor(ext)`, and
+`host.documentOpenedFor(ext, path, bytes)` (on open/reload). When a preview provider exists,
 `TextEditor` splits the tab into raw editor + preview panes. The `hover`/`gotoDefinition`/
 `completion`/`signatureHelp`/`format` hooks follow the same first-registered-provider-wins
 lookup, keyed off `ext`.
@@ -661,14 +716,16 @@ Then:
    `sdk.allocator()`/`sdk.host()` are valid; `Config` can't be a comptime default on the
    file-scope `var client: Client = .{};` every plugin declares for exactly that reason.
 2. Wire `client.onFolderOpen` / `client.onFolderClose` / `client.deinit` into your `Plugin`
-   vtable's `onFolderOpen` / `onFolderClose` / `deinit` — the client spawns/restarts the
-   server against the project root on folder open and tears it down on close/unload.
+   vtable's `onFolderOpen` / `onFolderClose` / `deinit` — the client updates/restarts against
+   the project root on folder open (spawn itself is lazy / warm-up-driven) and tears down on
+   close/unload.
 3. Register a `LanguageSupport` whose hooks are thin wrappers: gate on your extension list,
-   then delegate straight to the matching `client.*` method (`client.hover`, `.gotoDefinition`,
-   `.completion`, `.resolveCompletionDocumentation`, `.signatureHelp`, `.format`) — see
-   [`fizzyedit/zig`](https://github.com/fizzyedit/zig)'s `src/Lsp.zig` for the ~80-line
-   reference wrapper this pattern produces end to end, and its `plugin.zig` for wiring it into
-   `register(host)`.
+   then delegate straight to the matching `client.*` method. Implement `documentOpened` as
+   `client.warmUp(path, bytes)` so the server starts when a matching file is opened (not on
+   first hover). Other hooks map to `client.hover` / `.gotoDefinition` / `.completion` /
+   `.resolveCompletionDocumentation` / `.signatureHelp` / `.format` — see
+   [`fizzyedit/zig`](https://github.com/fizzyedit/zig)'s `src/Lsp.zig` for the reference
+   wrapper, and its `plugin.zig` for wiring it into `register(host)`.
 
 You do not need to handle JSON-RPC framing, threading, request/response id correlation,
 position-encoding negotiation, or server-initiated requests yourself — all of that is generic
@@ -928,7 +985,7 @@ drop straight into the plugins directory, exactly like §2.6.
 | `src/sdk/DocHandle.zig` | Opaque document handle (`owner`-routed) |
 | `src/sdk/EditorAPI.zig` | Shell read/utility surface plugins reach back through |
 | `src/sdk/regions.zig` | Sidebar/bottom/center/menu/settings/command contribution structs |
-| `src/sdk/language.zig` | `LanguageSupport` registry — hover/goto-definition/completion/signature-help/format/highlighting/preview hooks looked up by file extension |
+| `src/sdk/language.zig` | `LanguageSupport` registry — documentOpened/hover/goto-definition/completion/signature-help/format/highlighting/preview hooks looked up by file extension |
 | `src/core/lsp/Client.zig` | Server-agnostic LSP client (JSON-RPC framing, caching, threading) shared by every language plugin — see §3.9 |
 | `src/sdk/dylib.zig`, `dvui_context.zig` | Runtime-library C entry contract + dvui injection |
 | `src/sdk/version.zig` | SDK version + ABI fingerprint CI lock |

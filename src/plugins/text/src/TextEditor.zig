@@ -8,6 +8,7 @@ const plugin_impl = @import("../plugin.zig");
 const Document = @import("Document.zig");
 const SyntaxHighlight = @import("SyntaxHighlight.zig");
 const TextEntryWidget = @import("widgets/TextEntryWidget.zig");
+const tc = @import("textcore/textcore.zig");
 const TooltipWidget = @import("widgets/TooltipWidget.zig");
 const fuzzy = core.fuzzy;
 
@@ -151,7 +152,7 @@ fn drawEditor(doc: *Document, ext: []const u8, id_extra: u64, gpa: std.mem.Alloc
     }));
     const gutter_rs = gutter_wd.borderRectScale();
 
-    const out_of_band_edit = doc.pending_cursor != null;
+    const out_of_band_edit = doc.pending_sel != null;
     const tree_sitter_option = if (doc.text.items.len <= syntax_highlight_max_bytes)
         SyntaxHighlight.treeSitterOption(doc.path)
     else
@@ -190,10 +191,17 @@ fn drawEditor(doc: *Document, ext: []const u8, id_extra: u64, gpa: std.mem.Alloc
         // setting below only picks *what* it inserts (spaces vs a literal tab), not whether
         // it does so at all.
         .tab_inserts_indent = true,
-        .tab_size = @intFromEnum(plugin_impl.statePtr().settings.tab_size),
-        .insert_spaces = plugin_impl.statePtr().settings.insert_spaces_on_tab,
+        .tab_size = @intFromEnum(plugin_impl.statePtr().settings.tab_size.get()),
+        .insert_spaces = plugin_impl.statePtr().settings.insert_spaces_on_tab.get(),
         // Same VSCode-style baseline as Tab above — not gated by a setting.
         .auto_indent_newline = true,
+        .auto_close_pairs = plugin_impl.statePtr().settings.auto_close_brackets.get(),
+        // Purely visual — it never changes the document — so it's baseline-on like
+        // `auto_indent_newline` rather than another setting to find and toggle.
+        .highlight_matching_bracket = true,
+        // Indent-level rainbow from `core.palette.bracket` — same-kind pairs match; kinds
+        // at the same indent take different slots (and a scrambled walk vs the file tree).
+        .rainbow_brackets = true,
     }, chromeless.override(.{
         .expand = .both,
         .font = font,
@@ -230,10 +238,16 @@ fn drawEditor(doc: *Document, ext: []const u8, id_extra: u64, gpa: std.mem.Alloc
         te.text_changed = true;
     }
 
-    if (doc.pending_cursor) |pos| {
-        const clamped = @min(pos, doc.text.items.len);
-        te.textLayout.selection.* = .{ .start = clamped, .cursor = clamped, .end = clamped };
-        doc.pending_cursor = null;
+    if (doc.pending_sel) |r| {
+        const len = doc.text.items.len;
+        const head = @min(r.head, len);
+        const anchor = @min(r.anchor, len);
+        te.textLayout.selection.* = .{
+            .start = @min(anchor, head),
+            .cursor = head,
+            .end = @max(anchor, head),
+        };
+        doc.pending_sel = null;
     }
 
     te.processEvents();
@@ -270,6 +284,10 @@ fn drawEditor(doc: *Document, ext: []const u8, id_extra: u64, gpa: std.mem.Alloc
 
     doc.sel_start = te.textLayout.selection.start;
     doc.sel_end = te.textLayout.selection.end;
+    // Read before `te.deinit()` below, same as the selection: the shell's Copy/Paste routing
+    // asks the owner whether the verb is enabled, and this is the owner's answer to "is focus
+    // mine?" (see `Document.editor_focused`).
+    doc.editor_focused = dvui.focusedWidgetId() == te.data().id;
 
     const text_changed = te.text_changed;
     // `si` is a pointer into dvui's persistent per-widget-id data store (not a value owned by
@@ -1615,17 +1633,17 @@ fn drawHighlightedCode(tl: *dvui.TextLayoutWidget, code: []const u8, ts: sdk.Tre
 fn docFromCtx(ctx: *anyopaque) *Document {
     return @ptrCast(@alignCast(ctx));
 }
-fn editNotifyBegin(ctx: *anyopaque) void {
-    docFromCtx(ctx).history.begin();
+fn editNotifyBegin(ctx: *anyopaque, sel_before: tc.Range) void {
+    docFromCtx(ctx).history.begin(sel_before);
 }
 fn editNotifyRemoved(ctx: *anyopaque, pos: usize, bytes: []const u8) void {
-    docFromCtx(ctx).history.noteRemoved(sdk.allocator(), pos, bytes);
+    docFromCtx(ctx).history.note(sdk.allocator(), pos, bytes, "");
 }
 fn editNotifyInserted(ctx: *anyopaque, pos: usize, bytes: []const u8) void {
-    docFromCtx(ctx).history.noteInserted(sdk.allocator(), pos, bytes);
+    docFromCtx(ctx).history.note(sdk.allocator(), pos, "", bytes);
 }
-fn editNotifyEnd(ctx: *anyopaque) void {
-    docFromCtx(ctx).history.end(sdk.allocator());
+fn editNotifyEnd(ctx: *anyopaque, sel_after: tc.Range) void {
+    docFromCtx(ctx).history.end(sdk.allocator(), sel_after);
 }
 
 const max_text_bytes: usize = 64 * 1024 * 1024;
