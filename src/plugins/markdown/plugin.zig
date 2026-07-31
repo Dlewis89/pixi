@@ -10,6 +10,11 @@ const md = @import("src/markdown.zig");
 pub const Preview = md.Preview;
 pub const drawPreview = md.drawPreview;
 pub const drawPreviewForDocument = md.drawPreviewForDocument;
+/// Tears down preview state shared by every `Preview` (the remote-image cache and its worker
+/// threads). Fizzy's own copy of this module has no plugin lifecycle to hang it on, so
+/// `src/editor/readme.zig` calls it directly; this plugin's `deinit` does the same for the
+/// dylib copy's separate globals.
+pub const deinitShared = md.deinitShared;
 
 /// Injected at build time from `plugin.zig.zon` (see `static/integration.zig` /
 /// `src/plugins/shared/build/helpers.zig`'s `pluginOptions`) — one source of truth for
@@ -65,18 +70,20 @@ pub fn register(host: *sdk.Host) !void {
 fn deinit(state: *anyopaque) void {
     const st: *State = @ptrCast(@alignCast(state));
     st.destroy(sdk.allocator());
+    // Joins the remote-image fetch threads — they must not outlive this dylib.
+    md.deinitShared();
 }
 
 fn supportsPreview(_: *anyopaque, ext: []const u8) bool {
     return std.ascii.eqlIgnoreCase(ext, ".md") or std.ascii.eqlIgnoreCase(ext, ".markdown");
 }
 
-fn previewPane(state: *anyopaque, ext: []const u8, bytes: []const u8, id_extra: u64, gpa: std.mem.Allocator) !void {
+fn previewPane(state: *anyopaque, ext: []const u8, path: []const u8, bytes: []const u8, id_extra: u64, gpa: std.mem.Allocator) !void {
     _ = ext;
     const st: *State = @ptrCast(@alignCast(state));
     const gop = st.previews.getOrPut(gpa, id_extra) catch return error.OutOfMemory;
     if (!gop.found_existing) gop.value_ptr.* = .{};
-    md.drawPreviewForDocument(gop.value_ptr, sdk.language.previewDocumentPath(), bytes, gpa, .{
+    md.drawPreviewForDocument(gop.value_ptr, path, bytes, gpa, .{
         .io = dvui.io,
         .id_extra = id_extra,
     });

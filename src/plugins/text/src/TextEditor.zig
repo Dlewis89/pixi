@@ -33,12 +33,6 @@ pub fn draw(doc: *Document, id_extra: u64, gpa: std.mem.Allocator) !bool {
     const ext = std.fs.path.extension(doc.path);
     const preview = sdk.host().previewProviderFor(ext);
 
-    // Set for the duration of the draw so previewPane/hover/gotoDefinition providers can
-    // resolve this document's path (e.g. for relative-asset resolution or building an LSP
-    // file:// URI) without extending every hook's signature with an extra parameter.
-    sdk.language.setPreviewDocumentPath(doc.path);
-    defer sdk.language.setPreviewDocumentPath("");
-
     if (preview == null) {
         return drawEditor(doc, ext, id_extra, gpa);
     }
@@ -89,7 +83,7 @@ fn drawPreviewPane(
 ) !void {
     const hook = provider.vtable.previewPane orelse return;
     const owner = provider.owner orelse return;
-    try hook(owner.state, ext, doc.text.items, id_extra, gpa);
+    try hook(owner.state, ext, doc.path, doc.text.items, id_extra, gpa);
 }
 
 fn drawPreviewTogglePill(doc: *Document, id_extra: u64) void {
@@ -278,7 +272,7 @@ fn drawEditor(doc: *Document, ext: []const u8, id_extra: u64, gpa: std.mem.Alloc
 
     const editor_rs = row.data().borderRectScale();
     const scroll_rs = te.scroll.data().contentRectScale();
-    drawScrollEdgeShadows(editor_rs, scroll_rs, te.scroll.si);
+    core.dvui.drawScrollEdgeShadows(editor_rs, scroll_rs, te.scroll.si, .{});
 
     if (te.text_changed) doc.refreshLineCount();
 
@@ -1663,28 +1657,6 @@ fn lineNumberColumnWidth(line_count: usize, font: dvui.Font) f32 {
     var buf: [16]u8 = undefined;
     const sample = std.fmt.bufPrint(&buf, "{d}", .{line_count}) catch "9999";
     return line_number_pad_left + font.textSize(sample).w + text_gap_after_numbers;
-}
-
-fn drawScrollEdgeShadows(
-    vertical_rs: dvui.RectScale,
-    horizontal_rs: dvui.RectScale,
-    si: *const dvui.ScrollInfo,
-) void {
-    const vertical_scroll = si.offset(.vertical);
-    const horizontal_scroll = si.offset(.horizontal);
-
-    if (vertical_scroll > 0.0 and !vertical_rs.r.empty()) {
-        core.dvui.drawEdgeShadow(vertical_rs, .top, .{});
-    }
-    if (si.virtual_size.h > si.viewport.h and !vertical_rs.r.empty()) {
-        core.dvui.drawEdgeShadow(vertical_rs, .bottom, .{});
-    }
-    if (si.virtual_size.w > si.viewport.w and !horizontal_rs.r.empty()) {
-        core.dvui.drawEdgeShadow(horizontal_rs, .right, .{});
-    }
-    if (horizontal_scroll > 0.0 and !horizontal_rs.r.empty()) {
-        core.dvui.drawEdgeShadow(horizontal_rs, .left, .{});
-    }
 }
 
 fn drawLineNumbers(

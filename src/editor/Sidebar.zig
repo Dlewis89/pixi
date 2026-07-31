@@ -69,13 +69,10 @@ pub fn draw(_: Sidebar) !Action {
             if (a != .none) ret = a;
         }
 
-        const voff = scroll.si.offset(.vertical);
-        const vmax = scroll.si.scrollMax(.vertical);
+        const si = scroll.si.*;
         scroll.deinit();
 
-        const cs = pane.data().contentRectScale();
-        if (voff > 0.5) fizzy.dvui.drawEdgeShadow(cs, .top, .{});
-        if (voff < vmax - 0.5) fizzy.dvui.drawEdgeShadow(cs, .bottom, .{});
+        fizzy.dvui.drawScrollEdgeShadows(pane.data().contentRectScale(), null, &si, .{});
 
         pane.deinit();
     }

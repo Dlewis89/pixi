@@ -3,6 +3,7 @@ const dvui = @import("dvui");
 const builtin = @import("builtin");
 const icons = @import("icons");
 const platform = @import("platform.zig");
+const reveal_phase = @import("reveal.zig");
 
 pub const CanvasWidget = @import("widgets/CanvasWidget.zig");
 pub const ReorderWidget = @import("widgets/ReorderWidget.zig");
@@ -17,6 +18,238 @@ pub const TreeSelection = @import("widgets/TreeSelection.zig");
 /// animation origin (e.g. the New File flow animating from the tree row).
 pub var modal_dim_titlebar: bool = false;
 pub var dialog_close_rect_override: ?dvui.Rect.Physical = null;
+
+/// Hides a pane for the single frame dvui needs to lay out newly-swapped content, then fades it
+/// in — so switching store pages, document tabs or center providers reads as a quick cross-fade
+/// instead of a flash of half-built layout. See `core/reveal.zig` for why that frame exists.
+///
+/// `key` identifies *what* is being shown (a plugin id hash, a document id, a center id). A new
+/// key restarts the reveal; the same key every frame is free after the fade ends.
+///
+/// `id` must be a stable widget id for the pane itself — the reveal's own state lives under it.
+/// Typically the enclosing box's `data().id`, which does not change when the content does.
+///
+///     var pane = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both });
+///     defer pane.deinit();
+///     const rv = core.dvui.reveal(pane.data().id, doc_id, .{});
+///     defer rv.deinit();
+pub fn reveal(id: dvui.Id, key: u64, opts: RevealOptions) Reveal {
+    const anim_key = "fizzy_reveal";
+    const running = dvui.animationGet(id, anim_key) != null;
+
+    const prev_key = dvui.dataGet(null, id, "fizzy_reveal_key", u64);
+    const prev_phase = dvui.dataGet(null, id, "fizzy_reveal_phase", reveal_phase.Phase) orelse .shown;
+    const phase = reveal_phase.next(prev_key, key, prev_phase, running);
+
+    dvui.dataSet(null, id, "fizzy_reveal_key", key);
+    dvui.dataSet(null, id, "fizzy_reveal_phase", phase);
+
+    switch (phase) {
+        .hidden => {
+            // Nothing to animate yet — this frame exists only so dvui can measure. Ask for the
+            // next one, otherwise an idle app would sleep with the pane still invisible.
+            dvui.refresh(null, @src(), id);
+            return .{ .prev_alpha = dvui.alpha(0), .value = 0 };
+        },
+        .fading => {
+            if (!running) {
+                dvui.animation(id, anim_key, .{ .start_time = 0, .end_time = opts.duration_micros });
+            }
+            const v = if (dvui.animationGet(id, anim_key)) |a| std.math.clamp(a.value(), 0, 1) else 1;
+            return .{ .prev_alpha = dvui.alpha(v), .value = v };
+        },
+        .shown => return .{ .prev_alpha = dvui.currentWindow().alpha, .value = 1 },
+    }
+}
+
+pub const RevealOptions = struct {
+    /// Short on purpose: long enough to hide the settle frame and read as intentional, short
+    /// enough that switching tabs still feels instant. Matches `CanvasWidget`'s reveal.
+    duration_micros: i32 = 120_000,
+};
+
+/// Restores the alpha `reveal` multiplied. Always `defer`red immediately after the call.
+pub const Reveal = struct {
+    prev_alpha: f32,
+    /// How far the fade has got, 0 (hidden) to 1 (fully revealed).
+    value: f32,
+
+    pub fn deinit(self: Reveal) void {
+        dvui.alphaSet(self.prev_alpha);
+    }
+
+};
+
+/// A cross-fade between two entirely different subtrees, for swaps where revealing the incoming
+/// content is not enough on its own.
+///
+/// `reveal` works when the pane's chrome stays put and only its contents change (a document tab,
+/// a store page). It cannot work when the *background is part of what changes*: center providers
+/// each paint their own pane — the workbench's document canvas is square and full-bleed, the
+/// homepage, the pack-project window and the store's detail page are rounded cards — so fading
+/// the incoming one up from nothing exposes the window behind it, and the corner shape visibly
+/// changes mid-swap. There is no backdrop the host could draw that is right for both.
+///
+/// So don't guess: keep the outgoing pixels. The last frame of the outgoing provider is recorded
+/// into a texture (`dvui.Picture` redirects rendering into a render target), then drawn *over*
+/// the incoming provider and faded out. Nothing is ever transparent, no shape is assumed, and the
+/// incoming subtree's settle frame happens underneath a fully opaque snapshot.
+///
+/// Prefer `transition` for call sites — it owns swap detection, capture isolation, and teardown.
+/// `CrossFade` remains the low-level primitive those helpers drive.
+///
+/// The caller owns the state (one per swapping region) and must `discard` it on teardown.
+pub const CrossFade = struct {
+    /// Owned outright — not in dvui's texture cache, so it survives across frames and must be
+    /// destroyed explicitly.
+    texture: ?dvui.Texture = null,
+    /// Physical rect matching the captured texture exactly (`Picture.start` enlarges to pixel
+    /// boundaries; blitting a smaller rect would sample the wrong UVs).
+    rect: dvui.Rect.Physical = .{},
+    start_ns: i128 = 0,
+    duration_ns: i128 = 150 * std.time.ns_per_ms,
+
+    /// Begin recording the outgoing content instead of drawing it. Null when the backend has no
+    /// texture targets (web) or the region is empty — callers then swap without a fade, which is
+    /// exactly the old behaviour rather than a broken one.
+    pub fn beginCapture(rect: dvui.Rect.Physical) ?dvui.Picture {
+        var pic = dvui.Picture.start(rect) orelse return null;
+        // `textureCreateTarget` claims to start transparent, but some backends leave
+        // `textureClearTarget` unimplemented — clear explicitly so pixel-boundary padding
+        // around the content never samples uninitialized target memory.
+        pic.texture.clear();
+        return pic;
+    }
+
+    /// Take ownership of what `beginCapture` recorded.
+    ///
+    /// Deliberately not `dvui.Picture.deinit`, which draws the texture and destroys it — the
+    /// whole point is to keep it for later frames. Any snapshot still fading is dropped first,
+    /// so switching rapidly always fades from the most recent frame rather than stacking.
+    ///
+    /// The blit rect is `pic.r` (the pixel-enlarged capture), not the caller's original rect —
+    /// those can disagree by up to 1px per edge after `Picture.start`'s `@floor`/`@ceil`.
+    pub fn endCapture(self: *CrossFade, pic: *dvui.Picture) void {
+        pic.stop();
+        // Consumes the render target (destroying it) and hands back a sampleable texture.
+        const tex = dvui.textureFromTarget(pic.texture) catch return;
+        self.discard();
+        self.texture = tex;
+        self.rect = pic.r;
+        self.start_ns = dvui.currentWindow().frame_time_ns;
+    }
+
+    /// Draw the outgoing snapshot over what was just drawn, fading out. Call last, and every
+    /// frame — it is a no-op with nothing captured.
+    pub fn draw(self: *CrossFade) void {
+        const tex = self.texture orelse return;
+
+        const elapsed = dvui.currentWindow().frame_time_ns - self.start_ns;
+        if (elapsed >= self.duration_ns or self.duration_ns <= 0) {
+            self.discard();
+            return;
+        }
+        const t: f32 = @floatCast(@as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(self.duration_ns)));
+
+        dvui.renderTexture(tex, .{ .r = self.rect, .s = 1 }, .{
+            .colormod = dvui.Color.white.opacity(1 - dvui.easing.outQuad(t)),
+        }) catch {};
+
+        // Nothing else is animating, so without this an idle app would sleep mid-fade.
+        dvui.refresh(null, @src(), null);
+    }
+
+    pub fn discard(self: *CrossFade) void {
+        if (self.texture) |tex| dvui.Texture.destroyLater(tex);
+        self.texture = null;
+    }
+};
+
+/// Host-owned state for one "one of N screens" region. Pair with `transition` each frame.
+pub const Transition = struct {
+    cross_fade: CrossFade = .{},
+    prev_key: ?u64 = null,
+
+    pub fn discard(self: *Transition) void {
+        self.cross_fade.discard();
+        self.prev_key = null;
+    }
+};
+
+pub const TransitionOptions = struct {
+    /// Identifies *what* is showing now (hash of a center id, document id, …). A new key on a
+    /// subsequent frame triggers the capture of `draw_previous`.
+    key: u64,
+    /// Physical region to capture / blit. Typically the parent's `contentRectScale().r`.
+    rect: dvui.Rect.Physical,
+    /// How to draw the *outgoing* screen. Called only on the swap frame, and only when the
+    /// backend supports render targets. Ignored when `key` is unchanged or this is the first
+    /// frame for the region.
+    ///
+    /// Must run under the **same parent** the screen used last frame (stable widget ids). A
+    /// temporary isolate parent gives every widget a new id, which restarts `reveal` at alpha 0
+    /// and freezes min-size caches — the capture comes out empty/wrong and there is no fade.
+    draw_previous: ?*const fn (*anyopaque) void = null,
+    /// Called after a successful capture, before the incoming screen packs. Use it to clear the
+    /// parent's pack state so the capture's expanded child does not make the incoming one trip
+    /// `rectFor() got child after expanded child`.
+    after_capture: ?*const fn (*anyopaque) void = null,
+    ctx: *anyopaque = undefined,
+};
+
+/// Per-frame handle from `transition`. `defer` its `deinit` so the snapshot is blitted after
+/// the incoming content draws.
+pub const TransitionFrame = struct {
+    cross_fade: *CrossFade,
+
+    pub fn deinit(self: *TransitionFrame) void {
+        self.cross_fade.draw();
+    }
+};
+
+/// Cross-fade between screens in a host-owned region. Plugins draw normally; the host wraps the
+/// swap so the outgoing frame is captured and faded out over the incoming one.
+///
+///     var frame = core.dvui.transition(&state, .{
+///         .key = current_key,
+///         .rect = rs.r,
+///         .draw_previous = drawOutgoing,
+///         .ctx = ctx,
+///     });
+///     defer frame.deinit();
+///     drawIncoming();
+///
+/// On backends without render targets the capture is skipped and the swap is instant — same as
+/// before `CrossFade` existed.
+///
+/// The capture pass re-draws the outgoing screen under the **current parent** so widget ids match
+/// last frame (`reveal` stays shown, min-size caches stay warm). That packs an expanded child
+/// into the parent; the caller must clear pack state in `after_capture` before drawing the
+/// incoming screen, or dvui logs `rectFor() got child after expanded child` and paints a red
+/// `errorOutline`.
+pub fn transition(state: *Transition, opts: TransitionOptions) TransitionFrame {
+    const had_prev = state.prev_key != null;
+    const key_changed = !had_prev or state.prev_key.? != opts.key;
+
+    if (had_prev and key_changed) {
+        if (opts.draw_previous) |draw_prev| {
+            if (CrossFade.beginCapture(opts.rect)) |captured| {
+                var pic = captured;
+                // Match CacheWidget: clip to the capture region so we don't paint outside the
+                // target, and restore afterward so the incoming screen sees the normal clip.
+                const prev_clip = dvui.clipGet();
+                dvui.clipSet(opts.rect);
+                draw_prev(opts.ctx);
+                dvui.clipSet(prev_clip);
+                state.cross_fade.endCapture(&pic);
+                if (opts.after_capture) |cb| cb(opts.ctx);
+            }
+        }
+    }
+
+    state.prev_key = opts.key;
+    return .{ .cross_fade = &state.cross_fade };
+}
 
 /// Side of the square every glyph in a tree row occupies — the expand/collapse caret, a folder
 /// or file-type icon, a plugin's own icon, the app logo, or a letter standing in for a missing
@@ -1324,5 +1557,53 @@ pub fn drawEdgeShadow(container: dvui.RectScale, shadow: Shadow, opts: ShadowOpt
             rs.r = rs.r.plus(.cast(opts.offset));
             drawGradientRect(rs.r, dvui.CornerRect.Physical.all(opts.radius), opts, .{ .axis = .x, .opaque_at_zero = true });
         },
+    }
+}
+
+/// Scroll offsets are floats that rarely land exactly on their limit, so comparing them bare
+/// makes an edge hint flicker on and off by a fraction of a pixel at the extremes.
+const scroll_edge_epsilon: f32 = 0.5;
+
+/// Draw "there is more content this way" hints on whichever edges of a scroll viewport actually
+/// have content past them: `top` once scrolled away from the start, `bottom` while the end is
+/// still below the viewport, and likewise `left`/`right`. An axis whose content already fits gets
+/// nothing, and neither does an edge you have already scrolled to.
+///
+/// **This is the one definition of that behaviour.** Every viewport in the app routes through it
+/// so they can't drift: explorer, sidebar, both store panes, the text editor, markdown previews,
+/// and the workspace's recents list. Most of those previously hand-rolled it, and several tested
+/// only `virtual_size > viewport` for the bottom/right edge — which left the hint showing even
+/// when scrolled all the way to that end, telling the user there was more to see when there
+/// wasn't. Call this instead of `drawEdgeShadow` for anything that is a scroll viewport; reach
+/// for `drawEdgeShadow` directly only for shadows that aren't about hidden scroll content (the
+/// workspace draws one between the active tab and its neighbours, for instance).
+///
+/// Call it *after* the scroll area's content is drawn so the hints sit on top of it. Pass `null`
+/// for an axis that doesn't scroll. The two rects are separate because some panes hint the two
+/// axes over different areas — the explorer's horizontal hint spans a box its vertical one
+/// doesn't, and the text editor's excludes the line-number gutter.
+pub fn drawScrollEdgeShadows(
+    vertical_rs: ?dvui.RectScale,
+    horizontal_rs: ?dvui.RectScale,
+    si: *const dvui.ScrollInfo,
+    opts: ShadowOptions,
+) void {
+    if (vertical_rs) |rs| {
+        if (!rs.r.empty() and si.virtual_size.h > si.viewport.h) {
+            const off = si.offset(.vertical);
+            if (off > scroll_edge_epsilon) drawEdgeShadow(rs, .top, opts);
+            if (off + si.viewport.h < si.virtual_size.h - scroll_edge_epsilon) {
+                drawEdgeShadow(rs, .bottom, opts);
+            }
+        }
+    }
+    if (horizontal_rs) |rs| {
+        if (!rs.r.empty() and si.virtual_size.w > si.viewport.w) {
+            const off = si.offset(.horizontal);
+            if (off > scroll_edge_epsilon) drawEdgeShadow(rs, .left, opts);
+            if (off + si.viewport.w < si.virtual_size.w - scroll_edge_epsilon) {
+                drawEdgeShadow(rs, .right, opts);
+            }
+        }
     }
 }

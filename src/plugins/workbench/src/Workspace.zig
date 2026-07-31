@@ -760,6 +760,21 @@ pub fn drawCanvas(self: *Workspace) !void {
         }
 
         if (runtime.host().docByIndex(self.open_file_index)) |doc| {
+            // Switching tabs hands the pane an entirely different widget subtree, which dvui
+            // can only size from the previous frame's min-size cache — so the new document
+            // draws once at the wrong size before snapping. Hide that frame and cross-fade
+            // instead. See `core/reveal.zig`.
+            //
+            // The reveal's own id is source-derived and keyed by pane, deliberately not
+            // `canvas_vbox`'s: that box's id moves with the surrounding layout (panel toggles,
+            // splits), which would restart the fade on changes that aren't content swaps.
+            const rv = core.dvui.reveal(
+                dvui.Id.extendId(null, @src(), @truncate(self.grouping)),
+                doc.id,
+                .{},
+            );
+            defer rv.deinit();
+
             doc.owner.bindDocumentToPane(doc, canvas_vbox.data().id, self, self.center);
             _ = try doc.owner.drawDocument(doc);
         }
@@ -958,17 +973,10 @@ pub fn drawHomePage(_: *Workspace) !void {
                 .background = false,
                 .color_fill = .transparent,
             });
-            defer scroll_area.deinit();
-
-            // Draw edge shadow for the scroll area content, using the scroll_area's rectScale.
-            if (scroll_area.si.virtual_size.h > scroll_area.si.viewport.h) {
-                if (scroll_area.si.offset(.vertical) + scroll_area.si.viewport.h < scroll_area.si.virtual_size.h) {
-                    wdvui.drawEdgeShadow(scroll_area.data().rectScale(), .bottom, .{ .opacity = 0.15 });
-                }
-                if (scroll_area.si.offset(.vertical) > 0) {
-                    wdvui.drawEdgeShadow(scroll_area.data().rectScale(), .top, .{ .opacity = 0.15 });
-                }
-            }
+            // Captured before `deinit`; the hints are drawn after the buttons below so they sit
+            // over them. This block used to draw them here, before its own content, which put
+            // them underneath it.
+            const scroll_rs = scroll_area.data().rectScale();
 
             var i: usize = runtime.host().recentFolderCount();
             while (i > 0) : (i -= 1) {
@@ -999,6 +1007,12 @@ pub fn drawHomePage(_: *Workspace) !void {
                     try runtime.host().setProjectFolder(folder);
                 }
             }
+
+            const si = scroll_area.si.*;
+            scroll_area.deinit();
+            // Faint on purpose here (the list sits on the empty-workspace backdrop, not in a
+            // panel), unlike the default weight every other viewport uses.
+            wdvui.drawScrollEdgeShadows(scroll_rs, null, &si, .{ .opacity = 0.15 });
         }
     }
 }

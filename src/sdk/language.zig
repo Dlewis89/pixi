@@ -8,27 +8,6 @@ const dvui = @import("dvui");
 const core = @import("core");
 const Plugin = @import("Plugin.zig");
 
-/// Set by the text plugin immediately before calling `previewPane`; cleared after return.
-/// Lets preview providers resolve relative assets (e.g. `![x](assets/foo.png)`) next to the
-/// document without extending the vtable on every content edit.
-///
-/// NOTE: this only works because `previewPane`'s only consumers today (`text`/`markdown`)
-/// happen to be statically linked into the same binary and so share one copy of this
-/// `threadlocal`. It is NOT a valid way to pass data to a genuinely dynamically-loaded
-/// plugin dylib — each `.dylib` gets its own private compiled copy of every SDK source file,
-/// so a write from the host's copy is invisible from inside the plugin's copy.
-/// `hover`/`gotoDefinition` take `path` as an explicit parameter instead, precisely
-/// because third-party language plugins (e.g. `zig`) *are* loaded as separate dylibs.
-threadlocal var preview_document_path: []const u8 = "";
-
-pub fn setPreviewDocumentPath(path: []const u8) void {
-    preview_document_path = path;
-}
-
-pub fn previewDocumentPath() []const u8 {
-    return preview_document_path;
-}
-
 pub const HighlightStyle = struct {
     name: []const u8,
     opts: dvui.Options,
@@ -70,8 +49,13 @@ pub const LanguageSupport = struct {
         /// Draw a read-only preview into the current dvui parent for the right-hand pane
         /// of a text|preview split. `bytes` is the live document text (re-called every
         /// frame the pane is visible, so a provider should cache its own parse internally
-        /// keyed by content hash).
-        previewPane: ?*const fn (state: *anyopaque, ext: []const u8, bytes: []const u8, id_extra: u64, gpa: std.mem.Allocator) anyerror!void = null,
+        /// keyed by content hash). `path` is the document's path — empty for an unsaved
+        /// buffer — and is what a preview resolves relative assets against (markdown's
+        /// `![x](assets/foo.png)`). Like `hover`/`gotoDefinition` it is passed explicitly
+        /// rather than through shared SDK state: preview providers are commonly separate
+        /// dylibs, and each `.dylib` gets its own private copy of every SDK global, so a
+        /// write from the host's copy is invisible inside the plugin's.
+        previewPane: ?*const fn (state: *anyopaque, ext: []const u8, path: []const u8, bytes: []const u8, id_extra: u64, gpa: std.mem.Allocator) anyerror!void = null,
         /// Non-blocking: called when the text editor opens (or reloads) a document. Intended
         /// for language-server warmup — spawn the server and send `textDocument/didOpen` so
         /// analysis can start before the first hover/completion, rather than paying cold-start
@@ -87,10 +71,8 @@ pub const LanguageSupport = struct {
         /// (don't ask again for this exact position/content until it changes), `Some` with
         /// real text once content lands. When the cache is populated from a background
         /// thread, call `sdk.refresh()` so the idle GUI wakes and redraws (mouse may not move
-        /// again). `bytes` is the live document text, same convention as `previewPane`.
-        /// `path` is passed explicitly (unlike `previewPane`)
-        /// because language providers are commonly loaded as separate plugin dylibs — see the
-        /// `preview_document_path` doc comment above for why a threadlocal can't be reused here.
+        /// again). `bytes` is the live document text and `path` the document's path, same
+        /// convention as `previewPane`.
         hover: ?*const fn (state: *anyopaque, ext: []const u8, path: []const u8, bytes: []const u8, byte_offset: usize) ?HoverResult = null,
         /// May block briefly (a few hundred ms) — called once per Ctrl/Cmd+click, not every
         /// frame. Returns the definition location for the symbol at `byte_offset` in `bytes`

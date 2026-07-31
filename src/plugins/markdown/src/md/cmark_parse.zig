@@ -76,6 +76,13 @@ pub const Node = struct {
     pub fn taskListItemChecked(n: Node) bool {
         return c.cmark_gfm_extensions_get_tasklist_item_checked(n.n);
     }
+
+    /// True for a `- [ ]` / `- [x]` item. The tasklist extension takes ownership of the ITEM
+    /// node and overrides its type string, which is the only way to tell an *unchecked* task
+    /// item from a plain bullet (`taskListItemChecked` returns false for both).
+    pub fn isTaskListItem(n: Node) bool {
+        return std.mem.eql(u8, n.typeString(), "tasklist");
+    }
 };
 
 pub const CMarkAst = struct {

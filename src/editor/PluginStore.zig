@@ -13,7 +13,8 @@ const icons = @import("icons");
 const fizzy = @import("../fizzy.zig");
 const store = @import("../backend/plugin_store/store.zig");
 const PluginLoader = @import("PluginLoader.zig");
-const fuzzy = @import("core").fuzzy;
+const core = @import("core");
+const fuzzy = core.fuzzy;
 
 const compat = store.compat;
 const version = sdk.version;
@@ -74,6 +75,25 @@ var prev_installed_shown: usize = 0;
 
 var store_scroll_info: dvui.ScrollInfo = .{ .horizontal = .auto };
 var installed_scroll_info: dvui.ScrollInfo = .{ .horizontal = .auto };
+/// Detail-page header: scrolls sideways below `detail_header_min_w` instead of crushing the
+/// info column (and wrapping the description into a skyscraper). Vertical is never owned here.
+var detail_header_scroll: dvui.ScrollInfo = .{ .horizontal = .auto, .vertical = .none };
+/// `hashId` of the entry whose header `detail_header_scroll` last showed — used to zero the
+/// horizontal offset on page switches so a scrolled-over previous plugin doesn't leave you
+/// looking at the middle of the next one's header.
+var detail_header_scroll_entry: usize = 0;
+
+/// Floor under the detail header row (logo + info + install controls). The header *expands*
+/// with the pane above this; below it the scroll area takes over horizontally. Same role as
+/// `card_min_w` on the list cards — a stable content min, not a viewport-locked width.
+const detail_header_min_w: f32 = 480;
+
+/// Applied as `max_size_content.w` on header text so labels/layouts don't report their full
+/// unwrapped width as min size (which would inflate the header past `detail_header_min_w` and
+/// make the horizontal scrollbar appear while the pane is still wider than the floor). Same
+/// trick as `card_text_no_floor` — see that comment. The widgets still *draw* at the info
+/// column's real (expanded) width via `.expand = .horizontal`.
+const detail_header_text_no_floor: f32 = 1;
 
 /// Transient status line shown in the header (e.g. an action error). Module-owned buffer.
 var status_message: [256]u8 = undefined;
@@ -319,9 +339,9 @@ pub fn register(host: *sdk.Host) !void {
 /// Center provider: a VSCode marketplace-style detail page for the selected plugin. Active only
 /// while `tick` has swapped us in (store tab active + a plugin selected). Same rounded,
 /// content-colored "window" chrome every other center provider uses (`sdk.pane_layout.emptyStateCard`'s
-/// corners + top/bottom margin) so this page sizes and insets identically to the workbench
-/// homepage — just stacked vertically (header/tabs/content) instead of that helper's horizontal
-/// direction, so it isn't reused directly.
+/// corners, flush to the top of the center region) so this page sizes and insets identically to
+/// the workbench homepage — just stacked vertically (header/tabs/content) instead of that
+/// helper's horizontal direction, so it isn't reused directly.
 fn drawReadmeCenter(_: ?*anyopaque) anyerror!dvui.App.Result {
     const host = &fizzy.editor.host;
     var content_color = dvui.themeGet().color(.window, .fill);
@@ -337,7 +357,6 @@ fn drawReadmeCenter(_: ?*anyopaque) anyerror!dvui.App.Result {
         .background = true,
         .color_fill = content_color,
         .corners = dvui.CornerRect.all(16),
-        .margin = .{ .y = 10 },
         .id_extra = hashId(readme_center_id),
     });
     defer pane.deinit();
@@ -345,6 +364,12 @@ fn drawReadmeCenter(_: ?*anyopaque) anyerror!dvui.App.Result {
     const cat = if (catalog) |*c| c else return .ok;
     const snapshot = cat.acquire();
     defer cat.release();
+
+    // Switching pages swaps the whole subtree (header, tabs, README), so hide the settle frame
+    // and cross-fade rather than letting it flash. Keyed on the selection, so re-rendering the
+    // same page every frame costs nothing.
+    const rv = core.dvui.reveal(pane.data().id, revealKey(), .{});
+    defer rv.deinit();
 
     const entry = selectedEntry(snapshot) orelse {
         dvui.labelNoFmt(@src(), "Select a plugin to see its details.", .{}, .{
@@ -386,14 +411,54 @@ fn drawReadmeCenter(_: ?*anyopaque) anyerror!dvui.App.Result {
 /// VSCode-marketplace-style header: logo, then a stacked name/id/author/description column, with
 /// the same install/update/uninstall controls the card list uses (`drawCardControls`) pinned to
 /// the top-right.
+///
+/// Width is left to dvui the same way list cards are: the row has a stable
+/// `min_size_content = detail_header_min_w` and `.expand = .horizontal`, so it fills the pane
+/// while there's room and only the scroll area engages once the viewport drops below that
+/// floor. Text uses `detail_header_text_no_floor` so unwrapped label widths never inflate the
+/// min and flash the scrollbar mid-resize. Title/id stay single-line (ellipsize); the
+/// description still wraps within the (expanded) info column.
 fn drawDetailHeader(entry: StoreEntry) void {
     const theme = dvui.themeGet();
     const muted = theme.color(.window, .text).opacity(0.7);
 
+    // ScrollInfo defaults can be clobbered if a prior frame left vertical enabled; pin both.
+    detail_header_scroll.horizontal = .auto;
+    detail_header_scroll.vertical = .none;
+    const entry_key = hashId(entry.id);
+    if (detail_header_scroll_entry != entry_key) {
+        detail_header_scroll_entry = entry_key;
+        detail_header_scroll.viewport.x = 0;
+    }
+
+    var scroll = dvui.scrollArea(@src(), .{
+        .scroll_info = &detail_header_scroll,
+        // Overlay: the bar floats over the bottom padding instead of packing into the layout
+        // and growing the header's height when it appears.
+        .horizontal_bar = .auto_overlay,
+        .vertical_bar = .hide,
+    }, .{
+        // Width follows the pane; height follows the header content.
+        .expand = .horizontal,
+        .background = false,
+    });
+    defer scroll.deinit();
+
+    // Deliberately *not* keyed by `entry.id`, unlike the cards in the list: there is only ever
+    // one detail header, and a per-entry id made it a brand-new widget on every page switch —
+    // with no min size cached from the previous frame it laid out at zero height, which is the
+    // one frame of headerless page users saw before it snapped. A stable id keeps the cache.
+    //
+    // Expand to fill the scroll viewport when wider than the floor; report a fixed min so the
+    // scrollbar only appears once the pane is actually narrower than the content can go. Do
+    // *not* lock min=max to the viewport — that made wrap width track the resize every frame and
+    // flashed the scrollbar whenever a long token briefly exceeded the shrinking column.
     var header_box = dvui.box(@src(), .{ .dir = .horizontal }, .{
         .expand = .horizontal,
-        .padding = .{ .x = 16, .y = 16, .w = 16, .h = 8 },
-        .id_extra = hashId(entry.id),
+        .min_size_content = .{ .w = detail_header_min_w },
+        // Bottom padding matches top and leaves a strip for the overlay horizontal bar to sit
+        // in without covering the description.
+        .padding = .{ .x = 16, .y = 16, .w = 16, .h = 16 },
     });
     defer header_box.deinit();
 
@@ -426,8 +491,9 @@ fn drawDetailHeader(entry: StoreEntry) void {
     // to zero width (see `drawCard`'s comment on this exact ordering).
     drawCardControls(entry);
 
-    // 3. Stacked info: name (large, settings-root-style), id (small mono, dim), author (dim),
-    // then the wrapped description.
+    // 3. Stacked info: name (large), id (small mono), author, description. Expands into whatever
+    // the row has left after logo + controls; text min-widths are capped so they can't push the
+    // row's reported min past `detail_header_min_w`.
     {
         var info = dvui.box(@src(), .{ .dir = .vertical }, .{
             .expand = .horizontal,
@@ -436,9 +502,12 @@ fn drawDetailHeader(entry: StoreEntry) void {
         defer info.deinit();
 
         const title_font = dvui.Font.theme(.body);
+        // Single-line ellipsize (LabelWidget default) — wrapping the display-size title to one
+        // word per line was the resize hitch that made the scrollbar appear mid-drag.
         dvui.labelNoFmt(@src(), entry.title, .{}, .{
             .font = title_font.withSize(title_font.size * 3 - 1).withWeight(.bold),
             .expand = .horizontal,
+            .max_size_content = .{ .w = detail_header_text_no_floor, .h = std.math.floatMax(f32) },
             .margin = dvui.Rect.all(0),
             .padding = .{ .h = 2 },
         });
@@ -446,6 +515,7 @@ fn drawDetailHeader(entry: StoreEntry) void {
             .font = dvui.Font.theme(.mono),
             .color_text = muted,
             .expand = .horizontal,
+            .max_size_content = .{ .w = detail_header_text_no_floor, .h = std.math.floatMax(f32) },
             .margin = dvui.Rect.all(0),
             .padding = .{ .h = 4 },
         });
@@ -454,6 +524,8 @@ fn drawDetailHeader(entry: StoreEntry) void {
             var tl = dvui.textLayout(@src(), .{ .break_lines = true }, .{
                 .background = false,
                 .expand = .horizontal,
+                // Cap reported min width; wrap still uses the real expanded column width.
+                .max_size_content = .{ .w = detail_header_text_no_floor, .h = std.math.floatMax(f32) },
                 .margin = dvui.Rect.all(0),
                 // `TextLayoutWidget`'s own default padding is `Rect.all(6)` — unlike the labels
                 // above, which each override `.padding` down to just a bottom gap (`.{ .h = N }`,
@@ -489,8 +561,12 @@ fn drawAuthorLine(entry: StoreEntry, muted: dvui.Color) void {
     const author = authorFor(entry);
     if (publisher == null and author == null) return;
 
+    // Expand the row (not the individual links) so credit names stay packed on the left —
+    // `expand = .horizontal` on both publisher and author made them split the row and look
+    // centered. Cap the row's reported min so long names can't inflate the header floor.
     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
         .expand = .horizontal,
+        .max_size_content = .{ .w = detail_header_text_no_floor, .h = std.math.floatMax(f32) },
         .margin = dvui.Rect.all(0),
         .padding = .{ .h = 6 },
     });
@@ -521,11 +597,16 @@ fn drawAuthorLine(entry: StoreEntry, muted: dvui.Color) void {
     }
 }
 
-/// One name in the credit line — a plain dim label, or a clickable one when `url` is non-null.
+/// One name in the credit line — a plain dim label, or an underlined highlight-colored link when
+/// `url` is non-null. Styling matches the text plugin's hover-doc links (`TextEditor.zig`):
+/// `Font.withUnderline` + `color(.highlight, .fill)`, so every clickable bit of prose in the app
+/// reads the same way. A name with nowhere to go stays deliberately unstyled — underlining
+/// something unclickable is worse than leaving it plain.
 fn drawCreditLink(src: std.builtin.SourceLocation, text: []const u8, url: ?[]const u8, muted: dvui.Color) void {
+    const body = dvui.Font.theme(.body);
     const target = url orelse {
         dvui.labelNoFmt(src, text, .{}, .{
-            .font = dvui.Font.theme(.body),
+            .font = body,
             .color_text = muted,
             .gravity_y = 0.5,
             .margin = dvui.Rect.all(0),
@@ -535,8 +616,8 @@ fn drawCreditLink(src: std.builtin.SourceLocation, text: []const u8, url: ?[]con
     };
 
     if (dvui.labelClick(src, "{s}", .{text}, .{}, .{
-        .font = dvui.Font.theme(.body),
-        .color_text = muted,
+        .font = body.withUnderline(.{}),
+        .color_text = dvui.themeGet().color(.highlight, .fill),
         .gravity_y = 0.5,
         .margin = dvui.Rect.all(0),
         .padding = dvui.Rect.all(0),
@@ -1055,6 +1136,14 @@ fn hashId(id: []const u8) usize {
     return @truncate(std.hash.Wyhash.hash(0, id));
 }
 
+/// What the detail page is currently showing, as a reveal key: the selected plugin *and* the
+/// open tab, since switching tabs swaps the body subtree just as much as switching plugins does.
+fn revealKey() u64 {
+    var h = std.hash.Wyhash.init(@intFromEnum(selected_detail_tab));
+    h.update(Readme.selectedId() orelse "");
+    return h.final();
+}
+
 fn containsId(entries: []const StoreEntry, id: []const u8) bool {
     for (entries) |e| {
         if (std.mem.eql(u8, e.id, id)) return true;
@@ -1451,14 +1540,10 @@ fn drawStoreSection(entries: []const StoreEntry, filter_text: []const u8) usize 
         );
     }
 
-    const vertical_scroll = scroll.si.offset(.vertical);
-    const horizontal_scroll = scroll.si.offset(.horizontal);
     scroll.deinit();
 
-    if (vertical_scroll > 0.0) fizzy.dvui.drawEdgeShadow(pane_box.data().contentRectScale(), .top, .{});
-    if (store_scroll_info.virtual_size.h > store_scroll_info.viewport.h) fizzy.dvui.drawEdgeShadow(pane_box.data().contentRectScale(), .bottom, .{});
-    if (store_scroll_info.virtual_size.w > store_scroll_info.viewport.w) fizzy.dvui.drawEdgeShadow(pane_box.data().contentRectScale(), .right, .{});
-    if (horizontal_scroll > 0.0) fizzy.dvui.drawEdgeShadow(pane_box.data().contentRectScale(), .left, .{});
+    const rs = pane_box.data().contentRectScale();
+    fizzy.dvui.drawScrollEdgeShadows(rs, rs, &store_scroll_info, .{});
 
     return shown;
 }
@@ -1512,14 +1597,10 @@ fn drawInstalledSection(entries: []const StoreEntry, filter_text: []const u8) us
         );
     }
 
-    const vertical_scroll = scroll.si.offset(.vertical);
-    const horizontal_scroll = scroll.si.offset(.horizontal);
     scroll.deinit();
 
-    if (vertical_scroll > 0.0) fizzy.dvui.drawEdgeShadow(pane_box.data().contentRectScale(), .top, .{});
-    if (installed_scroll_info.virtual_size.h > installed_scroll_info.viewport.h) fizzy.dvui.drawEdgeShadow(pane_box.data().contentRectScale(), .bottom, .{});
-    if (installed_scroll_info.virtual_size.w > installed_scroll_info.viewport.w) fizzy.dvui.drawEdgeShadow(pane_box.data().contentRectScale(), .right, .{});
-    if (horizontal_scroll > 0.0) fizzy.dvui.drawEdgeShadow(pane_box.data().contentRectScale(), .left, .{});
+    const rs = pane_box.data().contentRectScale();
+    fizzy.dvui.drawScrollEdgeShadows(rs, rs, &installed_scroll_info, .{});
 
     return shown;
 }
@@ -1764,7 +1845,13 @@ fn drawCardShell(entry: StoreEntry, controls: *const fn (StoreEntry) void, row2_
                     std.fmt.bufPrint(&fail_buf, "Failed to load: {s} ({s})", .{ f.reason, d }) catch f.reason
                 else
                     std.fmt.bufPrint(&fail_buf, "Failed to load: {s}", .{f.reason}) catch f.reason;
-                var fail_tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .background = false, .margin = .{ .x = 4 } });
+                const fail_font = dvui.Font.theme(.body);
+                var fail_tl = dvui.textLayout(@src(), .{}, .{
+                    .expand = .horizontal,
+                    .background = false,
+                    .margin = .{ .x = 4 },
+                    .font = fail_font.withSize(fail_font.size - 1),
+                });
                 fail_tl.addText(fail_text, .{ .color_text = theme.color(.err, .text) });
                 fail_tl.deinit();
             };

@@ -29,6 +29,11 @@ const Readme = struct {
     /// `status` to `ready` with release ordering; read on the UI thread only after an acquire
     /// load sees `ready`, so no lock is needed for the bytes themselves.
     bytes: ?[]u8 = null,
+    /// Where the README was found — the dev-tree directory, or the raw URL it was fetched from.
+    /// Written by the worker alongside `bytes`; the preview resolves the README's own relative
+    /// images (`![shot](assets/shot.png)`) against it, which for the fetched case means pulling
+    /// them from the same repo over HTTPS.
+    image_base: ?[]u8 = null,
     thread: ?std.Thread = null,
     preview: markdown.Preview = .{},
 
@@ -81,6 +86,10 @@ pub fn selectedId() ?[]const u8 {
 
 pub fn deinit() void {
     clearCurrent();
+    // Joins the markdown engine's remote-image fetch threads. Fizzy links its *own* copy of the
+    // markdown module for this pane (the plugin's dylib copy has separate globals and is torn
+    // down by the plugin's own `deinit`), so this copy has no plugin lifecycle to ride on.
+    markdown.deinitShared();
 }
 
 /// Drop the current selection (e.g. the store "back" button).
@@ -97,6 +106,7 @@ fn clearCurrent() void {
         }
         c.preview.deinit();
         if (c.bytes) |b| gpa.free(b);
+        if (c.image_base) |b| gpa.free(b);
         gpa.free(c.id);
         gpa.free(c.repo);
         gpa.free(c.subpath);
@@ -141,7 +151,11 @@ pub fn draw() void {
             // Transparent — the store's detail page draws its own background behind this
             // (matching every other pane in the app); without this the preview's own scroll
             // area painted a visibly different `.content`-styled fill on top of it.
-            markdown.drawPreview(&c.preview, bytes, repo_asset.gpa(), .{ .io = c.io, .background = false });
+            markdown.drawPreview(&c.preview, bytes, repo_asset.gpa(), .{
+                .io = c.io,
+                .background = false,
+                .image_base_dir = c.image_base orelse ".",
+            });
         },
     }
 }
@@ -152,8 +166,9 @@ fn worker(self: *Readme) void {
     const limit: std.Io.Limit = .limited(repo_asset.max_readme_bytes);
 
     if (self.subpath.len > 0) {
-        if (repo_asset.readLocalAsset(self.io, self.subpath, readme_filename, limit)) |body| {
-            self.bytes = body;
+        if (repo_asset.readLocalAsset(self.io, self.subpath, readme_filename, limit)) |asset| {
+            self.bytes = asset.bytes;
+            self.image_base = asset.dir;
             self.status.store(@intFromEnum(Status.ready), .release);
             return;
         }
@@ -168,6 +183,8 @@ fn worker(self: *Readme) void {
     for (candidates.slice()) |url| {
         if (repo_asset.fetchOk(self.io, url, limit)) |body| {
             self.bytes = body;
+            // `url` lives in the worker's stack buffer — the preview needs it every frame.
+            self.image_base = repo_asset.gpa().dupe(u8, url) catch null;
             self.status.store(@intFromEnum(Status.ready), .release);
             return;
         }

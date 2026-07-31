@@ -6,6 +6,9 @@ const dvui = @import("dvui");
 const sdk = @import("fizzy_sdk");
 
 const md = @import("cmark_parse.zig");
+const net_image = @import("net_image.zig");
+const html_images_mod = @import("html_images.zig");
+const url_join = @import("url_join.zig");
 
 const is_windows = builtin.target.os.tag == .windows;
 
@@ -28,6 +31,13 @@ pub const RenderState = struct {
     /// @intFromPtr(table_node.n) → column count (from header row).
     /// Avoids re-traversing the header row every render frame.
     table_col_counts: std.AutoHashMapUnmanaged(usize, usize) = .empty,
+    /// @intFromPtr(item_node.n) → checked, for `- [ ]` / `- [x]` items only.
+    /// Absence means "plain bullet", which is what distinguishes an *unchecked* task item
+    /// from a normal one (both report `taskListItemChecked() == false`).
+    task_items: std.AutoHashMapUnmanaged(usize, bool) = .empty,
+    /// @intFromPtr(html_node.n) → every `<img>` in that raw-HTML node (src + requested size), in
+    /// document order (gpa-owned). Absent when the node has no `<img>`.
+    html_images: std.AutoHashMapUnmanaged(usize, []html_images_mod.Image) = .empty,
 
     pub fn deinit(self: *RenderState, gpa: std.mem.Allocator) void {
         self.clear(gpa);
@@ -36,6 +46,8 @@ pub const RenderState = struct {
         self.ext_node_kinds.deinit(gpa);
         self.subtree_has_image.deinit(gpa);
         self.table_col_counts.deinit(gpa);
+        self.task_items.deinit(gpa);
+        self.html_images.deinit(gpa);
     }
 
     pub fn clear(self: *RenderState, gpa: std.mem.Allocator) void {
@@ -49,6 +61,10 @@ pub const RenderState = struct {
         self.ext_node_kinds.clearRetainingCapacity();
         self.subtree_has_image.clearRetainingCapacity();
         self.table_col_counts.clearRetainingCapacity();
+        self.task_items.clearRetainingCapacity();
+        var hi = self.html_images.valueIterator();
+        while (hi.next()) |urls| html_images_mod.free(urls.*, gpa);
+        self.html_images.clearRetainingCapacity();
     }
 };
 
@@ -62,7 +78,9 @@ const IdGen = struct {
 };
 
 pub const RenderContext = struct {
-    /// Directory of the markdown file (for resolving relative `![alt](path)`).
+    /// What relative `![alt](path)` images resolve against: the markdown file's directory, or —
+    /// for a document fetched over the network, like the store's README pane — the URL it came
+    /// from (`https://…/README.md`), in which case relative images are fetched, not read.
     image_base_dir: ?[]const u8 = null,
     io: Io,
     /// Persistent allocator (same lifetime as State).  Used for image cache.
@@ -71,7 +89,22 @@ pub const RenderContext = struct {
     rs: *RenderState,
     /// Seed for per-document widget id_extra values (avoids collisions with other panes/docs).
     id_base: usize = 0,
+    /// Whether *text* widgets paint their own fill. Mirrors `markdown.PreviewOptions.background`,
+    /// and has to be threaded all the way down here rather than just applied to the preview's
+    /// scroll area: `dvui.TextLayoutWidget.defaults.background` is **true**, so every single
+    /// `textLayout` paints a fill of its own unless explicitly told not to. Suppressing only the
+    /// scroll area's fill therefore left every paragraph, heading, and caption drawing its own
+    /// panel — which is exactly what "background = false" was meant to get rid of.
+    ///
+    /// Deliberate decorative fills are *not* governed by this and stay on regardless: the code
+    /// block's surrounding panel, the HTML-block tint, table header/row banding, and task
+    /// bullets. Those are part of how the element reads, not a background behind the text.
+    background: bool = true,
 };
+
+/// Top/bottom margin every paragraph's `textLayout` carries. List markers match the top half so
+/// they line up with the paragraph they label (see `CMARK_NODE_LIST`).
+const paragraph_margin_y: f32 = 4;
 
 const max_image_bytes: usize = 16 * 1024 * 1024;
 const max_image_display_width: f32 = 720;
@@ -122,7 +155,25 @@ pub fn scanNode(node: md.Node, rs: *RenderState, gpa: std.mem.Allocator) bool {
     else if (std.mem.eql(u8, ts, "strikethrough"))
         rs.ext_node_kinds.put(gpa, @intFromPtr(node.n), .strikethrough) catch {};
 
+    if (node.nodeType() == md.c.CMARK_NODE_ITEM and node.isTaskListItem())
+        rs.task_items.put(gpa, @intFromPtr(node.n), node.taskListItemChecked()) catch {};
+
     var self_has_image = (node.nodeType() == md.c.CMARK_NODE_IMAGE);
+
+    // Raw HTML: GitHub READMEs routinely wrap their hero image in `<p align="center"><img …>`,
+    // which cmark hands us as an opaque HTML block. Pull the `<img src>` URLs out once here so
+    // rendering can show the actual images instead of the raw markup.
+    if (node.nodeType() == md.c.CMARK_NODE_HTML_BLOCK or node.nodeType() == md.c.CMARK_NODE_HTML_INLINE) {
+        if (node.literal()) |html| {
+            if (html_images_mod.collect(html, gpa)) |urls| {
+                rs.html_images.put(gpa, @intFromPtr(node.n), urls) catch {
+                    html_images_mod.free(urls, gpa);
+                };
+                self_has_image = true;
+            }
+        }
+    }
+
     var child = node.firstChild();
     while (child) |ch| : (child = ch.nextSibling()) {
         if (scanNode(ch, rs, gpa)) self_has_image = true;
@@ -148,8 +199,11 @@ pub fn preloadImages(root: md.Node, ctx: RenderContext) void {
 
 fn preloadImageSubtree(node: md.Node, ctx: RenderContext, arena: std.mem.Allocator) void {
     if (node.nodeType() == md.c.CMARK_NODE_IMAGE) {
-        preloadSingleImage(node, ctx, arena);
+        if (node.linkUrl()) |url| preloadSingleImage(url, ctx, arena);
         return;
+    }
+    if (ctx.rs.html_images.get(@intFromPtr(node.n))) |urls| {
+        for (urls) |html_img| preloadSingleImage(html_img.src, ctx, arena);
     }
     if (!ctx.rs.subtree_has_image.contains(@intFromPtr(node.n))) return;
     var child = node.firstChild();
@@ -158,33 +212,14 @@ fn preloadImageSubtree(node: md.Node, ctx: RenderContext, arena: std.mem.Allocat
     }
 }
 
-fn preloadSingleImage(img: md.Node, ctx: RenderContext, arena: std.mem.Allocator) void {
-    const raw_url = img.linkUrl() orelse return;
-    const abs_path = resolvedLocalImagePath(ctx, arena, raw_url) orelse return;
-
-    const bytes: []const u8 = blk: {
-        if (ctx.rs.image_cache.get(abs_path)) |cached| break :blk cached;
-        const fresh = Io.Dir.cwd().readFileAlloc(ctx.io, abs_path, ctx.gpa, .limited(max_image_bytes)) catch return;
-        const key = ctx.gpa.dupe(u8, abs_path) catch {
-            ctx.gpa.free(fresh);
-            return;
-        };
-        ctx.rs.image_cache.put(ctx.gpa, key, fresh) catch {
-            ctx.gpa.free(key);
-            ctx.gpa.free(fresh);
-            return;
-        };
-        break :blk fresh;
+fn preloadSingleImage(raw_url: []const u8, ctx: RenderContext, arena: std.mem.Allocator) void {
+    const resolved = resolveImageBytes(ctx, arena, raw_url);
+    const bytes = switch (resolved) {
+        .bytes => |b| b,
+        else => return,
     };
 
-    const dvui_key: dvui.Texture.Cache.Key = blk: {
-        var h = dvui.fnv.init();
-        const bp = bytes.ptr;
-        h.update(std.mem.asBytes(&bp));
-        const it = @intFromEnum(dvui.enums.TextureInterpolation.linear);
-        h.update(std.mem.asBytes(&it));
-        break :blk h.final();
-    };
+    const dvui_key = textureCacheKey(bytes);
 
     // Cache hit: texture already warm this frame, nothing to do.
     if (dvui.textureGetCached(dvui_key) != null) return;
@@ -192,7 +227,7 @@ fn preloadSingleImage(img: md.Node, ctx: RenderContext, arena: std.mem.Allocator
     // Cache miss: decode + GPU upload now so the animation first frame is free.
     const source: dvui.ImageSource = .{ .imageFile = .{
         .bytes = bytes,
-        .name = abs_path,
+        .name = raw_url,
         .invalidation = .ptr,
     } };
     const tex = dvui.Texture.fromImageSource(source) catch return;
@@ -203,6 +238,17 @@ fn preloadSingleImage(img: md.Node, ctx: RenderContext, arena: std.mem.Allocator
     dvui.textureAddToCache(dvui_key, tex);
 }
 
+/// The cache key dvui uses for an `imageFile` source with `.ptr` invalidation. dvui's own
+/// `hash()` calls stbi_info and then ignores the result for `.ptr`, so it's skipped entirely.
+fn textureCacheKey(bytes: []const u8) dvui.Texture.Cache.Key {
+    var h = dvui.fnv.init();
+    const bp = bytes.ptr;
+    h.update(std.mem.asBytes(&bp));
+    const it = @intFromEnum(dvui.enums.TextureInterpolation.linear);
+    h.update(std.mem.asBytes(&it));
+    return h.final();
+}
+
 // ---------------------------------------------------------------------------
 // Image rendering helpers
 // ---------------------------------------------------------------------------
@@ -210,12 +256,62 @@ fn preloadSingleImage(img: md.Node, ctx: RenderContext, arena: std.mem.Allocator
 fn resolvedLocalImagePath(ctx: RenderContext, arena: std.mem.Allocator, src: []const u8) ?[]const u8 {
     const t = std.mem.trim(u8, src, " \t\r\n");
     if (t.len == 0) return null;
-    if (std.ascii.startsWithIgnoreCase(t, "http://")) return null;
-    if (std.ascii.startsWithIgnoreCase(t, "https://")) return null;
+    if (net_image.isRemote(t)) return null;
     if (std.fs.path.isAbsolute(t))
         return std.fs.path.resolve(arena, &.{t}) catch null;
     const base = ctx.image_base_dir orelse return null;
     return std.fs.path.resolve(arena, &.{ base, t }) catch null;
+}
+
+/// Encoded image bytes for one image URL, or why there aren't any (yet).
+const ResolvedImage = union(enum) {
+    bytes: []const u8,
+    /// Remote fetch still running — caller should draw a placeholder and come back next frame.
+    pending,
+    /// User-facing reason the image can't be shown.
+    message: []const u8,
+};
+
+/// Bytes for `raw_url`, from the persistent local-file cache or the remote fetcher. Never blocks:
+/// a remote URL that hasn't landed yet returns `.pending`.
+fn resolveImageBytes(ctx: RenderContext, arena: std.mem.Allocator, raw_url: []const u8) ResolvedImage {
+    const url = std.mem.trim(u8, raw_url, " \t\r\n");
+    if (url.len == 0) return .{ .message = "(empty image src)" };
+
+    // A README fetched from a repo has a *URL* for a base, not a directory — its relative image
+    // paths only resolve against that URL (see `RenderContext.image_base_dir`).
+    const remote_url: ?[]const u8 = if (net_image.isRemote(url))
+        url
+    else if (ctx.image_base_dir) |base| blk: {
+        if (!net_image.isRemote(base)) break :blk null;
+        break :blk url_join.resolve(arena, base, url) orelse return .{ .message = "cannot resolve image url" };
+    } else null;
+
+    if (remote_url) |u| {
+        return switch (net_image.request(ctx.gpa, u)) {
+            .pending => .pending,
+            .failed => .{ .message = "could not fetch image" },
+            .ready => |b| .{ .bytes = b },
+        };
+    }
+
+    const abs_path = resolvedLocalImagePath(ctx, arena, url) orelse
+        return .{ .message = "cannot resolve image path (save file or use absolute path)" };
+
+    if (ctx.rs.image_cache.get(abs_path)) |cached| return .{ .bytes = cached };
+
+    const fresh = Io.Dir.cwd().readFileAlloc(ctx.io, abs_path, ctx.gpa, .limited(max_image_bytes)) catch
+        return .{ .message = "could not read image" };
+    const key = ctx.gpa.dupe(u8, abs_path) catch {
+        ctx.gpa.free(fresh);
+        return .{ .message = "could not read image" };
+    };
+    ctx.rs.image_cache.put(ctx.gpa, key, fresh) catch {
+        ctx.gpa.free(key);
+        ctx.gpa.free(fresh);
+        return .{ .message = "could not cache image" };
+    };
+    return .{ .bytes = fresh };
 }
 
 /// Clickable markdown hyperlink. `file://` URLs (including zls hover's `file:///path#L12`
@@ -389,6 +485,40 @@ fn renderMarkdownImagePlaceholder(msg: []const u8, ids: *IdGen) void {
 
 fn renderMarkdownImage(img: md.Node, span: dvui.Options, ctx: RenderContext, ids: *IdGen) void {
     _ = span;
+    const arena = dvui.currentWindow().arena();
+    const raw_url = img.linkUrl() orelse {
+        var outer = dvui.box(@src(), .{ .dir = .vertical }, .{
+            .expand = .horizontal,
+            .margin = .{ .y = 4, .h = 4 },
+            .id_extra = ids.next(),
+        });
+        defer outer.deinit();
+        renderMarkdownImagePlaceholder("(missing image src)", ids);
+        return;
+    };
+    const alt = linkLabelPlainText(img, arena) catch "";
+    renderImageUrl(raw_url, alt, .{}, ctx, ids);
+}
+
+/// A `Dim` in points. Percentages are resolved against `basis` (the image's natural width/height
+/// — see the call site); pixel counts are absolute. Null when the markup asked for nothing.
+fn resolveRequested(dim: ?html_images_mod.Dim, basis: f32) ?f32 {
+    return switch (dim orelse return null) {
+        .px => |px| px,
+        .fraction => |f| if (basis > 0) basis * f else null,
+    };
+}
+
+/// Size the markup asked for, when it did. Only raw HTML can: `![alt](url)` has no syntax for it.
+const RequestedSize = struct {
+    width: ?html_images_mod.Dim = null,
+    height: ?html_images_mod.Dim = null,
+    alignment: ?html_images_mod.Align = null,
+};
+
+/// Draw one image by URL — local path or remote — with an optional caption. Shared by
+/// `![alt](url)` and by `<img src>` pulled out of raw HTML.
+fn renderImageUrl(raw_url: []const u8, alt: []const u8, want: RequestedSize, ctx: RenderContext, ids: *IdGen) void {
     var outer = dvui.box(@src(), .{ .dir = .vertical }, .{
         .expand = .horizontal,
         .margin = .{ .y = 4, .h = 4 },
@@ -396,73 +526,36 @@ fn renderMarkdownImage(img: md.Node, span: dvui.Options, ctx: RenderContext, ids
     });
     defer outer.deinit();
 
+    // Hard ceiling so an unconstrained (or still-too-large) image can't take over the pane.
+    // Percentage widths are *not* resolved against this — see below.
+    const avail_w = outer.data().contentRect().w;
+
     const arena = dvui.currentWindow().arena();
-    const raw_url = img.linkUrl() orelse {
-        renderMarkdownImagePlaceholder("(missing image src)", ids);
-        return;
-    };
     const url_trim = std.mem.trim(u8, raw_url, " \t\r\n");
-    if (url_trim.len == 0) {
-        renderMarkdownImagePlaceholder("(empty image src)", ids);
-        return;
-    }
 
-    const alt_owned = linkLabelPlainText(img, arena) catch "";
-    const alt: []const u8 = alt_owned;
-
-    if (std.ascii.startsWithIgnoreCase(url_trim, "http://") or std.ascii.startsWithIgnoreCase(url_trim, "https://")) {
-        var tl = dvui.textLayout(@src(), .{}, .{
-            .expand = .horizontal,
-            .id_extra = ids.next(),
-        });
-        defer tl.deinit();
-        if (alt.len > 0) {
-            tl.addText(alt, .{ .color_text = dvui.themeGet().color(.control, .text).opacity(0.85) });
-            tl.addText(" ", .{});
-        }
-        addMarkdownLink(tl, url_trim, "open", .{
-            .font = dvui.Font.theme(.mono),
-        });
-        return;
-    }
-
-    const abs_path = resolvedLocalImagePath(ctx, arena, url_trim) orelse {
-        renderMarkdownImagePlaceholder("cannot resolve image path (save file or use absolute path)", ids);
-        return;
+    const bytes: []const u8 = switch (resolveImageBytes(ctx, arena, url_trim)) {
+        .bytes => |b| b,
+        .pending => {
+            renderMarkdownImagePlaceholder("loading image…", ids);
+            return;
+        },
+        .message => |msg| {
+            renderMarkdownImagePlaceholder(msg, ids);
+            // A remote image that failed to load is still worth reaching: offer the link.
+            if (net_image.isRemote(url_trim)) {
+                var tl = dvui.textLayout(@src(), .{}, .{
+                    .expand = .horizontal,
+                    .background = ctx.background,
+                    .id_extra = ids.next(),
+                });
+                defer tl.deinit();
+                addMarkdownLink(tl, url_trim, "open", .{ .font = dvui.Font.theme(.mono) });
+            }
+            return;
+        },
     };
 
-    // Use persistent cache to avoid reading the file every frame.
-    const bytes: []const u8 = blk: {
-        if (ctx.rs.image_cache.get(abs_path)) |cached| break :blk cached;
-
-        const fresh = Io.Dir.cwd().readFileAlloc(ctx.io, abs_path, ctx.gpa, .limited(max_image_bytes)) catch {
-            renderMarkdownImagePlaceholder("could not read image", ids);
-            return;
-        };
-        const key = ctx.gpa.dupe(u8, abs_path) catch {
-            ctx.gpa.free(fresh);
-            renderMarkdownImagePlaceholder("could not read image", ids);
-            return;
-        };
-        ctx.rs.image_cache.put(ctx.gpa, key, fresh) catch {
-            ctx.gpa.free(key);
-            ctx.gpa.free(fresh);
-            renderMarkdownImagePlaceholder("could not cache image", ids);
-            return;
-        };
-        break :blk fresh;
-    };
-
-    // Compute the same cache key dvui uses for this imageFile with .ptr invalidation.
-    // dvui's hash() calls stbi_info but ignores the result for .ptr — we skip it entirely.
-    const dvui_key: dvui.Texture.Cache.Key = blk: {
-        var h = dvui.fnv.init();
-        const bp = bytes.ptr;
-        h.update(std.mem.asBytes(&bp));
-        const it = @intFromEnum(dvui.enums.TextureInterpolation.linear);
-        h.update(std.mem.asBytes(&it));
-        break :blk h.final();
-    };
+    const dvui_key = textureCacheKey(bytes);
 
     // Fast path: texture already in dvui's cache from a prior visible frame.
     // Use .texture source to bypass hash()/stbi_info entirely on this frame.
@@ -470,7 +563,7 @@ fn renderMarkdownImage(img: md.Node, span: dvui.Options, ctx: RenderContext, ids
     // lazily inside renderImage (only when the image is actually in the clip rect).
     var source: dvui.ImageSource = .{ .imageFile = .{
         .bytes = bytes,
-        .name = abs_path,
+        .name = url_trim,
         .invalidation = .ptr,
     } };
     const nat: dvui.Size = if (dvui.textureGetCached(dvui_key)) |tex| nat: {
@@ -494,17 +587,37 @@ fn renderMarkdownImage(img: md.Node, span: dvui.Options, ctx: RenderContext, ids
     }
 
     const r = nat.w / nat.h;
-    const max_fit_w = @min(max_image_display_width, max_image_display_height * r);
-    const max_fit_h = @min(max_image_display_height, max_image_display_width / r);
 
-    const scale = @min(1.0, @min(max_fit_w / nat.w, max_fit_h / nat.h));
-    const dw = nat.w * scale;
-    const dh = nat.h * scale;
+    // `width="25%"` is treated as a scale of the image's *intrinsic* size, not of the pane —
+    // so a logo stays a constant 25% of itself as the store/center is resized. (Resolving
+    // against the containing block made the pixi hero grow and shrink with the pane.) A size
+    // the markup asked for still wins over the natural size; the pane is only a fit ceiling.
+    const requested_w: ?f32 = resolveRequested(want.width, nat.w);
+    const requested_h: ?f32 = resolveRequested(want.height, nat.h);
+    const target_w: f32 = requested_w orelse
+        if (requested_h) |h| h * r else @min(nat.w, max_image_display_width);
+    const target_h: f32 = if (requested_w == null and requested_h != null) requested_h.? else target_w / r;
+
+    const ceiling_w = if (avail_w > 0) @min(avail_w, max_image_display_width) else max_image_display_width;
+    const ceiling_h = max_image_display_height;
+    const fit = @min(1.0, @min(ceiling_w / target_w, ceiling_h / target_h));
+    const dw = target_w * fit;
+    const dh = target_h * fit;
+
+    // `.expand = .ratio` would grow the image back out to whatever rect the parent hands it,
+    // ignoring the size computed above (this is what kept the pixi hero at full size despite its
+    // `width="25%"`). The size *is* the answer here, so ask for exactly it.
+    const gravity_x: f32 = switch (want.alignment orelse .left) {
+        .left => 0,
+        .center => 0.5,
+        .right => 1,
+    };
 
     _ = dvui.image(@src(), .{ .source = source, .shrink = .ratio }, .{
         .min_size_content = .{ .w = dw, .h = dh },
-        .max_size_content = dvui.Options.MaxSize.size(.{ .w = max_fit_w, .h = max_fit_h }),
-        .expand = .ratio,
+        .max_size_content = dvui.Options.MaxSize.size(.{ .w = dw, .h = dh }),
+        .expand = .none,
+        .gravity_x = gravity_x,
         .label = .{ .text = if (alt.len > 0) alt else "markdown image" },
         .id_extra = ids.next(),
     });
@@ -513,12 +626,75 @@ fn renderMarkdownImage(img: md.Node, span: dvui.Options, ctx: RenderContext, ids
         var cap = dvui.textLayout(@src(), .{}, .{
             .expand = .horizontal,
             .margin = .{ .y = 2, .h = 0 },
+            .background = ctx.background,
             .id_extra = ids.next(),
         });
         defer cap.deinit();
         cap.addText(alt, .{
             .font = dvui.Font.theme(.body).larger(-1),
             .color_text = dvui.themeGet().color(.control, .text).opacity(0.65),
+        });
+    }
+}
+
+/// GFM task-list marker (`- [ ]` / `- [x]`), drawn rather than written.
+///
+/// This used to be a `"✓"` / `"•"` label, which showed up as a missing-glyph box: neither body
+/// font fizzy ships (PlusJakartaSans, Comfortaa) has U+2713 — only the mono face does. Drawing
+/// the box and using the bundled `entypo.check` vector keeps the marker correct under any font
+/// the user picks, and gives unchecked items a real empty box instead of a plain bullet.
+/// Where a list marker has to sit so it reads as being on the same line as the item's text.
+///
+/// Measured, not guessed: a glyph marker (`•`, `1.`) lands on the text's optical center for free
+/// because its widget is itself a line box, and screenshots confirm both are centered to within a
+/// pixel. A *drawn* box has no baseline of its own, so centering it in the line box left it ~4pt
+/// high — the text's ink sits below the line box center by roughly half the line gap plus the
+/// ascent. These numbers reproduce the glyph markers' placement to within ~0.2pt at body size.
+const MarkerMetrics = struct {
+    /// Side of the drawn checkbox, excluding its 1pt border.
+    side: f32,
+    /// Top margin that puts the drawn box's center on the text's ink center.
+    top: f32,
+
+    fn forBody() MarkerMetrics {
+        const font = dvui.Font.theme(.body);
+        const line_h = font.lineHeight();
+        const side = @round(line_h * 0.72);
+
+        var ascent: f32 = 0;
+        _ = font.textSizeEx("x", .{ .ascent_out = &ascent });
+        const line_gap = line_h - font.textHeight();
+        const ink_center = ascent + line_gap / 2;
+
+        // `border` adds 1pt on each side, so the box's drawn extent is `side + 2`.
+        return .{ .side = side, .top = @max(0, ink_center - (side + 2) / 2) };
+    }
+};
+
+fn renderTaskCheckbox(checked: bool, m: MarkerMetrics, ids: *IdGen) void {
+    const theme = dvui.themeGet();
+
+    var b = dvui.box(@src(), .{ .dir = .horizontal }, .{
+        .min_size_content = .{ .w = m.side, .h = m.side },
+        .max_size_content = .{ .w = m.side, .h = m.side },
+        .gravity_y = 0,
+        .margin = .{ .y = m.top },
+        .background = true,
+        .color_fill = if (checked) theme.color(.highlight, .fill) else theme.color(.control, .fill),
+        .border = dvui.Rect.all(1),
+        .color_border = if (checked) theme.color(.highlight, .fill) else theme.border.opacity(0.7),
+        .corners = dvui.CornerRect.all(3),
+        .id_extra = ids.next(),
+    });
+    defer b.deinit();
+
+    if (checked) {
+        dvui.icon(@src(), "task-checked", dvui.entypo.check, .{}, .{
+            .expand = .ratio,
+            .gravity_x = 0.5,
+            .gravity_y = 0.5,
+            .color_text = theme.color(.highlight, .text),
+            .id_extra = ids.next(),
         });
     }
 }
@@ -533,6 +709,19 @@ fn renderInlineFlowContainer(container: md.Node, span: dvui.Options, ctx: Render
         }
         if (hasImageSubtree(ctx, node)) {
             switch (node.nodeType()) {
+                md.c.CMARK_NODE_HTML_INLINE => {
+                    // Only reachable when the tag carried an `<img src>` (that's what put this
+                    // node in `subtree_has_image`); draw the images, drop the markup.
+                    if (ctx.rs.html_images.get(@intFromPtr(node.n))) |urls| {
+                        for (urls) |html_img| {
+                            renderImageUrl(html_img.src, "", .{
+                                .width = html_img.width,
+                                .height = html_img.height,
+                                .alignment = html_img.alignment,
+                            }, ctx, ids);
+                        }
+                    }
+                },
                 md.c.CMARK_NODE_EMPH => {
                     if (node.firstChild()) |_| {
                         const f = span.fontGet().withStyle(.italic);
@@ -728,6 +917,9 @@ fn renderBlock(n: md.Node, ids: *IdGen, ctx: RenderContext) void {
             var idx: i32 = n.listStart();
             const list_kind = n.listKind();
             const col_w = dvui.Font.theme(.body).sizeM(2.2, 0).w;
+            // Once per list rather than per item: `textSizeEx` shapes a glyph and hits the font
+            // cache, and every marker in one list resolves to the same placement anyway.
+            const marker_metrics: MarkerMetrics = .forBody();
             while (it) |item_node| : (it = item_node.nextSibling()) {
                 if (item_node.nodeType() != md.c.CMARK_NODE_ITEM) {
                     renderBlock(item_node, ids, ctx);
@@ -741,32 +933,33 @@ fn renderBlock(n: md.Node, ids: *IdGen, ctx: RenderContext) void {
                 defer row.deinit();
 
                 var buf: [24]u8 = undefined;
-                const is_task = list_kind == .ul and item_node.taskListItemChecked();
-                const bullet_str: []const u8 = if (is_task)
-                    "✓"
-                else switch (list_kind) {
+                const task_checked: ?bool = ctx.rs.task_items.get(@intFromPtr(item_node.n));
+                const bullet_str: []const u8 = switch (list_kind) {
                     .ul => "•",
                     .ol => std.fmt.bufPrint(&buf, "{d}.", .{idx}) catch "?",
                 };
                 if (list_kind == .ol) idx += 1;
 
-                const bullet_color = if (is_task)
-                    dvui.themeGet().color(.highlight, .fill)
-                else
-                    dvui.themeGet().color(.control, .text).opacity(0.45);
-
                 {
                     var pb = dvui.box(@src(), .{ .dir = .horizontal }, .{
                         .min_size_content = .{ .w = col_w, .h = 0 },
                         .gravity_y = 0,
+                        // The item's content is a paragraph, and `CMARK_NODE_PARAGRAPH` gives its
+                        // `textLayout` a 4pt top margin — without matching it here every marker
+                        // sits a line-gap above the text it belongs to.
+                        .margin = .{ .y = paragraph_margin_y },
                         .id_extra = ids.next(),
                     });
                     _ = dvui.spacer(@src(), .{ .expand = .horizontal, .id_extra = ids.next() });
-                    dvui.labelNoFmt(@src(), bullet_str, .{}, .{
-                        .gravity_y = 0,
-                        .color_text = bullet_color,
-                        .id_extra = ids.next(),
-                    });
+                    if (task_checked) |checked| {
+                        renderTaskCheckbox(checked, marker_metrics, ids);
+                    } else {
+                        dvui.labelNoFmt(@src(), bullet_str, .{}, .{
+                            .gravity_y = 0,
+                            .color_text = dvui.themeGet().color(.control, .text).opacity(0.45),
+                            .id_extra = ids.next(),
+                        });
+                    }
                     pb.deinit();
                 }
 
@@ -812,7 +1005,7 @@ fn renderBlock(n: md.Node, ids: *IdGen, ctx: RenderContext) void {
                     .id_extra = ids.next(),
                 });
                 defer hdr.deinit();
-                var tl_i = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .id_extra = ids.next() });
+                var tl_i = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .background = false, .id_extra = ids.next() });
                 tl_i.addText(info, .{
                     .font = dvui.Font.theme(.mono).withWeight(.bold),
                     .color_text = dvui.themeGet().color(.control, .text).opacity(0.55),
@@ -823,12 +1016,30 @@ fn renderBlock(n: md.Node, ids: *IdGen, ctx: RenderContext) void {
             var tl_c = dvui.textLayout(@src(), .{}, .{
                 .expand = .horizontal,
                 .padding = .{ .x = 10, .y = 8, .w = 10, .h = 8 },
+                .background = false,
                 .id_extra = ids.next(),
             });
             defer tl_c.deinit();
             tl_c.addText(code, .{ .font = dvui.Font.theme(.mono) });
         },
         md.c.CMARK_NODE_HTML_BLOCK => {
+            // `<p align="center"><img …></p>` is how most READMEs carry their hero image; render
+            // the images and drop the wrapper markup rather than dumping the tags as raw text.
+            if (ctx.rs.html_images.get(@intFromPtr(n.n))) |urls| {
+                var outer = dvui.box(@src(), .{ .dir = .vertical }, .{
+                    .expand = .horizontal,
+                    .id_extra = ids.next(),
+                });
+                defer outer.deinit();
+                for (urls) |html_img| {
+                    renderImageUrl(html_img.src, "", .{
+                        .width = html_img.width,
+                        .height = html_img.height,
+                        .alignment = html_img.alignment,
+                    }, ctx, ids);
+                }
+                return;
+            }
             if (n.literal()) |h| {
                 var tl = dvui.textLayout(@src(), .{}, .{
                     .expand = .horizontal,
@@ -849,19 +1060,20 @@ fn renderBlock(n: md.Node, ids: *IdGen, ctx: RenderContext) void {
             if (!hasImageSubtree(ctx, n)) {
                 var tl = dvui.textLayout(@src(), .{}, .{
                     .expand = .horizontal,
-                    .margin = .{ .y = 4, .h = 4 },
+                    .margin = .{ .y = paragraph_margin_y, .h = paragraph_margin_y },
+                    .background = ctx.background,
                     .id_extra = ids.next(),
                 });
                 defer tl.deinit();
-                renderInlines(tl, n, .{}, ctx, ids);
+                renderInlines(tl, n, .{ .background = ctx.background }, ctx, ids);
             } else {
                 var outer = dvui.box(@src(), .{ .dir = .vertical }, .{
                     .expand = .horizontal,
-                    .margin = .{ .y = 4, .h = 4 },
+                    .margin = .{ .y = paragraph_margin_y, .h = paragraph_margin_y },
                     .id_extra = ids.next(),
                 });
                 defer outer.deinit();
-                renderInlineFlowContainer(n, .{}, ctx, ids);
+                renderInlineFlowContainer(n, .{ .background = ctx.background }, ctx, ids);
             }
         },
         md.c.CMARK_NODE_HEADING => {
@@ -880,13 +1092,14 @@ fn renderBlock(n: md.Node, ids: *IdGen, ctx: RenderContext) void {
                 else => 7,
             };
             const heading_font = dvui.Font.theme(.heading).larger(size_bump - 2).withWeight(.bold);
-            const span: dvui.Options = .{ .font = heading_font };
+            const span: dvui.Options = .{ .font = heading_font, .background = ctx.background };
 
             if (!hasImageSubtree(ctx, n)) {
                 var tl = dvui.textLayout(@src(), .{}, .{
                     .expand = .horizontal,
                     .margin = .{ .y = top_margin, .h = 2 },
                     .font = heading_font,
+                    .background = ctx.background,
                     .id_extra = ids.next(),
                 });
                 defer tl.deinit();
@@ -914,6 +1127,7 @@ fn renderBlock(n: md.Node, ids: *IdGen, ctx: RenderContext) void {
                 var tl = dvui.textLayout(@src(), .{}, .{
                     .expand = .horizontal,
                     .margin = .{ .y = 4 },
+                    .background = ctx.background,
                     .id_extra = ids.next(),
                 });
                 const fn_font = dvui.Font.theme(.mono).larger(-1);

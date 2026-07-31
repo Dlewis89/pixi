@@ -131,8 +131,9 @@ fn worker(repo_owned: []u8, subpath_owned: []u8, entry: *IconEntry) void {
     const limit: std.Io.Limit = .limited(repo_asset.max_icon_bytes);
 
     if (subpath_owned.len > 0) {
-        if (repo_asset.readLocalAsset(io, subpath_owned, icon_filename, limit)) |body| {
-            entry.bytes = body;
+        if (repo_asset.readLocalAsset(io, subpath_owned, icon_filename, limit)) |asset| {
+            repo_asset.gpa().free(asset.dir); // an icon has nothing relative to resolve
+            entry.bytes = asset.bytes;
             entry.status.store(@intFromEnum(Status.ready), .release);
             return;
         }

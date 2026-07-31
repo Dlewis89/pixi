@@ -29,10 +29,22 @@ pub fn fetchOk(io: std.Io, url: []const u8, limit: std.Io.Limit) ?[]u8 {
     return gpa().dupe(u8, written) catch null;
 }
 
+/// An asset found in a dev tree: its bytes plus the directory it was read from, which a README
+/// preview needs in order to resolve the relative image paths inside it. Both app-allocator owned.
+pub const LocalAsset = struct {
+    bytes: []u8,
+    dir: []u8,
+
+    pub fn deinit(self: LocalAsset) void {
+        gpa().free(self.bytes);
+        gpa().free(self.dir);
+    }
+};
+
 /// Walk up from the executable directory looking for `{subpath}/{filename}` on disk. Covers dev
 /// trees (`zig-out/bin` → repo root) and sideloaded checkouts; packaged installs fall through to
 /// the GitHub fetch below.
-pub fn readLocalAsset(io: std.Io, subpath: []const u8, filename: []const u8, limit: std.Io.Limit) ?[]u8 {
+pub fn readLocalAsset(io: std.Io, subpath: []const u8, filename: []const u8, limit: std.Io.Limit) ?LocalAsset {
     const trimmed = std.mem.trim(u8, subpath, "/");
     if (trimmed.len == 0) return null;
 
@@ -50,7 +62,12 @@ pub fn readLocalAsset(io: std.Io, subpath: []const u8, filename: []const u8, lim
             .{ dir_buf[0..dir_len], trimmed, filename },
         ) catch return null;
         if (std.Io.Dir.cwd().readFileAlloc(io, abs, gpa(), limit)) |body| {
-            return body;
+            const dir = std.fs.path.dirname(abs) orelse ".";
+            const dir_owned = gpa().dupe(u8, dir) catch {
+                gpa().free(body);
+                return null;
+            };
+            return .{ .bytes = body, .dir = dir_owned };
         } else |_| {}
         const parent = std.fs.path.dirname(dir_buf[0..dir_len]) orelse break;
         dir_len = parent.len;

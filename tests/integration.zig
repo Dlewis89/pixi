@@ -370,3 +370,174 @@ test "the highlight query range covers every byte the viewport shows" {
     }
     te_scroll_to = null;
 }
+
+// -- content-swap reveal ------------------------------------------------------------------------
+
+// `core.dvui.reveal` hides the one frame dvui needs to size newly-swapped content, then fades it
+// in (see `src/core/reveal.zig`). The phase machine is unit-tested on its own; what needs a real
+// window is the wiring — that the phases actually reach `dvui`'s alpha, that the animation is
+// registered and completes, and that a settled pane ends fully opaque instead of stuck dim.
+
+var reveal_key: u64 = 1;
+var reveal_alpha: f32 = -1;
+
+fn revealFrame() !dvui.App.Result {
+    var b = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both });
+    defer b.deinit();
+
+    const rv = fizzy.core.dvui.reveal(b.data().id, reveal_key, .{});
+    defer rv.deinit();
+
+    // Sampled inside the reveal's scope — this is what any content drawn here would be scaled by.
+    reveal_alpha = dvui.currentWindow().alpha;
+    return .ok;
+}
+
+test "a content swap hides one frame, fades in, and settles fully opaque" {
+    var ctx = try shim.init(std.testing.allocator);
+    defer ctx.deinit(std.testing.allocator);
+
+    reveal_key = 1;
+
+    // Frame 1: brand-new content. Laid out (so dvui can measure it) but not drawn.
+    _ = try dvui.testing.step(revealFrame);
+    try std.testing.expectEqual(@as(f32, 0), reveal_alpha);
+
+    // Frame 2: measuring is done and the fade is registered, so this frame draws its first
+    // value — the start of the ramp, still 0.
+    _ = try dvui.testing.step(revealFrame);
+    try std.testing.expectEqual(@as(f32, 0), reveal_alpha);
+
+    // Frame 3: `testing.step` advances 100ms per frame, so the 120ms fade is partway up.
+    _ = try dvui.testing.step(revealFrame);
+    try std.testing.expect(reveal_alpha > 0);
+    try std.testing.expect(reveal_alpha < 1);
+
+    // And done by the next one.
+    _ = try dvui.testing.step(revealFrame);
+    try std.testing.expectEqual(@as(f32, 1), reveal_alpha);
+
+    // Same key, no re-reveal: a pane redrawing unchanged content must not keep flickering.
+    _ = try dvui.testing.step(revealFrame);
+    try std.testing.expectEqual(@as(f32, 1), reveal_alpha);
+}
+
+test "switching to different content re-reveals" {
+    var ctx = try shim.init(std.testing.allocator);
+    defer ctx.deinit(std.testing.allocator);
+
+    reveal_key = 1;
+    for (0..4) |_| _ = try dvui.testing.step(revealFrame);
+    try std.testing.expectEqual(@as(f32, 1), reveal_alpha);
+
+    // A different document / store page / center provider.
+    reveal_key = 2;
+    _ = try dvui.testing.step(revealFrame);
+    try std.testing.expectEqual(@as(f32, 0), reveal_alpha);
+
+    for (0..4) |_| _ = try dvui.testing.step(revealFrame);
+    try std.testing.expectEqual(@as(f32, 1), reveal_alpha);
+}
+
+
+// -- center-provider cross-fade -----------------------------------------------------------------
+
+// Swapping center providers can't be a fade-in: each provider paints its own pane (square and
+// full-bleed for a document canvas, a rounded card for the homepage / pack window / store page),
+// so fading the incoming one up exposes the window behind it and changes the corner shape
+// mid-swap. Instead the *outgoing* provider draws one more time into a texture, and that snapshot
+// fades out over the incoming one — see `core.dvui.transition` and `Editor.drawActiveCenter`.
+//
+// What matters here is the draw bookkeeping: the outgoing provider gets exactly one extra draw,
+// on the swap frame, and never again. On the testing backend (no render targets) that extra draw
+// is skipped entirely — the same fallback the web build takes.
+
+var center_a_draws: usize = 0;
+var center_b_draws: usize = 0;
+
+fn centerADraw(_: ?*anyopaque) anyerror!dvui.App.Result {
+    center_a_draws += 1;
+    return .ok;
+}
+
+fn centerBDraw(_: ?*anyopaque) anyerror!dvui.App.Result {
+    center_b_draws += 1;
+    return .ok;
+}
+
+var center_frame_ctx: *fizzy.Editor = undefined;
+
+fn centerFrame() !dvui.App.Result {
+    var b = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both });
+    defer b.deinit();
+    return fizzy.Editor.drawActiveCenterForTest(center_frame_ctx);
+}
+
+test "a provider swap degrades cleanly when the backend has no render targets" {
+    // dvui's testing backend returns an error from `textureCreateTarget`, so `Picture.start`
+    // yields null and the capture never happens — the same path the web build takes. What that
+    // must degrade to is the *old* behaviour (an instant swap), not a broken one: the outgoing
+    // provider is not redrawn, nothing is retained, and no snapshot is left stuck over the new
+    // content. The capture path itself needs a real GPU backend and is verified in the app.
+    var ctx = try shim.init(std.testing.allocator);
+    defer ctx.deinit(std.testing.allocator);
+
+    const editor = ctx.editor;
+    center_frame_ctx = editor;
+    defer {
+        editor.center_transition.discard();
+        editor.host.center_providers.deinit(std.testing.allocator);
+    }
+
+    try editor.host.registerCenter(.{ .id = "test.center.a", .draw = centerADraw });
+    try editor.host.registerCenter(.{ .id = "test.center.b", .draw = centerBDraw });
+
+    editor.host.setActiveCenter("test.center.a");
+    center_a_draws = 0;
+    center_b_draws = 0;
+
+    _ = try dvui.testing.step(centerFrame);
+    _ = try dvui.testing.step(centerFrame);
+    try std.testing.expectEqual(@as(usize, 2), center_a_draws);
+    try std.testing.expectEqual(@as(usize, 0), center_b_draws);
+
+    editor.host.setActiveCenter("test.center.b");
+    _ = try dvui.testing.step(centerFrame);
+    _ = try dvui.testing.step(centerFrame);
+
+    // B took over immediately; A stopped dead; nothing is being held on to.
+    try std.testing.expectEqual(@as(usize, 2), center_a_draws);
+    try std.testing.expectEqual(@as(usize, 2), center_b_draws);
+    try std.testing.expect(editor.center_transition.cross_fade.texture == null);
+}
+
+test "a center provider that disappears is not drawn for its own cross-fade" {
+    // A plugin can be unloaded between frames, which is why the outgoing provider is looked up
+    // again by id rather than cached — a stale `draw` pointer would be called on a dylib that is
+    // no longer mapped.
+    var ctx = try shim.init(std.testing.allocator);
+    defer ctx.deinit(std.testing.allocator);
+
+    const editor = ctx.editor;
+    center_frame_ctx = editor;
+    defer {
+        editor.center_transition.discard();
+        editor.host.center_providers.deinit(std.testing.allocator);
+    }
+
+    try editor.host.registerCenter(.{ .id = "test.center.a", .draw = centerADraw });
+    try editor.host.registerCenter(.{ .id = "test.center.b", .draw = centerBDraw });
+    editor.host.setActiveCenter("test.center.a");
+    _ = try dvui.testing.step(centerFrame);
+
+    center_a_draws = 0;
+    center_b_draws = 0;
+
+    // A goes away and B takes over in the same breath.
+    _ = editor.host.center_providers.orderedRemove(0);
+    editor.host.setActiveCenter("test.center.b");
+    _ = try dvui.testing.step(centerFrame);
+
+    try std.testing.expectEqual(@as(usize, 0), center_a_draws);
+    try std.testing.expectEqual(@as(usize, 1), center_b_draws);
+}

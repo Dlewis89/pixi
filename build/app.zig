@@ -382,6 +382,15 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         // Keybinding parse/resolve core. Deliberately dvui-free (see keymap.zig) — dvui's
         // keybind map can't express chords and is keyed by bind name, not command.
         .{ "fizzy-keymap-tests", "src/editor/keymap/keymap.zig" },
+        // `<img>` scanning for the markdown preview's raw-HTML blocks. Under src/plugins/
+        // but std-only by design (see html_images.zig), so it tests from the app build.
+        .{ "fizzy-md-html-images-tests", "src/plugins/markdown/src/md/html_images.zig" },
+        // Resolving a fetched README's relative image paths against its source URL. std-only,
+        // same reasoning as html_images above.
+        .{ "fizzy-md-url-join-tests", "src/plugins/markdown/src/md/url_join.zig" },
+        // Content-swap reveal phase machine. std-only by design (see reveal.zig) — the dvui
+        // half is the thin wrapper in core/dvui.zig.
+        .{ "fizzy-reveal-tests", "src/core/reveal.zig" },
     }) |entry| {
         try unit_test_artifacts.append(b.allocator, b.addTest(.{
             .name = entry[0],

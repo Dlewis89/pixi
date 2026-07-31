@@ -17,6 +17,7 @@ const build_opts = @import("build_opts");
 
 const fizzy = @import("../fizzy.zig");
 const dvui = @import("dvui");
+const core = @import("core");
 const update_notify = @import("../backend/update_notify.zig");
 
 const App = fizzy.App;
@@ -255,6 +256,13 @@ document_watcher: ?DocumentWatcher = null,
 /// grace window so `dvui.ContextWidget.updateHold` actually re-runs and gets a chance
 /// to open the hold-to-context menu on touch-only hardware.
 last_touch_press_ns: ?i128 = null,
+
+/// Id of the center provider drawn last frame, so a swap can look the outgoing one up again by
+/// id (never cache the pointer: a plugin can unload between frames). Borrowed from the host's
+/// registry entry, which outlives a frame.
+center_prev_id: ?[]const u8 = null,
+/// Host-owned cross-fade between center providers. See `drawActiveCenter`.
+center_transition: core.dvui.Transition = .{},
 
 const embedded_fonts: []const dvui.Font.Source = &.{
     .{
@@ -1973,6 +1981,100 @@ pub fn clearAllWorkspaceCenter(editor: *Editor) void {
     editor.workbench.clearAllWorkspaceCenter();
 }
 
+/// Draws whichever center provider is active, cross-fading when that changes.
+///
+/// Swapping providers replaces the entire center subtree, and each provider paints its own pane
+/// — square and full-bleed for a document canvas, a rounded card for the homepage, the
+/// pack-project window and the store's detail page. So this cannot be a fade-in: there is no
+/// background the host could hold underneath that is correct for both shapes, and dvui also
+/// needs a frame to size the incoming subtree from a cold min-size cache.
+///
+/// Instead the outgoing provider gets one more draw, recorded into a texture rather than shown,
+/// and that snapshot fades out over the incoming provider. See `core.dvui.transition`.
+fn drawActiveCenter(editor: *Editor) !dvui.App.Result {
+    const center = editor.host.activeCenter() orelse {
+        editor.center_transition.discard();
+        editor.center_prev_id = null;
+        return .ok;
+    };
+
+    // Stable slot under the center region. Both the capture pass and the live provider parent
+    // here, so widget ids match last frame during capture (`reveal` stays shown, min-sizes stay
+    // warm). The slot is also the paned/box's only expanded child, so packing the capture and
+    // then the incoming screen only needs a reset of *this* box's pack state — not the outer
+    // paned's.
+    var slot = dvui.box(@src(), .{ .dir = .vertical }, .{
+        .expand = .both,
+        .background = false,
+        .padding = .{},
+        .margin = .{},
+        .border = .{},
+    });
+    defer slot.deinit();
+
+    const rs = slot.data().contentRectScale();
+
+    const CaptureCtx = struct {
+        editor: *Editor,
+        prev_id: []const u8,
+        slot: *dvui.BoxWidget,
+
+        fn draw(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            // Look up by id rather than caching the pointer: a plugin can be unloaded between
+            // frames, and its `draw` pointer would be dangling. Errors are ignored — a provider
+            // failing here must not take down the swap, it just means no fade.
+            if (self.editor.centerProviderById(self.prev_id)) |outgoing| {
+                _ = outgoing.draw(outgoing.ctx) catch {};
+            }
+        }
+
+        fn afterCapture(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            // The capture just packed an expanded child into `slot`. Clear pack state so the
+            // incoming provider is once again this box's first child this frame.
+            self.slot.first_child = true;
+            self.slot.packed_children = 0;
+            self.slot.total_weight = 0;
+            self.slot.min_space_taken = 0;
+            if (builtin.mode == .Debug) self.slot.child_id = .zero;
+        }
+    };
+
+    const prev_id = editor.center_prev_id;
+    var capture_ctx: CaptureCtx = .{
+        .editor = editor,
+        .prev_id = prev_id orelse "",
+        .slot = slot,
+    };
+
+    var frame = core.dvui.transition(&editor.center_transition, .{
+        .key = std.hash.Wyhash.hash(0, center.id),
+        .rect = rs.r,
+        .draw_previous = if (prev_id != null) CaptureCtx.draw else null,
+        .after_capture = if (prev_id != null) CaptureCtx.afterCapture else null,
+        .ctx = @ptrCast(&capture_ctx),
+    });
+    defer frame.deinit();
+
+    editor.center_prev_id = center.id;
+    return try center.draw(center.ctx);
+}
+
+/// Test seam: `drawActiveCenter` is the unit under test in `tests/integration.zig`, and the
+/// frame loop around it needs far more of the editor than the shim brings up.
+pub fn drawActiveCenterForTest(editor: *Editor) !dvui.App.Result {
+    return drawActiveCenter(editor);
+}
+
+/// Registered center provider with this id, or null if it is gone (plugin unloaded).
+fn centerProviderById(editor: *Editor, id: []const u8) ?*sdk.regions.CenterProvider {
+    for (editor.host.center_providers.items) |*p| {
+        if (std.mem.eql(u8, p.id, id)) return p;
+    }
+    return null;
+}
+
 /// Workbench routing helpers (type-agnostic; dispatch through `doc.owner`).
 pub fn docGrouping(_: *Editor, doc: sdk.DocHandle) u64 {
     return doc.owner.documentGrouping(doc);
@@ -3091,15 +3193,13 @@ pub fn tick(editor: *Editor) !dvui.App.Result {
                 }
 
                 if (editor.panel.paned.showFirst()) {
-                    if (editor.host.activeCenter()) |center| {
-                        const result = try center.draw(center.ctx);
-                        if (result != .ok) {
-                            return result;
-                        }
+                    const result = try drawActiveCenter(editor);
+                    if (result != .ok) {
+                        return result;
                     }
                 }
-            } else if (editor.host.activeCenter()) |center| {
-                const result = try center.draw(center.ctx);
+            } else {
+                const result = try drawActiveCenter(editor);
                 if (result != .ok) {
                     return result;
                 }
@@ -4311,6 +4411,10 @@ pub fn rawCloseFileID(editor: *Editor, id: u64) !void {
 }
 
 pub fn deinit(editor: *Editor) !void {
+    // Owned outright rather than cached by dvui, so it has to be released explicitly.
+    editor.center_transition.discard();
+    editor.center_prev_id = null;
+
     // Stop watchers first, before touching anything they could still be querying —
     // signals background threads, joins them, and tears down OS watches. Clearing the optionals
     // is part of stopping, not tidiness: `stop` frees the watcher's own state, and the rest of

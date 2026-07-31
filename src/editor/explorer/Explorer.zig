@@ -139,32 +139,19 @@ pub fn draw(explorer: *Explorer) !dvui.App.Result {
         try view.draw(view.ctx);
     }
 
-    const vertical_scroll = scroll.si.offset(.vertical);
-    const horizontal_scroll = scroll.si.offset(.horizontal);
-
     scroll.deinit();
 
     if (self_vert_scroll) {
         explorer.scroll_info.virtual_size.h = explorer.scroll_info.viewport.h;
     }
 
-    if (vertical_scroll > 0.0) {
-        fizzy.dvui.drawEdgeShadow(pane_vbox.data().contentRectScale(), .top, .{});
-    }
-
-    if (explorer.scroll_info.virtual_size.h > explorer.scroll_info.viewport.h) {
-        fizzy.dvui.drawEdgeShadow(pane_vbox.data().contentRectScale(), .bottom, .{});
-    }
+    // Two calls rather than one: `pane_vbox` has to deinit between the vertical and horizontal
+    // hints, since the horizontal ones are drawn over the outer `vbox` instead.
+    fizzy.dvui.drawScrollEdgeShadows(pane_vbox.data().contentRectScale(), null, &explorer.scroll_info, .{});
 
     pane_vbox.deinit();
 
-    if (explorer.scroll_info.virtual_size.w > explorer.scroll_info.viewport.w) {
-        fizzy.dvui.drawEdgeShadow(vbox.data().contentRectScale(), .right, .{});
-    }
-
-    if (horizontal_scroll > 0.0) {
-        fizzy.dvui.drawEdgeShadow(vbox.data().contentRectScale(), .left, .{});
-    }
+    fizzy.dvui.drawScrollEdgeShadows(null, vbox.data().contentRectScale(), &explorer.scroll_info, .{});
 
     // Peek-only floating collapse button. Drawn last so it overlays everything else in the
     // explorer pane. Only appears while we're full-screen peeking on a collapsed paned.
