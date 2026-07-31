@@ -1655,6 +1655,13 @@ const card_min_w: f32 = 280;
 /// longest description happens to be", which is exactly what the scrollArea must not do.
 const card_text_no_floor: f32 = 1;
 
+/// Padding for every text line inside a card's info column. `LabelWidget.defaults` is
+/// `Rect.all(6)`, which across four always-drawn lines (title/description/author/row2) adds ~48px
+/// of pure whitespace to a card whose text is only ~64px tall. The lines are already separated by
+/// their own leading, so a small vertical pad is enough to keep them from touching; horizontally
+/// the info column's own margin does the job, so the sides go to zero.
+const card_text_padding: dvui.Rect = .{ .x = 0, .y = 1, .w = 0, .h = 1 };
+
 /// Shared card shell: a clickable container (logo + info + state controls). Clicking anywhere
 /// outside the controls selects the plugin (its README shows in the center). The controls consume
 /// their own clicks so the card-level click never double-fires. `controls` draws the
@@ -1679,8 +1686,8 @@ fn drawCardShell(entry: StoreEntry, controls: *const fn (StoreEntry) void, row2_
         .id_extra = hashId(entry.id),
         .expand = .horizontal,
         .min_size_content = .{ .w = card_min_w },
-        .margin = .all(4),
-        .padding = .all(8),
+        .margin = .all(3),
+        .padding = .{ .x = 8, .y = 6, .w = 8, .h = 6 },
         .corners = dvui.CornerRect.all(8),
         .background = true,
         .color_fill = fill,
@@ -1769,6 +1776,7 @@ fn drawCardShell(entry: StoreEntry, controls: *const fn (StoreEntry) void, row2_
                 dvui.labelNoFmt(@src(), entry.title, .{}, .{
                     .font = title_font.withWeight(.bold),
                     .expand = .horizontal,
+                    .padding = card_text_padding,
                     .max_size_content = .{ .w = card_text_no_floor, .h = std.math.floatMax(f32) },
                 });
                 if (releaseDate(entry)) |date| {
@@ -1776,6 +1784,7 @@ fn drawCardShell(entry: StoreEntry, controls: *const fn (StoreEntry) void, row2_
                         .font = dvui.Font.theme(.mono),
                         .color_text = theme.color(.control, .text),
                         .gravity_y = 0.5,
+                        .padding = card_text_padding,
                         .margin = .{ .x = 6 },
                     });
                 }
@@ -1789,6 +1798,7 @@ fn drawCardShell(entry: StoreEntry, controls: *const fn (StoreEntry) void, row2_
                     .font = dvui.Font.theme(.body),
                     .color_text = theme.color(.window, .text).opacity(0.75),
                     .expand = .horizontal,
+                    .padding = card_text_padding,
                     .max_size_content = .{ .w = card_text_no_floor, .h = std.math.floatMax(f32) },
                 });
                 desc_label.draw();
@@ -1808,6 +1818,7 @@ fn drawCardShell(entry: StoreEntry, controls: *const fn (StoreEntry) void, row2_
                 .font = dvui.Font.theme(.body),
                 .color_text = theme.color(.control, .text),
                 .expand = .horizontal,
+                .padding = card_text_padding,
                 .max_size_content = .{ .w = card_text_no_floor, .h = std.math.floatMax(f32) },
             });
 
@@ -1815,6 +1826,7 @@ fn drawCardShell(entry: StoreEntry, controls: *const fn (StoreEntry) void, row2_
                 .font = dvui.Font.theme(.mono),
                 .color_text = theme.color(.control, .text),
                 .expand = .horizontal,
+                .padding = card_text_padding,
                 .max_size_content = .{ .w = card_text_no_floor, .h = std.math.floatMax(f32) },
             });
 
